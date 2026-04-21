@@ -14,7 +14,9 @@ pub struct VideoStream {
     width: u32,
     height: u32,
     texture: Texture,
-    pending: Option<(Vec<u8>, f64)>,
+    pending: Option<(ffmpeg::frame::Video, f64)>,
+    rgba_buf: Vec<u8>,
+    scaled: ffmpeg::frame::Video,
 }
 
 impl VideoStream {
@@ -78,13 +80,13 @@ impl VideoStream {
             height,
             texture,
             pending: None,
+            rgba_buf: vec![0u8; (width * height * 4) as usize],
+            scaled: ffmpeg::frame::Video::empty(),
         };
 
         // Prime with the first frame so nothing flashes black at startup.
-        if let Some((rgba, _pts)) = stream.decode_next() {
-            stream
-                .texture
-                .write_region(queue, 0, 0, width, height, &rgba);
+        if let Some((frame, _pts)) = stream.decode_next_raw() {
+            stream.scale_and_upload(queue, &frame);
         }
 
         Ok(stream)
@@ -106,24 +108,41 @@ impl VideoStream {
         self.duration_seconds
     }
 
-    /// Decode and upload frames up to time `t` (in seconds from start of video).
+    /// Decode frames up to time `t` (seconds). Only the latest frame with `pts <= t`
+    /// is scaled and uploaded; intermediate frames are decoded-then-discarded so
+    /// H.264/VP9/etc temporal deps stay intact without paying for N scales+uploads.
     pub fn advance_to(&mut self, queue: &wgpu::Queue, t: f64) {
+        if self.pending.is_none() {
+            match self.decode_next_raw() {
+                Some(p) => self.pending = Some(p),
+                None => return,
+            }
+        }
+
+        if self.pending.as_ref().unwrap().1 > t {
+            return;
+        }
+
         loop {
-            if self.pending.is_none() {
-                match self.decode_next() {
-                    Some(p) => self.pending = Some(p),
-                    None => return,
+            match self.decode_next_raw() {
+                Some((next_frame, next_pts)) => {
+                    if next_pts <= t {
+                        // Drop the current pending — we'll never display it.
+                        self.pending = Some((next_frame, next_pts));
+                    } else {
+                        let (cur_frame, _) = self.pending.take().unwrap();
+                        self.scale_and_upload(queue, &cur_frame);
+                        self.pending = Some((next_frame, next_pts));
+                        return;
+                    }
+                }
+                None => {
+                    if let Some((cur_frame, _)) = self.pending.take() {
+                        self.scale_and_upload(queue, &cur_frame);
+                    }
+                    return;
                 }
             }
-
-            let pts = self.pending.as_ref().unwrap().1;
-            if pts > t {
-                return;
-            }
-
-            let (rgba, _) = self.pending.take().unwrap();
-            self.texture
-                .write_region(queue, 0, 0, self.width, self.height, &rgba);
         }
     }
 
@@ -134,28 +153,14 @@ impl VideoStream {
         self.pending = None;
     }
 
-    fn decode_next(&mut self) -> Option<(Vec<u8>, f64)> {
+    fn decode_next_raw(&mut self) -> Option<(ffmpeg::frame::Video, f64)> {
         let mut frame = ffmpeg::frame::Video::empty();
         loop {
             match self.decoder.receive_frame(&mut frame) {
                 Ok(()) => {
                     let pts = frame.pts().unwrap_or(0);
                     let pts_sec = pts as f64 * self.time_base_seconds;
-
-                    let mut rgba_frame = ffmpeg::frame::Video::empty();
-                    self.scaler.run(&frame, &mut rgba_frame).ok()?;
-
-                    let stride = rgba_frame.stride(0);
-                    let row_bytes = (self.width * 4) as usize;
-                    let src = rgba_frame.data(0);
-                    let mut rgba = vec![0u8; row_bytes * self.height as usize];
-                    for y in 0..self.height as usize {
-                        let src_off = y * stride;
-                        let dst_off = y * row_bytes;
-                        rgba[dst_off..dst_off + row_bytes]
-                            .copy_from_slice(&src[src_off..src_off + row_bytes]);
-                    }
-                    return Some((rgba, pts_sec));
+                    return Some((frame, pts_sec));
                 }
                 Err(_) => match self.next_video_packet() {
                     Some(packet) => {
@@ -165,6 +170,23 @@ impl VideoStream {
                 },
             }
         }
+    }
+
+    fn scale_and_upload(&mut self, queue: &wgpu::Queue, frame: &ffmpeg::frame::Video) {
+        if self.scaler.run(frame, &mut self.scaled).is_err() {
+            return;
+        }
+        let stride = self.scaled.stride(0);
+        let row_bytes = (self.width * 4) as usize;
+        let src = self.scaled.data(0);
+        for y in 0..self.height as usize {
+            let src_off = y * stride;
+            let dst_off = y * row_bytes;
+            self.rgba_buf[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&src[src_off..src_off + row_bytes]);
+        }
+        self.texture
+            .write_region(queue, 0, 0, self.width, self.height, &self.rgba_buf);
     }
 
     fn next_video_packet(&mut self) -> Option<ffmpeg::Packet> {
