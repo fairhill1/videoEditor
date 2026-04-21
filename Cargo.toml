@@ -1,0 +1,22 @@
+[package]
+name = "videoEditor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+cpal = "0.17.3"
+env_logger = "0.11.10"
+ffmpeg-next = "8.1.0"
+fontdue = "0.9.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+log = "0.4.29"
+pollster = "0.4.0"
+wgpu = "29.0.1"
+winit = "0.30.13"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
