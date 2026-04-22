@@ -17,7 +17,14 @@ pub struct VideoStream {
     pending: Option<(ffmpeg::frame::Video, f64)>,
     rgba_buf: Vec<u8>,
     scaled: ffmpeg::frame::Video,
+    displayed_pts: Option<f64>,
 }
+
+/// How far forward `t` can be from the displayed frame before `goto` gives up
+/// on linear decode and issues a seek. Tuned to cover a normal playback step
+/// (well under one frame at 24fps is ~0.04s; a 1s buffer absorbs render stalls
+/// without making scrubs decode through the whole file).
+const FORWARD_DECODE_BUDGET: f64 = 1.0;
 
 impl VideoStream {
     pub fn open(
@@ -82,14 +89,29 @@ impl VideoStream {
             pending: None,
             rgba_buf: vec![0u8; (width * height * 4) as usize],
             scaled: ffmpeg::frame::Video::empty(),
+            displayed_pts: None,
         };
 
         // Prime with the first frame so nothing flashes black at startup.
-        if let Some((frame, _pts)) = stream.decode_next_raw() {
+        if let Some((frame, pts)) = stream.decode_next_raw() {
             stream.scale_and_upload(queue, &frame);
+            stream.displayed_pts = Some(pts);
         }
 
         Ok(stream)
+    }
+
+    /// Display the frame at `t` using whichever strategy is cheapest.
+    /// - `t` went backward, or is far beyond the decoded position: seek.
+    /// - `t` is close ahead: let the decoder walk forward (cheap).
+    /// This is the only entry point callers should use during playback/scrub;
+    /// it keeps per-frame decoder work bounded even under rapid seek requests.
+    pub fn goto(&mut self, queue: &wgpu::Queue, t: f64) {
+        match self.displayed_pts {
+            Some(d) if t < d || t > d + FORWARD_DECODE_BUDGET => self.seek(queue, t),
+            Some(_) => self.advance_to(queue, t),
+            None => self.seek(queue, t),
+        }
     }
 
     pub fn texture(&self) -> &Texture {
@@ -130,15 +152,17 @@ impl VideoStream {
                         // Drop the current pending — we'll never display it.
                         self.pending = Some((next_frame, next_pts));
                     } else {
-                        let (cur_frame, _) = self.pending.take().unwrap();
+                        let (cur_frame, cur_pts) = self.pending.take().unwrap();
                         self.scale_and_upload(queue, &cur_frame);
+                        self.displayed_pts = Some(cur_pts);
                         self.pending = Some((next_frame, next_pts));
                         return;
                     }
                 }
                 None => {
-                    if let Some((cur_frame, _)) = self.pending.take() {
+                    if let Some((cur_frame, cur_pts)) = self.pending.take() {
                         self.scale_and_upload(queue, &cur_frame);
+                        self.displayed_pts = Some(cur_pts);
                     }
                     return;
                 }
@@ -146,11 +170,37 @@ impl VideoStream {
         }
     }
 
-    pub fn seek(&mut self, t: f64) {
+    /// Seek to `t` seconds and display the frame containing `t` (frame-accurate:
+    /// the last frame with pts <= t, decoded forward from the nearest keyframe).
+    pub fn seek(&mut self, queue: &wgpu::Queue, t: f64) {
         let ts = (t.max(0.0) * AV_TIME_BASE) as i64;
         let _ = self.ictx.seek(ts, ..);
         self.decoder.flush();
         self.pending = None;
+
+        let mut last: Option<(ffmpeg::frame::Video, f64)> = None;
+        loop {
+            match self.decode_next_raw() {
+                Some((frame, pts)) => {
+                    if pts > t {
+                        let (to_upload, upload_pts) =
+                            last.take().unwrap_or_else(|| (frame.clone(), pts));
+                        self.scale_and_upload(queue, &to_upload);
+                        self.displayed_pts = Some(upload_pts);
+                        self.pending = Some((frame, pts));
+                        return;
+                    }
+                    last = Some((frame, pts));
+                }
+                None => {
+                    if let Some((prev, prev_pts)) = last.take() {
+                        self.scale_and_upload(queue, &prev);
+                        self.displayed_pts = Some(prev_pts);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     fn decode_next_raw(&mut self) -> Option<(ffmpeg::frame::Video, f64)> {

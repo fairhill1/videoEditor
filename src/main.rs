@@ -1,5 +1,7 @@
+mod media;
 mod quad;
 mod text;
+mod timeline;
 mod video;
 
 use std::sync::Arc;
@@ -13,23 +15,37 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
-use video::VideoStream;
+use timeline::{Clip, SourceId, Timeline, Track, TrackKind};
 
 // Layout split ratios — tweak to taste.
-const TOP_BOTTOM_SPLIT: f32 = 0.55; // top section takes this fraction of height
-const MEDIA_PREVIEW_SPLIT: f32 = 0.28; // media pool takes this fraction of top-section width
+const TOP_BOTTOM_SPLIT: f32 = 0.55;
+const MEDIA_PREVIEW_SPLIT: f32 = 0.28;
 
 // Panel colors (sRGB).
 const MEDIA_POOL_COLOR: [f32; 4] = [0.14, 0.14, 0.16, 1.0];
 const PREVIEW_COLOR: [f32; 4] = [0.04, 0.04, 0.05, 1.0];
 const TIMELINE_COLOR: [f32; 4] = [0.10, 0.10, 0.12, 1.0];
+const LANE_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
+const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.22, 1.0];
+const VIDEO_CLIP_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
+const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
+const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
+const TRACK_LABEL_COLOR: [f32; 4] = [0.45, 0.45, 0.50, 1.0];
 const LABEL_SIZE: f32 = 13.0;
+const CLIP_LABEL_SIZE: f32 = 11.0;
 const LABEL_PAD: f32 = 10.0;
 const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 const PLAYHEAD_WIDTH: f32 = 2.0;
+
+// Timeline panel layout.
+const TRACK_LANE_HEIGHT: f32 = 32.0;
+const TRACK_LANE_GAP: f32 = 2.0;
+const TRACK_HEADER_WIDTH: f32 = 48.0;
+const TIMELINE_TOP_PAD: f32 = 30.0; // clear space for the "TIMELINE" label
 
 struct Clock {
     playing: bool,
@@ -68,6 +84,11 @@ impl Clock {
         self.anchor_pos = t.max(0.0);
         self.anchor_instant = Instant::now();
     }
+
+    fn pause_at(&mut self, t: f64) {
+        self.anchor_pos = t.max(0.0);
+        self.playing = false;
+    }
 }
 
 struct State {
@@ -80,10 +101,12 @@ struct State {
     surface_format: wgpu::TextureFormat,
     quads: QuadRenderer,
     text: TextRenderer,
-    video: Option<VideoStream>,
+    media: MediaPool,
+    timeline: Timeline,
     clock: Clock,
     cursor: [f32; 2],
     scrubbing: bool,
+    last_playing_source: Option<SourceId>,
 }
 
 impl State {
@@ -109,15 +132,31 @@ impl State {
         let quads = QuadRenderer::new(&device, &queue, surface_format.add_srgb_suffix());
         let text = TextRenderer::new(&device, &quads);
 
-        let video = std::env::args()
-            .nth(1)
-            .and_then(|path| match VideoStream::open(&path, &device, &queue, &quads) {
-                Ok(stream) => Some(stream),
-                Err(e) => {
-                    log::error!("failed to load video {path}: {e}");
-                    None
+        // Start with V1, V2, A1, A2 — the model supports arbitrary mixes; this is
+        // just a sensible default so the UI shows multiple lanes immediately.
+        let mut timeline = Timeline::new();
+        timeline.tracks.push(Track::new(TrackKind::Video));
+        timeline.tracks.push(Track::new(TrackKind::Video));
+        timeline.tracks.push(Track::new(TrackKind::Audio));
+        timeline.tracks.push(Track::new(TrackKind::Audio));
+
+        let mut media = MediaPool::new();
+        let mut cursor = 0.0_f64;
+        for path in std::env::args().skip(1) {
+            match media.add(&path, &device, &queue, &quads) {
+                Ok(id) => {
+                    let dur = media.duration(id);
+                    timeline.tracks[0].clips.push(Clip {
+                        source: id,
+                        source_in: 0.0,
+                        source_out: dur,
+                        timeline_start: cursor,
+                    });
+                    cursor += dur;
                 }
-            });
+                Err(e) => log::error!("failed to load {path}: {e}"),
+            }
+        }
 
         let state = State {
             instance,
@@ -129,10 +168,12 @@ impl State {
             surface_format,
             quads,
             text,
-            video,
+            media,
+            timeline,
             clock: Clock::new(),
             cursor: [0.0, 0.0],
             scrubbing: false,
+            last_playing_source: None,
         };
 
         state.configure_surface();
@@ -168,17 +209,17 @@ impl State {
     }
 
     fn seek_to_cursor_x(&mut self) {
-        let Some(v) = self.video.as_mut() else {
-            return;
-        };
-        let duration = v.duration();
+        let duration = self.timeline.duration();
         if duration <= 0.0 {
             return;
         }
         let w = self.size.width as f32;
-        let ratio = (self.cursor[0] / w).clamp(0.0, 1.0) as f64;
+        let clips_w = (w - TRACK_HEADER_WIDTH).max(1.0);
+        let ratio = ((self.cursor[0] - TRACK_HEADER_WIDTH) / clips_w).clamp(0.0, 1.0) as f64;
         let t = ratio * duration;
-        v.seek(t);
+        // Only update the clock — render() will do the decoder work at most once
+        // per frame. Doing the seek here too would pile up expensive ffmpeg seeks
+        // on every mousemove and freeze the event loop.
         self.clock.set_pos(t);
     }
 
@@ -217,6 +258,14 @@ impl State {
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
         let preview_w = w - media_w;
 
+        // Tick the clock. Pause at end of timeline so we don't run past the content.
+        let duration = self.timeline.duration();
+        let mut t = self.clock.pos();
+        if duration > 0.0 && t >= duration {
+            self.clock.pause_at(duration);
+            t = duration;
+        }
+
         self.quads.clear();
         self.quads
             .push(Quad::colored([0.0, 0.0], [media_w, top_h], MEDIA_POOL_COLOR));
@@ -225,30 +274,116 @@ impl State {
             [preview_w, top_h],
             PREVIEW_COLOR,
         ));
-        let mut playhead_ratio: Option<f32> = None;
-        if let Some(v) = self.video.as_mut() {
-            let pos = self.clock.pos();
-            v.advance_to(&self.queue, pos);
-            let vw = v.width() as f32;
-            let vh = v.height() as f32;
-            let scale = (preview_w / vw).min(top_h / vh);
-            let draw_w = vw * scale;
-            let draw_h = vh * scale;
-            let dx = media_w + (preview_w - draw_w) * 0.5;
-            let dy = (top_h - draw_h) * 0.5;
-            self.quads
-                .push_with(Quad::textured([dx, dy], [draw_w, draw_h]), Some(v.texture()));
 
-            let duration = v.duration();
-            if duration > 0.0 {
-                playhead_ratio = Some((pos / duration).clamp(0.0, 1.0) as f32);
+        // --- Preview: topmost active video clip ---
+        // Scoped disjoint borrows so the decoder advance + textured-quad push can
+        // share this block without leaking borrows past it.
+        {
+            let Self {
+                media,
+                timeline,
+                quads,
+                queue,
+                last_playing_source,
+                ..
+            } = self;
+
+            let active_info = timeline
+                .topmost_video_clip(t)
+                .map(|(_, c)| (c.source, c.source_time(t)));
+            if let Some((source_id, source_t)) = active_info {
+                *last_playing_source = Some(source_id);
+                if let Some(src) = media.get_mut(source_id) {
+                    src.stream.goto(queue, source_t);
+
+                    let vw = src.stream.width() as f32;
+                    let vh = src.stream.height() as f32;
+                    let scale = (preview_w / vw).min(top_h / vh);
+                    let draw_w = vw * scale;
+                    let draw_h = vh * scale;
+                    let dx = media_w + (preview_w - draw_w) * 0.5;
+                    let dy = (top_h - draw_h) * 0.5;
+                    quads.push_with(
+                        Quad::textured([dx, dy], [draw_w, draw_h]),
+                        Some(src.stream.texture()),
+                    );
+                }
+            } else {
+                *last_playing_source = None;
             }
         }
+
+        // --- Timeline panel background ---
         self.quads
             .push(Quad::colored([0.0, top_h], [w, bottom_h], TIMELINE_COLOR));
 
-        if let Some(ratio) = playhead_ratio {
-            let px = (ratio * w - PLAYHEAD_WIDTH * 0.5).round();
+        // --- Timeline tracks ---
+        let tracks_top = top_h + TIMELINE_TOP_PAD;
+        let tracks_bottom = h;
+        let tracks_area_h = (tracks_bottom - tracks_top).max(0.0);
+        let center_y = tracks_top + tracks_area_h * 0.5;
+
+        let video_tracks: Vec<usize> = self
+            .timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| tr.kind == TrackKind::Video)
+            .map(|(i, _)| i)
+            .collect();
+        let audio_tracks: Vec<usize> = self
+            .timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| tr.kind == TrackKind::Audio)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Divider between video (above) and audio (below) regions.
+        self.quads.push(Quad::colored(
+            [0.0, center_y - 0.5],
+            [w, 1.0],
+            DIVIDER_COLOR,
+        ));
+
+        // Use the real duration so clip widths, playhead, and scrub all share the
+        // same denominator. Empty timelines skip the clip loop entirely, so the
+        // `.max(1.0)` guard is only there to avoid NaN from a 0/0 division.
+        let timeline_duration_display = self.timeline.duration().max(1.0);
+        let clips_x = TRACK_HEADER_WIDTH;
+        let clips_w = (w - TRACK_HEADER_WIDTH).max(1.0);
+
+        // V1 sits just above the divider, V2 above V1, etc.
+        for (visual_i, &track_idx) in video_tracks.iter().enumerate() {
+            let lane_y = center_y - (visual_i as f32 + 1.0) * (TRACK_LANE_HEIGHT + TRACK_LANE_GAP)
+                + TRACK_LANE_GAP;
+            self.draw_track_lane(
+                lane_y,
+                clips_x,
+                clips_w,
+                timeline_duration_display,
+                track_idx,
+                visual_i,
+            );
+        }
+        // A1 sits just below the divider, A2 below A1, etc.
+        for (visual_i, &track_idx) in audio_tracks.iter().enumerate() {
+            let lane_y = center_y + visual_i as f32 * (TRACK_LANE_HEIGHT + TRACK_LANE_GAP);
+            self.draw_track_lane(
+                lane_y,
+                clips_x,
+                clips_w,
+                timeline_duration_display,
+                track_idx,
+                visual_i,
+            );
+        }
+
+        // --- Playhead: drawn last so it's on top of clips ---
+        if self.timeline.duration() > 0.0 {
+            let ratio = (t / self.timeline.duration()).clamp(0.0, 1.0) as f32;
+            let px = (clips_x + ratio * clips_w - PLAYHEAD_WIDTH * 0.5).round();
             self.quads.push(Quad::colored(
                 [px, top_h],
                 [PLAYHEAD_WIDTH, bottom_h],
@@ -256,7 +391,7 @@ impl State {
             ));
         }
 
-        // Panel labels (baseline y = top + pad + ascent).
+        // --- Panel labels ---
         let baseline_y = LABEL_PAD + self.text.ascent(LABEL_SIZE);
         self.text.draw(
             &self.queue,
@@ -309,6 +444,62 @@ impl State {
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         surface_texture.present();
+    }
+
+    fn draw_track_lane(
+        &mut self,
+        lane_y: f32,
+        clips_x: f32,
+        clips_w: f32,
+        timeline_duration: f64,
+        track_idx: usize,
+        visual_i: usize,
+    ) {
+        let track = &self.timeline.tracks[track_idx];
+        let (clip_color, label_prefix) = match track.kind {
+            TrackKind::Video => (VIDEO_CLIP_COLOR, "V"),
+            TrackKind::Audio => (AUDIO_CLIP_COLOR, "A"),
+        };
+
+        // Lane background.
+        self.quads.push(Quad::colored(
+            [0.0, lane_y],
+            [clips_x + clips_w, TRACK_LANE_HEIGHT],
+            LANE_COLOR,
+        ));
+
+        // Track header label (V1, V2, A1, ...).
+        let header = format!("{}{}", label_prefix, visual_i + 1);
+        let baseline = lane_y + (TRACK_LANE_HEIGHT + self.text.ascent(CLIP_LABEL_SIZE)) * 0.5;
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [8.0, baseline],
+            &header,
+            CLIP_LABEL_SIZE,
+            TRACK_LABEL_COLOR,
+        );
+
+        // Clips.
+        for clip in &track.clips {
+            let x = clips_x + (clip.timeline_start / timeline_duration) as f32 * clips_w;
+            let cw = ((clip.duration() / timeline_duration) as f32 * clips_w).max(1.0);
+            self.quads
+                .push(Quad::colored([x, lane_y], [cw, TRACK_LANE_HEIGHT], clip_color));
+
+            if let Some(src) = self.media.get(clip.source) {
+                let label_pad = 6.0;
+                let label_baseline = lane_y + self.text.ascent(CLIP_LABEL_SIZE) + 4.0;
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [x + label_pad, label_baseline],
+                    &src.name,
+                    CLIP_LABEL_SIZE,
+                    CLIP_LABEL_COLOR,
+                );
+            }
+        }
     }
 }
 
