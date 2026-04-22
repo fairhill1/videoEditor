@@ -108,6 +108,15 @@ impl TextRenderer {
         m.ascent
     }
 
+    /// Pen-advance width of `text` at `size_px`. Cheap — uses font metrics only,
+    /// no rasterization or atlas lookups, so it's safe to call every frame for
+    /// layout decisions (e.g. right-aligning a timer readout).
+    pub fn measure_width(&self, text: &str, size_px: f32) -> f32 {
+        text.chars()
+            .map(|ch| self.font.metrics(ch, size_px).advance_width)
+            .sum()
+    }
+
     fn rasterize_and_upload(
         &mut self,
         queue: &wgpu::Queue,

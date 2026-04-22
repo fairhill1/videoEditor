@@ -40,6 +40,10 @@ const CLIP_LABEL_SIZE: f32 = 11.0;
 const LABEL_PAD: f32 = 10.0;
 const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 const PLAYHEAD_WIDTH: f32 = 2.0;
+const TIMER_SIZE: f32 = 14.0;
+const TIMER_PAD: f32 = 12.0;
+const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+const TIMER_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 
 // Timeline panel layout.
 const TRACK_LANE_HEIGHT: f32 = 32.0;
@@ -47,10 +51,30 @@ const TRACK_LANE_GAP: f32 = 2.0;
 const TRACK_HEADER_WIDTH: f32 = 48.0;
 const TIMELINE_TOP_PAD: f32 = 30.0; // clear space for the "TIMELINE" label
 
+// Media pool list layout.
+const POOL_LIST_TOP: f32 = 36.0; // below the MEDIA POOL label
+const POOL_ROW_HEIGHT: f32 = 36.0;
+const POOL_ROW_GAP: f32 = 4.0;
+const POOL_ROW_PAD: f32 = 8.0;
+const POOL_ROW_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
+const POOL_ROW_ACCENT: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
+const POOL_ITEM_NAME_SIZE: f32 = 12.0;
+const POOL_ITEM_META_SIZE: f32 = 10.0;
+const POOL_META_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 1.0];
+
 struct Clock {
     playing: bool,
     anchor_pos: f64,
     anchor_instant: Instant,
+}
+
+fn format_timecode(t: f64) -> String {
+    let total_ms = (t.max(0.0) * 1000.0) as u64;
+    let ms = total_ms % 1000;
+    let sec = total_ms / 1000;
+    let m = sec / 60;
+    let s = sec % 60;
+    format!("{:02}:{:02}.{:03}", m, s, ms)
 }
 
 impl Clock {
@@ -88,6 +112,33 @@ impl Clock {
     fn pause_at(&mut self, t: f64) {
         self.anchor_pos = t.max(0.0);
         self.playing = false;
+    }
+}
+
+/// Import a file into the pool. If it loaded, append a clip onto V1 after the
+/// last existing clip — this keeps dropped files immediately playable until we
+/// build a pool-to-timeline drag interaction.
+fn import_and_append(
+    media: &mut MediaPool,
+    timeline: &mut Timeline,
+    path: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    quads: &QuadRenderer,
+) {
+    match media.add(path, device, queue, quads) {
+        Ok(id) => {
+            let dur = media.duration(id);
+            let v1 = &mut timeline.tracks[0];
+            let start = v1.clips.last().map_or(0.0, |c| c.timeline_end());
+            v1.clips.push(Clip {
+                source: id,
+                source_in: 0.0,
+                source_out: dur,
+                timeline_start: start,
+            });
+        }
+        Err(e) => log::error!("failed to load {path}: {e}"),
     }
 }
 
@@ -141,21 +192,8 @@ impl State {
         timeline.tracks.push(Track::new(TrackKind::Audio));
 
         let mut media = MediaPool::new();
-        let mut cursor = 0.0_f64;
         for path in std::env::args().skip(1) {
-            match media.add(&path, &device, &queue, &quads) {
-                Ok(id) => {
-                    let dur = media.duration(id);
-                    timeline.tracks[0].clips.push(Clip {
-                        source: id,
-                        source_in: 0.0,
-                        source_out: dur,
-                        timeline_start: cursor,
-                    });
-                    cursor += dur;
-                }
-                Err(e) => log::error!("failed to load {path}: {e}"),
-            }
+            import_and_append(&mut media, &mut timeline, &path, &device, &queue, &quads);
         }
 
         let state = State {
@@ -225,6 +263,33 @@ impl State {
 
     fn toggle_playback(&mut self) {
         self.clock.toggle();
+    }
+
+    fn import_file(&mut self, path: &str) {
+        import_and_append(
+            &mut self.media,
+            &mut self.timeline,
+            path,
+            &self.device,
+            &self.queue,
+            &self.quads,
+        );
+    }
+
+    fn open_file_picker(&mut self) {
+        // Blocking dialog is fine here: a single-user editor pausing the event
+        // loop while the OS picker is up is the expected behavior.
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("video", &["mp4", "mov", "mkv", "webm", "avi", "m4v"])
+            .pick_files()
+        else {
+            return;
+        };
+        for path in paths {
+            if let Some(p) = path.to_str() {
+                self.import_file(p);
+            }
+        }
     }
 
     fn render(&mut self) {
@@ -391,6 +456,9 @@ impl State {
             ));
         }
 
+        // --- Media pool list ---
+        self.draw_media_pool_list(media_w, top_h);
+
         // --- Panel labels ---
         let baseline_y = LABEL_PAD + self.text.ascent(LABEL_SIZE);
         self.text.draw(
@@ -416,6 +484,31 @@ impl State {
             "TIMELINE",
             LABEL_SIZE,
             LABEL_COLOR,
+        );
+
+        // --- Playback timer: bottom-right of preview, above any video frame ---
+        let timer_text = format!(
+            "{} / {}",
+            format_timecode(t),
+            format_timecode(self.timeline.duration())
+        );
+        let timer_w = self.text.measure_width(&timer_text, TIMER_SIZE);
+        let timer_ascent = self.text.ascent(TIMER_SIZE);
+        let timer_baseline = top_h - TIMER_PAD;
+        let timer_left = w - TIMER_PAD - timer_w;
+        let bg_pad = 6.0;
+        self.quads.push(Quad::colored(
+            [timer_left - bg_pad, timer_baseline - timer_ascent - bg_pad * 0.5],
+            [timer_w + bg_pad * 2.0, timer_ascent + bg_pad],
+            TIMER_BG_COLOR,
+        ));
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [timer_left, timer_baseline],
+            &timer_text,
+            TIMER_SIZE,
+            TIMER_COLOR,
         );
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -444,6 +537,55 @@ impl State {
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         surface_texture.present();
+    }
+
+    fn draw_media_pool_list(&mut self, pool_w: f32, pool_h: f32) {
+        let row_x = LABEL_PAD;
+        let row_w = (pool_w - LABEL_PAD * 2.0).max(1.0);
+
+        for (i, &id) in self.media.ids().iter().enumerate() {
+            let row_y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
+            if row_y + POOL_ROW_HEIGHT > pool_h {
+                break; // beyond panel; scrolling will come later
+            }
+            let Some(src) = self.media.get(id) else {
+                continue;
+            };
+
+            self.quads.push(Quad::colored(
+                [row_x, row_y],
+                [row_w, POOL_ROW_HEIGHT],
+                POOL_ROW_COLOR,
+            ));
+            // Left-edge accent strip so video/audio is glanceable later.
+            self.quads.push(Quad::colored(
+                [row_x, row_y],
+                [3.0, POOL_ROW_HEIGHT],
+                POOL_ROW_ACCENT,
+            ));
+
+            let name_baseline = row_y + POOL_ROW_PAD + self.text.ascent(POOL_ITEM_NAME_SIZE);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [row_x + POOL_ROW_PAD + 4.0, name_baseline],
+                &src.name,
+                POOL_ITEM_NAME_SIZE,
+                CLIP_LABEL_COLOR,
+            );
+
+            let meta = format_timecode(src.stream.duration());
+            let meta_baseline =
+                row_y + POOL_ROW_HEIGHT - POOL_ROW_PAD * 0.5;
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [row_x + POOL_ROW_PAD + 4.0, meta_baseline],
+                &meta,
+                POOL_ITEM_META_SIZE,
+                POOL_META_COLOR,
+            );
+        }
     }
 
     fn draw_track_lane(
@@ -532,6 +674,11 @@ impl ApplicationHandler for App {
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
             }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(path_str) = path.to_str() {
+                    state.import_file(path_str);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 state.render();
                 state.get_window().request_redraw();
@@ -573,6 +720,18 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 state.toggle_playback();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyO),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                state.open_file_picker();
             }
             _ => (),
         }

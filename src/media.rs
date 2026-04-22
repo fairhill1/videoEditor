@@ -13,6 +13,7 @@ pub struct Source {
 
 pub struct MediaPool {
     sources: HashMap<SourceId, Source>,
+    order: Vec<SourceId>,
     next_id: u32,
 }
 
@@ -20,6 +21,7 @@ impl MediaPool {
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
+            order: Vec::new(),
             next_id: 0,
         }
     }
@@ -40,6 +42,7 @@ impl MediaPool {
         let id = SourceId(self.next_id);
         self.next_id += 1;
         self.sources.insert(id, Source { stream, name });
+        self.order.push(id);
         Ok(id)
     }
 
@@ -53,5 +56,9 @@ impl MediaPool {
 
     pub fn duration(&self, id: SourceId) -> f64 {
         self.sources.get(&id).map_or(0.0, |s| s.stream.duration())
+    }
+
+    pub fn ids(&self) -> &[SourceId] {
+        &self.order
     }
 }
