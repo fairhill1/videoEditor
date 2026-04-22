@@ -76,4 +76,31 @@ impl Timeline {
             .filter(|(_, tr)| tr.kind == TrackKind::Video)
             .find_map(|(i, tr)| tr.active_clip(t).map(|c| (i, c)))
     }
+
+    /// Split every clip containing `t` into two clips meeting at `t`. Clips whose
+    /// start aligns exactly with `t` are left alone — there's nothing to split.
+    pub fn split_at(&mut self, t: f64) {
+        for track in &mut self.tracks {
+            let mut i = 0;
+            while i < track.clips.len() {
+                let orig = track.clips[i];
+                if orig.contains(t) && t > orig.timeline_start {
+                    let split_source_t = orig.source_time(t);
+                    track.clips[i].source_out = split_source_t;
+                    track.clips.insert(
+                        i + 1,
+                        Clip {
+                            source: orig.source,
+                            source_in: split_source_t,
+                            source_out: orig.source_out,
+                            timeline_start: t,
+                        },
+                    );
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
 }

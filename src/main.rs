@@ -62,6 +62,49 @@ const POOL_ITEM_NAME_SIZE: f32 = 12.0;
 const POOL_ITEM_META_SIZE: f32 = 10.0;
 const POOL_META_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 1.0];
 
+// Clip interaction.
+const CLIP_EDGE_GRAB_PX: f32 = 6.0;
+const MIN_CLIP_DURATION: f64 = 0.05; // seconds — keeps trim from zeroing a clip
+const DRAG_GHOST_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 0.55];
+
+#[derive(Copy, Clone, Debug)]
+enum DragMode {
+    None,
+    Scrub,
+    PoolDrag { source: SourceId },
+    ClipMove { track: usize, idx: usize, grab_t_offset: f64 },
+    ClipTrimLeft { track: usize, idx: usize },
+    ClipTrimRight { track: usize, idx: usize },
+}
+
+enum TimelineHit {
+    None,
+    Lane { track: usize },
+    ClipBody { track: usize, idx: usize, grab_t_offset: f64 },
+    ClipTrimLeft { track: usize, idx: usize },
+    ClipTrimRight { track: usize, idx: usize },
+}
+
+#[derive(Copy, Clone)]
+struct TimelineLayout {
+    top: f32,
+    clips_x: f32,
+    clips_w: f32,
+    center_y: f32,
+    duration: f64,
+}
+
+impl TimelineLayout {
+    fn cursor_to_t(&self, cursor_x: f32) -> f64 {
+        let ratio = ((cursor_x - self.clips_x) / self.clips_w).clamp(0.0, 1.0) as f64;
+        ratio * self.duration
+    }
+
+    fn t_to_x(&self, t: f64) -> f32 {
+        self.clips_x + (t / self.duration) as f32 * self.clips_w
+    }
+}
+
 struct Clock {
     playing: bool,
     anchor_pos: f64,
@@ -115,30 +158,15 @@ impl Clock {
     }
 }
 
-/// Import a file into the pool. If it loaded, append a clip onto V1 after the
-/// last existing clip — this keeps dropped files immediately playable until we
-/// build a pool-to-timeline drag interaction.
-fn import_and_append(
+fn import_source(
     media: &mut MediaPool,
-    timeline: &mut Timeline,
     path: &str,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     quads: &QuadRenderer,
 ) {
-    match media.add(path, device, queue, quads) {
-        Ok(id) => {
-            let dur = media.duration(id);
-            let v1 = &mut timeline.tracks[0];
-            let start = v1.clips.last().map_or(0.0, |c| c.timeline_end());
-            v1.clips.push(Clip {
-                source: id,
-                source_in: 0.0,
-                source_out: dur,
-                timeline_start: start,
-            });
-        }
-        Err(e) => log::error!("failed to load {path}: {e}"),
+    if let Err(e) = media.add(path, device, queue, quads) {
+        log::error!("failed to load {path}: {e}");
     }
 }
 
@@ -156,7 +184,7 @@ struct State {
     timeline: Timeline,
     clock: Clock,
     cursor: [f32; 2],
-    scrubbing: bool,
+    drag: DragMode,
     last_playing_source: Option<SourceId>,
 }
 
@@ -193,7 +221,7 @@ impl State {
 
         let mut media = MediaPool::new();
         for path in std::env::args().skip(1) {
-            import_and_append(&mut media, &mut timeline, &path, &device, &queue, &quads);
+            import_source(&mut media, &path, &device, &queue, &quads);
         }
 
         let state = State {
@@ -210,7 +238,7 @@ impl State {
             timeline,
             clock: Clock::new(),
             cursor: [0.0, 0.0],
-            scrubbing: false,
+            drag: DragMode::None,
             last_playing_source: None,
         };
 
@@ -246,19 +274,230 @@ impl State {
         (self.size.height as f32 * TOP_BOTTOM_SPLIT).round()
     }
 
-    fn seek_to_cursor_x(&mut self) {
+    fn timeline_layout(&self) -> TimelineLayout {
+        let w = self.size.width as f32;
+        let top = self.timeline_top();
+        let bottom = self.size.height as f32;
+        let tracks_top = top + TIMELINE_TOP_PAD;
+        TimelineLayout {
+            top,
+            clips_x: TRACK_HEADER_WIDTH,
+            clips_w: (w - TRACK_HEADER_WIDTH).max(1.0),
+            center_y: tracks_top + (bottom - tracks_top) * 0.5,
+            duration: self.timeline.duration().max(1.0),
+        }
+    }
+
+    fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
+        let w = self.size.width as f32;
+        let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
+        let top_h = self.timeline_top();
+        if cursor_x < 0.0 || cursor_x > media_w || cursor_y < POOL_LIST_TOP || cursor_y > top_h {
+            return None;
+        }
+        let stride = POOL_ROW_HEIGHT + POOL_ROW_GAP;
+        let rel_y = cursor_y - POOL_LIST_TOP;
+        let i = (rel_y / stride).floor() as usize;
+        let within = rel_y - i as f32 * stride;
+        if within > POOL_ROW_HEIGHT {
+            return None; // in the gap between rows
+        }
+        self.media.ids().get(i).copied()
+    }
+
+    /// Locate the visual track lane under `cursor_y`. Returns the track index
+    /// whose lane *center* is nearest — gaps snap to the nearer lane so drops
+    /// near a boundary feel forgiving.
+    fn track_at_y(&self, cursor_y: f32, layout: &TimelineLayout) -> Option<usize> {
+        if cursor_y < layout.top + TIMELINE_TOP_PAD {
+            return None;
+        }
+        let stride = TRACK_LANE_HEIGHT + TRACK_LANE_GAP;
+        let video_idxs: Vec<usize> = self
+            .timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| tr.kind == TrackKind::Video)
+            .map(|(i, _)| i)
+            .collect();
+        let audio_idxs: Vec<usize> = self
+            .timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, tr)| tr.kind == TrackKind::Audio)
+            .map(|(i, _)| i)
+            .collect();
+
+        if cursor_y < layout.center_y {
+            let dy = layout.center_y - cursor_y;
+            let visual_i = (dy / stride).floor() as usize;
+            video_idxs.get(visual_i).copied()
+        } else {
+            let dy = cursor_y - layout.center_y;
+            let visual_i = (dy / stride).floor() as usize;
+            audio_idxs.get(visual_i).copied()
+        }
+    }
+
+    fn timeline_hit(&self, cursor_x: f32, cursor_y: f32) -> TimelineHit {
+        let layout = self.timeline_layout();
+        if cursor_y < layout.top {
+            return TimelineHit::None;
+        }
+        let Some(track_idx) = self.track_at_y(cursor_y, &layout) else {
+            return TimelineHit::None;
+        };
+        if cursor_x < layout.clips_x {
+            return TimelineHit::None;
+        }
+        let cursor_t = layout.cursor_to_t(cursor_x);
+        let track = &self.timeline.tracks[track_idx];
+        for (i, clip) in track.clips.iter().enumerate() {
+            let x0 = layout.t_to_x(clip.timeline_start);
+            let x1 = layout.t_to_x(clip.timeline_end());
+            if cursor_x >= x0 - CLIP_EDGE_GRAB_PX && cursor_x <= x0 + CLIP_EDGE_GRAB_PX {
+                return TimelineHit::ClipTrimLeft { track: track_idx, idx: i };
+            }
+            if cursor_x >= x1 - CLIP_EDGE_GRAB_PX && cursor_x <= x1 + CLIP_EDGE_GRAB_PX {
+                return TimelineHit::ClipTrimRight { track: track_idx, idx: i };
+            }
+            if cursor_x >= x0 && cursor_x <= x1 {
+                return TimelineHit::ClipBody {
+                    track: track_idx,
+                    idx: i,
+                    grab_t_offset: cursor_t - clip.timeline_start,
+                };
+            }
+        }
+        TimelineHit::Lane { track: track_idx }
+    }
+
+    fn begin_drag(&mut self) {
+        let [cx, cy] = self.cursor;
+        if let Some(source) = self.pool_hit(cx, cy) {
+            self.drag = DragMode::PoolDrag { source };
+            return;
+        }
+        match self.timeline_hit(cx, cy) {
+            TimelineHit::ClipTrimLeft { track, idx } => {
+                self.drag = DragMode::ClipTrimLeft { track, idx };
+            }
+            TimelineHit::ClipTrimRight { track, idx } => {
+                self.drag = DragMode::ClipTrimRight { track, idx };
+            }
+            TimelineHit::ClipBody { track, idx, grab_t_offset } => {
+                self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
+            }
+            TimelineHit::Lane { .. } => {
+                self.drag = DragMode::Scrub;
+                self.apply_scrub();
+            }
+            TimelineHit::None => {}
+        }
+    }
+
+    fn update_drag(&mut self) {
+        match self.drag {
+            DragMode::None | DragMode::PoolDrag { .. } => {}
+            DragMode::Scrub => self.apply_scrub(),
+            DragMode::ClipMove { track, idx, grab_t_offset } => {
+                let layout = self.timeline_layout();
+                let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                let clip = &mut self.timeline.tracks[track].clips[idx];
+                clip.timeline_start = (cursor_t - grab_t_offset).max(0.0);
+            }
+            DragMode::ClipTrimLeft { track, idx } => {
+                let layout = self.timeline_layout();
+                let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                let clip = &mut self.timeline.tracks[track].clips[idx];
+                // Hold the right edge fixed; shift source_in and timeline_start together.
+                let end = clip.timeline_end();
+                let new_start = cursor_t.clamp(
+                    (clip.timeline_start - clip.source_in).max(0.0),
+                    end - MIN_CLIP_DURATION,
+                );
+                let delta = new_start - clip.timeline_start;
+                clip.source_in += delta;
+                clip.timeline_start = new_start;
+                // timeline_end is unchanged: the shift in timeline_start exactly
+                // cancels the shift in source_in, and source_out is untouched.
+            }
+            DragMode::ClipTrimRight { track, idx } => {
+                let layout = self.timeline_layout();
+                let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                let clip = &mut self.timeline.tracks[track].clips[idx];
+                let min_end = clip.timeline_start + MIN_CLIP_DURATION;
+                let source_cap = {
+                    let src_dur = self.media.duration(clip.source);
+                    clip.timeline_start + (src_dur - clip.source_in)
+                };
+                let new_end = cursor_t.clamp(min_end, source_cap);
+                clip.source_out = clip.source_in + (new_end - clip.timeline_start);
+            }
+        }
+    }
+
+    fn end_drag(&mut self) {
+        if let DragMode::PoolDrag { source } = self.drag {
+            let [cx, cy] = self.cursor;
+            let layout = self.timeline_layout();
+            if let Some(track_idx) = self.track_at_y(cy, &layout) {
+                if self.timeline.tracks[track_idx].kind == TrackKind::Video {
+                    let drop_t = layout.cursor_to_t(cx).max(0.0);
+                    let dur = self.media.duration(source);
+                    self.timeline.tracks[track_idx].clips.push(Clip {
+                        source,
+                        source_in: 0.0,
+                        source_out: dur,
+                        timeline_start: drop_t,
+                    });
+                }
+            }
+        }
+        self.drag = DragMode::None;
+    }
+
+    fn apply_scrub(&mut self) {
         let duration = self.timeline.duration();
         if duration <= 0.0 {
             return;
         }
-        let w = self.size.width as f32;
-        let clips_w = (w - TRACK_HEADER_WIDTH).max(1.0);
-        let ratio = ((self.cursor[0] - TRACK_HEADER_WIDTH) / clips_w).clamp(0.0, 1.0) as f64;
-        let t = ratio * duration;
-        // Only update the clock — render() will do the decoder work at most once
-        // per frame. Doing the seek here too would pile up expensive ffmpeg seeks
-        // on every mousemove and freeze the event loop.
+        let layout = self.timeline_layout();
+        let t = layout.cursor_to_t(self.cursor[0]);
+        // Only update the clock — render() does the decoder work at most once per
+        // frame. Doing a seek per mousemove piles up expensive ffmpeg seeks and
+        // freezes the event loop.
         self.clock.set_pos(t);
+    }
+
+    fn current_fps(&self) -> f64 {
+        let t = self.clock.pos();
+        self.timeline
+            .topmost_video_clip(t)
+            .and_then(|(_, c)| self.media.get(c.source))
+            .map(|s| s.stream.frame_rate())
+            .unwrap_or(30.0)
+    }
+
+    fn step_frame(&mut self, dir: f64) {
+        if self.clock.playing {
+            self.clock.pause_at(self.clock.pos());
+        }
+        let fps = self.current_fps().max(1.0);
+        let dt = dir / fps;
+        let mut new_t = (self.clock.pos() + dt).max(0.0);
+        let duration = self.timeline.duration();
+        if duration > 0.0 {
+            new_t = new_t.min(duration);
+        }
+        self.clock.set_pos(new_t);
+    }
+
+    fn split_at_playhead(&mut self) {
+        let t = self.clock.pos();
+        self.timeline.split_at(t);
     }
 
     fn toggle_playback(&mut self) {
@@ -266,9 +505,8 @@ impl State {
     }
 
     fn import_file(&mut self, path: &str) {
-        import_and_append(
+        import_source(
             &mut self.media,
-            &mut self.timeline,
             path,
             &self.device,
             &self.queue,
@@ -454,6 +692,17 @@ impl State {
                 [PLAYHEAD_WIDTH, bottom_h],
                 PLAYHEAD_COLOR,
             ));
+        }
+
+        // --- Pool-drag ghost: so it's obvious you're carrying a clip ---
+        if let DragMode::PoolDrag { source } = self.drag {
+            let dur = self.media.duration(source);
+            let ghost_w = ((dur / timeline_duration_display) as f32 * clips_w).max(40.0);
+            let ghost_h = TRACK_LANE_HEIGHT;
+            let gx = self.cursor[0] - ghost_w * 0.5;
+            let gy = self.cursor[1] - ghost_h * 0.5;
+            self.quads
+                .push(Quad::colored([gx, gy], [ghost_w, ghost_h], DRAG_GHOST_COLOR));
         }
 
         // --- Media pool list ---
@@ -688,51 +937,42 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = [position.x as f32, position.y as f32];
-                if state.scrubbing {
-                    state.seek_to_cursor_x();
-                }
+                state.update_drag();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                if state.cursor[1] >= state.timeline_top() {
-                    state.scrubbing = true;
-                    state.seek_to_cursor_x();
-                }
+                state.begin_drag();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
             } => {
-                state.scrubbing = false;
+                state.end_drag();
             }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Space),
+                        physical_key: PhysicalKey::Code(code),
                         state: ElementState::Pressed,
-                        repeat: false,
+                        repeat,
                         ..
                     },
                 ..
-            } => {
-                state.toggle_playback();
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyO),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                state.open_file_picker();
-            }
+            } => match code {
+                // Arrows repeat so holding steps through frames.
+                KeyCode::ArrowLeft => state.step_frame(-1.0),
+                KeyCode::ArrowRight => state.step_frame(1.0),
+                // The rest are edge-triggered to avoid repeat spam.
+                _ if repeat => {}
+                KeyCode::Space => state.toggle_playback(),
+                KeyCode::KeyO => state.open_file_picker(),
+                KeyCode::KeyS => state.split_at_playhead(),
+                _ => {}
+            },
             _ => (),
         }
     }

@@ -13,6 +13,7 @@ pub struct VideoStream {
     duration_seconds: f64,
     width: u32,
     height: u32,
+    frame_rate: f64,
     texture: Texture,
     pending: Option<(ffmpeg::frame::Video, f64)>,
     rgba_buf: Vec<u8>,
@@ -44,16 +45,23 @@ impl VideoStream {
             0.0
         };
 
-        let (stream_index, time_base_seconds, parameters) = {
+        let (stream_index, time_base_seconds, parameters, frame_rate) = {
             let input = ictx
                 .streams()
                 .best(ffmpeg::media::Type::Video)
                 .ok_or(ffmpeg::Error::StreamNotFound)?;
             let tb = input.time_base();
+            let afr = input.avg_frame_rate();
+            let fr = {
+                let num = afr.numerator() as f64;
+                let den = afr.denominator() as f64;
+                if num > 0.0 && den > 0.0 { num / den } else { 30.0 }
+            };
             (
                 input.index(),
                 tb.numerator() as f64 / tb.denominator() as f64,
                 input.parameters(),
+                fr,
             )
         };
 
@@ -85,6 +93,7 @@ impl VideoStream {
             duration_seconds,
             width,
             height,
+            frame_rate,
             texture,
             pending: None,
             rgba_buf: vec![0u8; (width * height * 4) as usize],
@@ -128,6 +137,10 @@ impl VideoStream {
 
     pub fn duration(&self) -> f64 {
         self.duration_seconds
+    }
+
+    pub fn frame_rate(&self) -> f64 {
+        self.frame_rate
     }
 
     /// Decode frames up to time `t` (seconds). Only the latest frame with `pts <= t`
