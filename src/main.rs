@@ -1,3 +1,4 @@
+mod audio;
 mod media;
 mod quad;
 mod text;
@@ -5,7 +6,6 @@ mod timeline;
 mod video;
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use winit::{
     application::ApplicationHandler,
@@ -16,6 +16,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use audio::AudioEngine;
 use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
@@ -33,6 +34,7 @@ const LANE_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
 const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.22, 1.0];
 const VIDEO_CLIP_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
 const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
+const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
 const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
 const TRACK_LABEL_COLOR: [f32; 4] = [0.45, 0.45, 0.50, 1.0];
@@ -75,7 +77,8 @@ const POOL_DUR_TEXT: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 // Clip interaction.
 const CLIP_EDGE_GRAB_PX: f32 = 6.0;
 const MIN_CLIP_DURATION: f64 = 0.05; // seconds — keeps trim from zeroing a clip
-const DRAG_GHOST_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 0.55];
+const DRAG_GHOST_VIDEO_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 0.55];
+const DRAG_GHOST_AUDIO_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 0.55];
 
 #[derive(Copy, Clone, Debug)]
 enum DragMode {
@@ -125,12 +128,6 @@ impl TimelineLayout {
     }
 }
 
-struct Clock {
-    playing: bool,
-    anchor_pos: f64,
-    anchor_instant: Instant,
-}
-
 /// Shorten `text` so it fits within `max_w` when rendered at `size_px`,
 /// appending an ellipsis if truncation happened. Returns the original string
 /// when it already fits, so the common case stays zero-allocation at the call
@@ -167,44 +164,6 @@ fn format_timecode(t: f64) -> String {
     format!("{:02}:{:02}.{:03}", m, s, ms)
 }
 
-impl Clock {
-    fn new() -> Self {
-        Self {
-            playing: false,
-            anchor_pos: 0.0,
-            anchor_instant: Instant::now(),
-        }
-    }
-
-    fn pos(&self) -> f64 {
-        if self.playing {
-            self.anchor_pos + self.anchor_instant.elapsed().as_secs_f64()
-        } else {
-            self.anchor_pos
-        }
-    }
-
-    fn toggle(&mut self) {
-        if self.playing {
-            self.anchor_pos = self.pos();
-            self.playing = false;
-        } else {
-            self.anchor_instant = Instant::now();
-            self.playing = true;
-        }
-    }
-
-    fn set_pos(&mut self, t: f64) {
-        self.anchor_pos = t.max(0.0);
-        self.anchor_instant = Instant::now();
-    }
-
-    fn pause_at(&mut self, t: f64) {
-        self.anchor_pos = t.max(0.0);
-        self.playing = false;
-    }
-}
-
 fn import_source(
     media: &mut MediaPool,
     path: &str,
@@ -229,7 +188,7 @@ struct State {
     text: TextRenderer,
     media: MediaPool,
     timeline: Timeline,
-    clock: Clock,
+    audio: AudioEngine,
     cursor: [f32; 2],
     drag: DragMode,
     last_playing_source: Option<SourceId>,
@@ -283,7 +242,7 @@ impl State {
             text,
             media,
             timeline,
-            clock: Clock::new(),
+            audio: AudioEngine::new(),
             cursor: [0.0, 0.0],
             drag: DragMode::None,
             last_playing_source: None,
@@ -460,7 +419,9 @@ impl State {
                 // Allow vertical drag: if the cursor is over a different
                 // same-kind track, relocate the clip there before nudging x.
                 // Cross-kind moves (V↔A) are blocked — a video clip on an
-                // audio lane has no meaningful playback behavior yet.
+                // audio lane has no meaningful playback behavior yet. Linked
+                // siblings stay on their own tracks; only the dragged clip
+                // changes track membership.
                 let (track, idx) =
                     if let Some(hover) = self.track_at_y(self.cursor[1], &layout) {
                         let src_kind = self.timeline.tracks[track].kind;
@@ -482,37 +443,103 @@ impl State {
                         (track, idx)
                     };
                 let cursor_t = layout.cursor_to_t(self.cursor[0]);
-                let clip = &mut self.timeline.tracks[track].clips[idx];
-                clip.timeline_start = (cursor_t - grab_t_offset).max(0.0);
+                let current_start =
+                    self.timeline.tracks[track].clips[idx].timeline_start;
+                let desired_delta = (cursor_t - grab_t_offset) - current_start;
+                self.apply_move_delta(track, idx, desired_delta);
             }
             DragMode::ClipTrimLeft { track, idx } => {
                 let layout = self.timeline_layout();
                 let cursor_t = layout.cursor_to_t(self.cursor[0]);
-                let clip = &mut self.timeline.tracks[track].clips[idx];
-                // Hold the right edge fixed; shift source_in and timeline_start together.
-                let end = clip.timeline_end();
-                let new_start = cursor_t.clamp(
-                    (clip.timeline_start - clip.source_in).max(0.0),
-                    end - MIN_CLIP_DURATION,
-                );
-                let delta = new_start - clip.timeline_start;
-                clip.source_in += delta;
-                clip.timeline_start = new_start;
-                // timeline_end is unchanged: the shift in timeline_start exactly
-                // cancels the shift in source_in, and source_out is untouched.
+                let current_start =
+                    self.timeline.tracks[track].clips[idx].timeline_start;
+                let desired_delta = cursor_t - current_start;
+                self.apply_trim_left_delta(track, idx, desired_delta);
             }
             DragMode::ClipTrimRight { track, idx } => {
                 let layout = self.timeline_layout();
                 let cursor_t = layout.cursor_to_t(self.cursor[0]);
-                let clip = &mut self.timeline.tracks[track].clips[idx];
-                let min_end = clip.timeline_start + MIN_CLIP_DURATION;
-                let source_cap = {
-                    let src_dur = self.media.duration(clip.source);
-                    clip.timeline_start + (src_dur - clip.source_in)
-                };
-                let new_end = cursor_t.clamp(min_end, source_cap);
-                clip.source_out = clip.source_in + (new_end - clip.timeline_start);
+                let current_end =
+                    self.timeline.tracks[track].clips[idx].timeline_end();
+                let desired_delta = cursor_t - current_end;
+                self.apply_trim_right_delta(track, idx, desired_delta);
             }
+        }
+    }
+
+    /// Indices of every clip linked to `(track, idx)`, including itself.
+    /// Unlinked clips return just their own position.
+    fn linked_siblings(&self, track: usize, idx: usize) -> Vec<(usize, usize)> {
+        let link = self.timeline.tracks[track].clips[idx].link;
+        let Some(link_id) = link else {
+            return vec![(track, idx)];
+        };
+        let mut v = Vec::new();
+        for (ti, tr) in self.timeline.tracks.iter().enumerate() {
+            for (ci, c) in tr.clips.iter().enumerate() {
+                if c.link == Some(link_id) {
+                    v.push((ti, ci));
+                }
+            }
+        }
+        v
+    }
+
+    fn apply_move_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
+        let siblings = self.linked_siblings(track, idx);
+        // Clamp so the earliest-starting sibling doesn't go negative —
+        // applying the same delta everywhere preserves the sync offset.
+        let min_start = siblings
+            .iter()
+            .map(|&(ti, ci)| self.timeline.tracks[ti].clips[ci].timeline_start)
+            .fold(f64::INFINITY, f64::min);
+        let delta = desired_delta.max(-min_start);
+        for (ti, ci) in siblings {
+            self.timeline.tracks[ti].clips[ci].timeline_start += delta;
+        }
+    }
+
+    fn apply_trim_left_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
+        let siblings = self.linked_siblings(track, idx);
+        // Delta bounds: the same delta shifts every sibling's source_in and
+        // timeline_start, so the allowed range is the intersection of each
+        // sibling's own limits.
+        let mut min_delta = f64::NEG_INFINITY;
+        let mut max_delta = f64::INFINITY;
+        for &(ti, ci) in &siblings {
+            let c = &self.timeline.tracks[ti].clips[ci];
+            min_delta = min_delta.max(-c.source_in);
+            min_delta = min_delta.max(-c.timeline_start);
+            max_delta = max_delta.min(c.duration() - MIN_CLIP_DURATION);
+        }
+        let delta = desired_delta.clamp(min_delta, max_delta);
+        for (ti, ci) in siblings {
+            let c = &mut self.timeline.tracks[ti].clips[ci];
+            c.source_in += delta;
+            c.timeline_start += delta;
+        }
+    }
+
+    fn apply_trim_right_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
+        let siblings = self.linked_siblings(track, idx);
+        let mut min_delta = f64::NEG_INFINITY;
+        let mut max_delta = f64::INFINITY;
+        for &(ti, ci) in &siblings {
+            let c = &self.timeline.tracks[ti].clips[ci];
+            // Can't shrink below the minimum clip duration.
+            min_delta = min_delta.max(MIN_CLIP_DURATION - c.duration());
+            // Can't extend past the source's end — cap per-track since video
+            // and audio streams of the same source can have different lengths.
+            let src_dur = match self.timeline.tracks[ti].kind {
+                TrackKind::Video => self.media.duration(c.source),
+                TrackKind::Audio => self.media.audio_duration(c.source).unwrap_or(c.source_out),
+            };
+            max_delta = max_delta.min(src_dur - c.source_out);
+        }
+        let delta = desired_delta.clamp(min_delta, max_delta);
+        for (ti, ci) in siblings {
+            let c = &mut self.timeline.tracks[ti].clips[ci];
+            c.source_out += delta;
         }
     }
 
@@ -521,15 +548,56 @@ impl State {
             let [cx, cy] = self.cursor;
             let layout = self.timeline_layout();
             if let Some(track_idx) = self.track_at_y(cy, &layout) {
-                if self.timeline.tracks[track_idx].kind == TrackKind::Video {
-                    let drop_t = layout.cursor_to_t(cx).max(0.0);
-                    let dur = self.media.duration(source);
-                    self.timeline.tracks[track_idx].clips.push(Clip {
-                        source,
-                        source_in: 0.0,
-                        source_out: dur,
-                        timeline_start: drop_t,
-                    });
+                let drop_t = layout.cursor_to_t(cx).max(0.0);
+                let kind = self.timeline.tracks[track_idx].kind;
+                match kind {
+                    TrackKind::Video => {
+                        let dur = self.media.duration(source);
+                        // Decide up front whether we're auto-pairing audio —
+                        // only then do we need a link id, and both sides must
+                        // use the same one.
+                        let audio_target = self
+                            .media
+                            .has_audio(source)
+                            .then(|| {
+                                self.timeline
+                                    .tracks
+                                    .iter()
+                                    .position(|t| t.kind == TrackKind::Audio)
+                            })
+                            .flatten();
+                        let link = audio_target.map(|_| self.timeline.new_link_id());
+                        self.timeline.tracks[track_idx].clips.push(Clip {
+                            source,
+                            source_in: 0.0,
+                            source_out: dur,
+                            timeline_start: drop_t,
+                            link,
+                        });
+                        if let Some(audio_idx) = audio_target {
+                            let adur = self.media.audio_duration(source).unwrap_or(dur);
+                            self.timeline.tracks[audio_idx].clips.push(Clip {
+                                source,
+                                source_in: 0.0,
+                                source_out: adur,
+                                timeline_start: drop_t,
+                                link,
+                            });
+                        }
+                    }
+                    TrackKind::Audio => {
+                        if let Some(adur) = self.media.audio_duration(source) {
+                            self.timeline.tracks[track_idx].clips.push(Clip {
+                                source,
+                                source_in: 0.0,
+                                source_out: adur,
+                                timeline_start: drop_t,
+                                link: None,
+                            });
+                        }
+                        // Dropping a video-only source on an audio lane is a
+                        // no-op — there's nothing to play back there.
+                    }
                 }
             }
         }
@@ -543,14 +611,14 @@ impl State {
         }
         let layout = self.timeline_layout();
         let t = layout.cursor_to_t(self.cursor[0]);
-        // Only update the clock — render() does the decoder work at most once per
-        // frame. Doing a seek per mousemove piles up expensive ffmpeg seeks and
-        // freezes the event loop.
-        self.clock.set_pos(t);
+        // Audio engine owns the playhead — setting position also flushes any
+        // pre-mixed samples so the next tick refills from the new time,
+        // keeping scrub snappy instead of dragging 150ms of stale audio.
+        self.audio.set_position(t);
     }
 
     fn current_fps(&self) -> f64 {
-        let t = self.clock.pos();
+        let t = self.audio.position();
         self.timeline
             .topmost_video_clip(t)
             .and_then(|(_, c)| self.media.get(c.source))
@@ -559,26 +627,26 @@ impl State {
     }
 
     fn step_frame(&mut self, dir: f64) {
-        if self.clock.playing {
-            self.clock.pause_at(self.clock.pos());
+        if self.audio.playing() {
+            self.audio.set_playing(false);
         }
         let fps = self.current_fps().max(1.0);
         let dt = dir / fps;
-        let mut new_t = (self.clock.pos() + dt).max(0.0);
+        let mut new_t = (self.audio.position() + dt).max(0.0);
         let duration = self.timeline.duration();
         if duration > 0.0 {
             new_t = new_t.min(duration);
         }
-        self.clock.set_pos(new_t);
+        self.audio.set_position(new_t);
     }
 
     fn split_at_playhead(&mut self) {
-        let t = self.clock.pos();
+        let t = self.audio.position();
         self.timeline.split_at(t);
     }
 
     fn toggle_playback(&mut self) {
-        self.clock.toggle();
+        self.audio.toggle();
     }
 
     fn import_file(&mut self, path: &str) {
@@ -638,15 +706,31 @@ impl State {
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
         let preview_w = w - media_w;
 
-        // Tick the clock. Pause at end of timeline so we don't run past the content.
+        // Clamp playhead to [0, duration]. The audio engine drives time forward
+        // while playing; if we ran past the end, pause and park at the end so
+        // video and audio agree on "stopped".
         let duration = self.timeline.duration();
-        let mut t = self.clock.pos();
+        let mut t = self.audio.position();
         if duration <= 0.0 {
-            self.clock.pause_at(0.0);
+            self.audio.set_playing(false);
+            self.audio.set_position(0.0);
             t = 0.0;
         } else if t >= duration {
-            self.clock.pause_at(duration);
+            self.audio.set_playing(false);
+            self.audio.set_position(duration);
             t = duration;
+        }
+
+        // Refill the audio mix buffer before doing render work. Done early so
+        // if render is slow the audio thread still has samples queued.
+        {
+            let Self {
+                audio,
+                timeline,
+                media,
+                ..
+            } = self;
+            audio.tick(timeline, media);
         }
 
         self.quads.clear();
@@ -792,29 +876,37 @@ impl State {
 
         // --- Pool-drag ghost: previews where the clip will land ---
         // Start-aligned to the cursor (matches `end_drag`'s drop_t semantics)
-        // and snapped to the hovered video lane's y when over one, so the
-        // preview rect is exactly the rect that'll be created on mouse-up.
+        // and snapped to the hovered lane's y when over one, so the preview
+        // rect is exactly the rect that'll be created on mouse-up.
         if let DragMode::PoolDrag { source } = self.drag {
             let dur = self.media.duration(source);
             let ghost_w = ((dur / timeline_duration_display) as f32 * clips_w).max(40.0);
             let ghost_h = lane_h;
             let layout = self.timeline_layout();
-            let over_video_lane = self
-                .track_at_y(self.cursor[1], &layout)
-                .filter(|&i| self.timeline.tracks[i].kind == TrackKind::Video);
+            let over_lane = self.track_at_y(self.cursor[1], &layout);
             let gx = self.cursor[0].max(clips_x);
-            let gy = match over_video_lane {
-                Some(track_idx) => {
-                    let visual_i = video_tracks.iter().position(|&i| i == track_idx).unwrap_or(0);
-                    center_y
-                        - half_gap
-                        - lane_h
-                        - visual_i as f32 * (lane_h + TRACK_LANE_GAP)
-                }
-                None => self.cursor[1] - ghost_h * 0.5,
+            let (gy, ghost_color) = match over_lane {
+                Some(track_idx) => match self.timeline.tracks[track_idx].kind {
+                    TrackKind::Video => {
+                        let visual_i =
+                            video_tracks.iter().position(|&i| i == track_idx).unwrap_or(0);
+                        let y = center_y
+                            - half_gap
+                            - lane_h
+                            - visual_i as f32 * (lane_h + TRACK_LANE_GAP);
+                        (y, DRAG_GHOST_VIDEO_COLOR)
+                    }
+                    TrackKind::Audio => {
+                        let visual_i =
+                            audio_tracks.iter().position(|&i| i == track_idx).unwrap_or(0);
+                        let y = center_y + half_gap + visual_i as f32 * (lane_h + TRACK_LANE_GAP);
+                        (y, DRAG_GHOST_AUDIO_COLOR)
+                    }
+                },
+                None => (self.cursor[1] - ghost_h * 0.5, DRAG_GHOST_VIDEO_COLOR),
             };
             self.quads
-                .push(Quad::colored([gx, gy], [ghost_w, ghost_h], DRAG_GHOST_COLOR));
+                .push(Quad::colored([gx, gy], [ghost_w, ghost_h], ghost_color));
         }
 
         // --- Media pool list ---
@@ -1021,6 +1113,56 @@ impl State {
             let cw = ((clip.duration() / timeline_duration) as f32 * clips_w).max(1.0);
             self.quads
                 .push(Quad::colored([x, lane_y], [cw, lane_h], clip_color));
+
+            // Waveform bars for audio clips. One 1px-wide vertical rect per
+            // pixel column, height proportional to the max peak in that
+            // column's source-time window. Label is drawn after so it sits
+            // on top of the waveform.
+            if track.kind == TrackKind::Audio && cw > 1.0 {
+                if let Some(src) = self.media.get(clip.source) {
+                    if let Some(wf) = src.waveform.as_ref() {
+                        if !wf.peaks.is_empty() {
+                            let clip_dur = clip.duration();
+                            let seconds_per_px = clip_dur / cw as f64;
+                            let mid_y = lane_y + lane_h * 0.5;
+                            let max_half_h = (lane_h * 0.45_f32).max(1.0);
+                            let n_cols = cw.ceil() as i32;
+                            let n_peaks = wf.peaks.len();
+                            for col in 0..n_cols {
+                                let src_t_start =
+                                    clip.source_in + col as f64 * seconds_per_px;
+                                let src_t_end = src_t_start + seconds_per_px;
+                                let idx_start =
+                                    (src_t_start / wf.bucket_seconds) as usize;
+                                let mut idx_end = ((src_t_end / wf.bucket_seconds)
+                                    .ceil()
+                                    as usize)
+                                    .max(idx_start + 1);
+                                if idx_start >= n_peaks {
+                                    break;
+                                }
+                                idx_end = idx_end.min(n_peaks);
+                                if idx_start >= idx_end {
+                                    continue;
+                                }
+                                let mut peak = 0.0f32;
+                                for &p in &wf.peaks[idx_start..idx_end] {
+                                    if p > peak {
+                                        peak = p;
+                                    }
+                                }
+                                let half_h = (peak * max_half_h).max(0.5);
+                                let px = x + col as f32;
+                                self.quads.push(Quad::colored(
+                                    [px, mid_y - half_h],
+                                    [1.0, half_h * 2.0],
+                                    AUDIO_WAVE_COLOR,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
 
             if let Some(src) = self.media.get(clip.source) {
                 let label_pad = 6.0;

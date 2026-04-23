@@ -2,12 +2,15 @@ use std::collections::HashMap;
 
 use ffmpeg_next as ffmpeg;
 
+use crate::audio::{self, AudioStream, Waveform};
 use crate::quad::QuadRenderer;
 use crate::timeline::SourceId;
 use crate::video::VideoStream;
 
 pub struct Source {
     pub stream: VideoStream,
+    pub audio: Option<AudioStream>,
+    pub waveform: Option<Waveform>,
     pub name: String,
 }
 
@@ -34,6 +37,27 @@ impl MediaPool {
         quads: &QuadRenderer,
     ) -> Result<SourceId, ffmpeg::Error> {
         let stream = VideoStream::open(path, device, queue, quads)?;
+        // Missing/undecodable audio shouldn't block importing a video-only file.
+        let audio = match AudioStream::open(path) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("skipping audio for {path}: {e}");
+                None
+            }
+        };
+        // Build a peak summary up front for the timeline waveform. Failure
+        // here just means the audio clip renders as a flat rect — not fatal.
+        let waveform = if audio.is_some() {
+            match audio::build_waveform(path) {
+                Ok(w) => w,
+                Err(e) => {
+                    log::warn!("waveform build failed for {path}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let name = std::path::Path::new(path)
             .file_name()
             .and_then(|s| s.to_str())
@@ -41,7 +65,15 @@ impl MediaPool {
             .to_string();
         let id = SourceId(self.next_id);
         self.next_id += 1;
-        self.sources.insert(id, Source { stream, name });
+        self.sources.insert(
+            id,
+            Source {
+                stream,
+                audio,
+                waveform,
+                name,
+            },
+        );
         self.order.push(id);
         Ok(id)
     }
@@ -56,6 +88,18 @@ impl MediaPool {
 
     pub fn duration(&self, id: SourceId) -> f64 {
         self.sources.get(&id).map_or(0.0, |s| s.stream.duration())
+    }
+
+    pub fn has_audio(&self, id: SourceId) -> bool {
+        self.sources
+            .get(&id)
+            .map_or(false, |s| s.audio.is_some())
+    }
+
+    pub fn audio_duration(&self, id: SourceId) -> Option<f64> {
+        self.sources
+            .get(&id)
+            .and_then(|s| s.audio.as_ref().map(|a| a.duration()))
     }
 
     pub fn ids(&self) -> &[SourceId] {
