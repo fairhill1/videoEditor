@@ -15,11 +15,17 @@ pub struct VideoStream {
     height: u32,
     frame_rate: f64,
     texture: Texture,
+    thumbnail: Texture,
     pending: Option<(ffmpeg::frame::Video, f64)>,
     rgba_buf: Vec<u8>,
     scaled: ffmpeg::frame::Video,
     displayed_pts: Option<f64>,
 }
+
+/// Short side of the baked media-pool thumbnail. The pool slot is a fixed
+/// aspect ratio, so the UI letterboxes the thumb into its slot — we only need
+/// enough pixels here to look crisp at typical row sizes.
+const THUMB_HEIGHT: u32 = 64;
 
 /// How far forward `t` can be from the displayed frame before `goto` gives up
 /// on linear decode and issues a seek. Tuned to cover a normal playback step
@@ -84,6 +90,25 @@ impl VideoStream {
         let texture =
             quads.create_empty_texture(device, width, height, wgpu::TextureFormat::Rgba8UnormSrgb);
 
+        let thumb_h = THUMB_HEIGHT.min(height).max(1);
+        let thumb_w =
+            ((thumb_h as f64 * width as f64 / height as f64).round() as u32).max(1);
+        let mut thumb_scaler = ffmpeg::software::scaling::Context::get(
+            decoder.format(),
+            width,
+            height,
+            ffmpeg::format::Pixel::RGBA,
+            thumb_w,
+            thumb_h,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )?;
+        let thumbnail = quads.create_empty_texture(
+            device,
+            thumb_w,
+            thumb_h,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
         let mut stream = Self {
             ictx,
             decoder,
@@ -95,6 +120,7 @@ impl VideoStream {
             height,
             frame_rate,
             texture,
+            thumbnail,
             pending: None,
             rgba_buf: vec![0u8; (width * height * 4) as usize],
             scaled: ffmpeg::frame::Video::empty(),
@@ -102,7 +128,17 @@ impl VideoStream {
         };
 
         // Prime with the first frame so nothing flashes black at startup.
+        // Bake the pool thumbnail from the same frame — it's already decoded
+        // and we only need it once, so reusing it avoids a second seek/decode.
         if let Some((frame, pts)) = stream.decode_next_raw() {
+            bake_thumbnail(
+                queue,
+                &mut thumb_scaler,
+                &frame,
+                thumb_w,
+                thumb_h,
+                &stream.thumbnail,
+            );
             stream.scale_and_upload(queue, &frame);
             stream.displayed_pts = Some(pts);
         }
@@ -125,6 +161,10 @@ impl VideoStream {
 
     pub fn texture(&self) -> &Texture {
         &self.texture
+    }
+
+    pub fn thumbnail(&self) -> &Texture {
+        &self.thumbnail
     }
 
     pub fn width(&self) -> u32 {
@@ -261,4 +301,28 @@ impl VideoStream {
             }
         }
     }
+}
+
+fn bake_thumbnail(
+    queue: &wgpu::Queue,
+    scaler: &mut ffmpeg::software::scaling::Context,
+    frame: &ffmpeg::frame::Video,
+    w: u32,
+    h: u32,
+    texture: &Texture,
+) {
+    let mut scaled = ffmpeg::frame::Video::empty();
+    if scaler.run(frame, &mut scaled).is_err() {
+        return;
+    }
+    let stride = scaled.stride(0);
+    let row_bytes = (w * 4) as usize;
+    let src = scaled.data(0);
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h as usize {
+        let src_off = y * stride;
+        let dst_off = y * row_bytes;
+        buf[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+    }
+    texture.write_region(queue, 0, 0, w, h, &buf);
 }

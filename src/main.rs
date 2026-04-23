@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use winit::{
     application::ApplicationHandler,
+    dpi::LogicalSize,
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle},
     keyboard::{KeyCode, PhysicalKey},
@@ -46,21 +47,30 @@ const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const TIMER_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 
 // Timeline panel layout.
-const TRACK_LANE_HEIGHT: f32 = 32.0;
+// Lane height is computed per-frame to fill the timeline area; these bounds
+// keep it readable with one track and prevent chunkiness at high counts.
+const TRACK_LANE_MIN_H: f32 = 32.0;
+const TRACK_LANE_MAX_H: f32 = 88.0;
+const TRACK_LANE_FILL: f32 = 0.9; // fraction of tracks-area height the lanes+gaps try to fill
 const TRACK_LANE_GAP: f32 = 2.0;
 const TRACK_HEADER_WIDTH: f32 = 48.0;
 const TIMELINE_TOP_PAD: f32 = 30.0; // clear space for the "TIMELINE" label
 
 // Media pool list layout.
 const POOL_LIST_TOP: f32 = 36.0; // below the MEDIA POOL label
-const POOL_ROW_HEIGHT: f32 = 36.0;
+const POOL_ROW_HEIGHT: f32 = 64.0;
 const POOL_ROW_GAP: f32 = 4.0;
-const POOL_ROW_PAD: f32 = 8.0;
+const POOL_ROW_PAD: f32 = 6.0;
 const POOL_ROW_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
-const POOL_ROW_ACCENT: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
 const POOL_ITEM_NAME_SIZE: f32 = 12.0;
 const POOL_ITEM_META_SIZE: f32 = 10.0;
-const POOL_META_COLOR: [f32; 4] = [0.55, 0.55, 0.60, 1.0];
+// Thumbnail slot inside each row — fixed ~16:9 slot, actual thumb is
+// letterboxed into it preserving source aspect.
+const POOL_THUMB_W: f32 = 92.0;
+const POOL_THUMB_H: f32 = POOL_ROW_HEIGHT - POOL_ROW_PAD * 2.0;
+const POOL_THUMB_BG: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
+const POOL_DUR_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.65];
+const POOL_DUR_TEXT: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 
 // Clip interaction.
 const CLIP_EDGE_GRAB_PX: f32 = 6.0;
@@ -91,7 +101,17 @@ struct TimelineLayout {
     clips_x: f32,
     clips_w: f32,
     center_y: f32,
+    lane_h: f32,
     duration: f64,
+}
+
+fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
+    let n = n_tracks.max(1) as f32;
+    let gaps = (n - 1.0).max(0.0) * TRACK_LANE_GAP;
+    let avail = (tracks_area_h * TRACK_LANE_FILL - gaps).max(0.0);
+    (avail / n)
+        .clamp(TRACK_LANE_MIN_H, TRACK_LANE_MAX_H)
+        .round()
 }
 
 impl TimelineLayout {
@@ -111,6 +131,33 @@ struct Clock {
     anchor_instant: Instant,
 }
 
+/// Shorten `text` so it fits within `max_w` when rendered at `size_px`,
+/// appending an ellipsis if truncation happened. Returns the original string
+/// when it already fits, so the common case stays zero-allocation at the call
+/// site (the caller passes a `&str` either way).
+fn truncate_to_width(text: &TextRenderer, s: &str, size_px: f32, max_w: f32) -> String {
+    if text.measure_width(s, size_px) <= max_w {
+        return s.to_string();
+    }
+    let ellipsis = "…";
+    let ell_w = text.measure_width(ellipsis, size_px);
+    if ell_w > max_w {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0.0;
+    for ch in s.chars() {
+        let ch_w = text.measure_width(&ch.to_string(), size_px);
+        if used + ch_w + ell_w > max_w {
+            break;
+        }
+        out.push(ch);
+        used += ch_w;
+    }
+    out.push_str(ellipsis);
+    out
+}
+
 fn format_timecode(t: f64) -> String {
     let total_ms = (t.max(0.0) * 1000.0) as u64;
     let ms = total_ms % 1000;
@@ -123,7 +170,7 @@ fn format_timecode(t: f64) -> String {
 impl Clock {
     fn new() -> Self {
         Self {
-            playing: true,
+            playing: false,
             anchor_pos: 0.0,
             anchor_instant: Instant::now(),
         }
@@ -279,11 +326,13 @@ impl State {
         let top = self.timeline_top();
         let bottom = self.size.height as f32;
         let tracks_top = top + TIMELINE_TOP_PAD;
+        let tracks_area_h = (bottom - tracks_top).max(0.0);
         TimelineLayout {
             top,
             clips_x: TRACK_HEADER_WIDTH,
             clips_w: (w - TRACK_HEADER_WIDTH).max(1.0),
-            center_y: tracks_top + (bottom - tracks_top) * 0.5,
+            center_y: (tracks_top + tracks_area_h * 0.5).round(),
+            lane_h: compute_lane_height(tracks_area_h, self.timeline.tracks.len()),
             duration: self.timeline.duration().max(1.0),
         }
     }
@@ -312,7 +361,7 @@ impl State {
         if cursor_y < layout.top + TIMELINE_TOP_PAD {
             return None;
         }
-        let stride = TRACK_LANE_HEIGHT + TRACK_LANE_GAP;
+        let stride = layout.lane_h + TRACK_LANE_GAP;
         let video_idxs: Vec<usize> = self
             .timeline
             .tracks
@@ -330,12 +379,16 @@ impl State {
             .map(|(i, _)| i)
             .collect();
 
+        // Lanes start half_gap away from center_y on each side (the V/A
+        // boundary's share of the inter-lane gap). Subtract it so the V1/A1
+        // hitbox aligns with the rendered lane rect.
+        let half_gap = TRACK_LANE_GAP * 0.5;
         if cursor_y < layout.center_y {
-            let dy = layout.center_y - cursor_y;
+            let dy = (layout.center_y - cursor_y - half_gap).max(0.0);
             let visual_i = (dy / stride).floor() as usize;
             video_idxs.get(visual_i).copied()
         } else {
-            let dy = cursor_y - layout.center_y;
+            let dy = (cursor_y - layout.center_y - half_gap).max(0.0);
             let visual_i = (dy / stride).floor() as usize;
             audio_idxs.get(visual_i).copied()
         }
@@ -404,6 +457,30 @@ impl State {
             DragMode::Scrub => self.apply_scrub(),
             DragMode::ClipMove { track, idx, grab_t_offset } => {
                 let layout = self.timeline_layout();
+                // Allow vertical drag: if the cursor is over a different
+                // same-kind track, relocate the clip there before nudging x.
+                // Cross-kind moves (V↔A) are blocked — a video clip on an
+                // audio lane has no meaningful playback behavior yet.
+                let (track, idx) =
+                    if let Some(hover) = self.track_at_y(self.cursor[1], &layout) {
+                        let src_kind = self.timeline.tracks[track].kind;
+                        let dst_kind = self.timeline.tracks[hover].kind;
+                        if hover != track && src_kind == dst_kind {
+                            let clip = self.timeline.tracks[track].clips.remove(idx);
+                            let new_idx = self.timeline.tracks[hover].clips.len();
+                            self.timeline.tracks[hover].clips.push(clip);
+                            self.drag = DragMode::ClipMove {
+                                track: hover,
+                                idx: new_idx,
+                                grab_t_offset,
+                            };
+                            (hover, new_idx)
+                        } else {
+                            (track, idx)
+                        }
+                    } else {
+                        (track, idx)
+                    };
                 let cursor_t = layout.cursor_to_t(self.cursor[0]);
                 let clip = &mut self.timeline.tracks[track].clips[idx];
                 clip.timeline_start = (cursor_t - grab_t_offset).max(0.0);
@@ -564,7 +641,10 @@ impl State {
         // Tick the clock. Pause at end of timeline so we don't run past the content.
         let duration = self.timeline.duration();
         let mut t = self.clock.pos();
-        if duration > 0.0 && t >= duration {
+        if duration <= 0.0 {
+            self.clock.pause_at(0.0);
+            t = 0.0;
+        } else if t >= duration {
             self.clock.pause_at(duration);
             t = duration;
         }
@@ -624,7 +704,11 @@ impl State {
         let tracks_top = top_h + TIMELINE_TOP_PAD;
         let tracks_bottom = h;
         let tracks_area_h = (tracks_bottom - tracks_top).max(0.0);
-        let center_y = tracks_top + tracks_area_h * 0.5;
+        // Snap center to a whole pixel so derived lane_y values don't land on
+        // half-pixels (which renders as a blurry edge under bilinear sampling).
+        let center_y = (tracks_top + tracks_area_h * 0.5).round();
+        let half_gap = TRACK_LANE_GAP * 0.5;
+        let lane_h = compute_lane_height(tracks_area_h, self.timeline.tracks.len());
 
         let video_tracks: Vec<usize> = self
             .timeline
@@ -651,18 +735,29 @@ impl State {
         ));
 
         // Use the real duration so clip widths, playhead, and scrub all share the
-        // same denominator. Empty timelines skip the clip loop entirely, so the
-        // `.max(1.0)` guard is only there to avoid NaN from a 0/0 division.
-        let timeline_duration_display = self.timeline.duration().max(1.0);
+        // same denominator. Fold in any currently-dragged clip's duration so the
+        // ghost previews at the same scale it'll occupy after drop, instead of
+        // ballooning to screen width when the timeline is empty (timeline=0 →
+        // `.max(1.0)` → ghost_w = clip_dur * clips_w).
+        let ghost_dur = if let DragMode::PoolDrag { source } = self.drag {
+            self.media.duration(source)
+        } else {
+            0.0
+        };
+        let timeline_duration_display = self.timeline.duration().max(ghost_dur).max(1.0);
         let clips_x = TRACK_HEADER_WIDTH;
         let clips_w = (w - TRACK_HEADER_WIDTH).max(1.0);
 
-        // V1 sits just above the divider, V2 above V1, etc.
+        // V1 sits just above the divider (leaving half_gap between its bottom
+        // and center_y), V2 stacks above V1 with a full TRACK_LANE_GAP between.
         for (visual_i, &track_idx) in video_tracks.iter().enumerate() {
-            let lane_y = center_y - (visual_i as f32 + 1.0) * (TRACK_LANE_HEIGHT + TRACK_LANE_GAP)
-                + TRACK_LANE_GAP;
+            let lane_y = center_y
+                - half_gap
+                - lane_h
+                - visual_i as f32 * (lane_h + TRACK_LANE_GAP);
             self.draw_track_lane(
                 lane_y,
+                lane_h,
                 clips_x,
                 clips_w,
                 timeline_duration_display,
@@ -672,9 +767,10 @@ impl State {
         }
         // A1 sits just below the divider, A2 below A1, etc.
         for (visual_i, &track_idx) in audio_tracks.iter().enumerate() {
-            let lane_y = center_y + visual_i as f32 * (TRACK_LANE_HEIGHT + TRACK_LANE_GAP);
+            let lane_y = center_y + half_gap + visual_i as f32 * (lane_h + TRACK_LANE_GAP);
             self.draw_track_lane(
                 lane_y,
+                lane_h,
                 clips_x,
                 clips_w,
                 timeline_duration_display,
@@ -694,13 +790,29 @@ impl State {
             ));
         }
 
-        // --- Pool-drag ghost: so it's obvious you're carrying a clip ---
+        // --- Pool-drag ghost: previews where the clip will land ---
+        // Start-aligned to the cursor (matches `end_drag`'s drop_t semantics)
+        // and snapped to the hovered video lane's y when over one, so the
+        // preview rect is exactly the rect that'll be created on mouse-up.
         if let DragMode::PoolDrag { source } = self.drag {
             let dur = self.media.duration(source);
             let ghost_w = ((dur / timeline_duration_display) as f32 * clips_w).max(40.0);
-            let ghost_h = TRACK_LANE_HEIGHT;
-            let gx = self.cursor[0] - ghost_w * 0.5;
-            let gy = self.cursor[1] - ghost_h * 0.5;
+            let ghost_h = lane_h;
+            let layout = self.timeline_layout();
+            let over_video_lane = self
+                .track_at_y(self.cursor[1], &layout)
+                .filter(|&i| self.timeline.tracks[i].kind == TrackKind::Video);
+            let gx = self.cursor[0].max(clips_x);
+            let gy = match over_video_lane {
+                Some(track_idx) => {
+                    let visual_i = video_tracks.iter().position(|&i| i == track_idx).unwrap_or(0);
+                    center_y
+                        - half_gap
+                        - lane_h
+                        - visual_i as f32 * (lane_h + TRACK_LANE_GAP)
+                }
+                None => self.cursor[1] - ghost_h * 0.5,
+            };
             self.quads
                 .push(Quad::colored([gx, gy], [ghost_w, ghost_h], DRAG_GHOST_COLOR));
         }
@@ -806,33 +918,64 @@ impl State {
                 [row_w, POOL_ROW_HEIGHT],
                 POOL_ROW_COLOR,
             ));
-            // Left-edge accent strip so video/audio is glanceable later.
+
+            // Thumbnail slot (dark background so letterboxed thumbs look intentional).
+            let slot_x = row_x + POOL_ROW_PAD;
+            let slot_y = row_y + POOL_ROW_PAD;
             self.quads.push(Quad::colored(
-                [row_x, row_y],
-                [3.0, POOL_ROW_HEIGHT],
-                POOL_ROW_ACCENT,
+                [slot_x, slot_y],
+                [POOL_THUMB_W, POOL_THUMB_H],
+                POOL_THUMB_BG,
             ));
 
-            let name_baseline = row_y + POOL_ROW_PAD + self.text.ascent(POOL_ITEM_NAME_SIZE);
+            // Fit the baked thumbnail into the slot, preserving source aspect.
+            let thumb = src.stream.thumbnail();
+            let tw = thumb.width as f32;
+            let th = thumb.height as f32;
+            let scale = (POOL_THUMB_W / tw).min(POOL_THUMB_H / th);
+            let dw = (tw * scale).round();
+            let dh = (th * scale).round();
+            let dx = (slot_x + (POOL_THUMB_W - dw) * 0.5).round();
+            let dy = (slot_y + (POOL_THUMB_H - dh) * 0.5).round();
+            self.quads
+                .push_with(Quad::textured([dx, dy], [dw, dh]), Some(thumb));
+
+            // Duration pill in the bottom-right of the thumb slot.
+            let dur_text = format_timecode(src.stream.duration());
+            let dur_w = self.text.measure_width(&dur_text, POOL_ITEM_META_SIZE);
+            let dur_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
+            let pill_pad_x = 4.0;
+            let pill_pad_y = 2.0;
+            let pill_w = dur_w + pill_pad_x * 2.0;
+            let pill_h = dur_ascent + pill_pad_y * 2.0;
+            let pill_inset = 3.0;
+            let pill_x = slot_x + POOL_THUMB_W - pill_inset - pill_w;
+            let pill_y = slot_y + POOL_THUMB_H - pill_inset - pill_h;
+            self.quads
+                .push(Quad::colored([pill_x, pill_y], [pill_w, pill_h], POOL_DUR_BG));
             self.text.draw(
                 &self.queue,
                 &mut self.quads,
-                [row_x + POOL_ROW_PAD + 4.0, name_baseline],
-                &src.name,
-                POOL_ITEM_NAME_SIZE,
-                CLIP_LABEL_COLOR,
+                [pill_x + pill_pad_x, pill_y + pill_pad_y + dur_ascent],
+                &dur_text,
+                POOL_ITEM_META_SIZE,
+                POOL_DUR_TEXT,
             );
 
-            let meta = format_timecode(src.stream.duration());
-            let meta_baseline =
-                row_y + POOL_ROW_HEIGHT - POOL_ROW_PAD * 0.5;
+            // Name to the right of the thumb, vertically centered. Clamp with
+            // an ellipsis if the filename would otherwise bleed into the preview.
+            let name_x = slot_x + POOL_THUMB_W + POOL_ROW_PAD + 4.0;
+            let name_max_w = (row_x + row_w - POOL_ROW_PAD - name_x).max(0.0);
+            let name_ascent = self.text.ascent(POOL_ITEM_NAME_SIZE);
+            let name_baseline = row_y + (POOL_ROW_HEIGHT + name_ascent) * 0.5;
+            let name = truncate_to_width(&self.text, &src.name, POOL_ITEM_NAME_SIZE, name_max_w);
             self.text.draw(
                 &self.queue,
                 &mut self.quads,
-                [row_x + POOL_ROW_PAD + 4.0, meta_baseline],
-                &meta,
-                POOL_ITEM_META_SIZE,
-                POOL_META_COLOR,
+                [name_x, name_baseline],
+                &name,
+                POOL_ITEM_NAME_SIZE,
+                CLIP_LABEL_COLOR,
             );
         }
     }
@@ -840,6 +983,7 @@ impl State {
     fn draw_track_lane(
         &mut self,
         lane_y: f32,
+        lane_h: f32,
         clips_x: f32,
         clips_w: f32,
         timeline_duration: f64,
@@ -855,13 +999,13 @@ impl State {
         // Lane background.
         self.quads.push(Quad::colored(
             [0.0, lane_y],
-            [clips_x + clips_w, TRACK_LANE_HEIGHT],
+            [clips_x + clips_w, lane_h],
             LANE_COLOR,
         ));
 
         // Track header label (V1, V2, A1, ...).
         let header = format!("{}{}", label_prefix, visual_i + 1);
-        let baseline = lane_y + (TRACK_LANE_HEIGHT + self.text.ascent(CLIP_LABEL_SIZE)) * 0.5;
+        let baseline = lane_y + (lane_h + self.text.ascent(CLIP_LABEL_SIZE)) * 0.5;
         self.text.draw(
             &self.queue,
             &mut self.quads,
@@ -876,7 +1020,7 @@ impl State {
             let x = clips_x + (clip.timeline_start / timeline_duration) as f32 * clips_w;
             let cw = ((clip.duration() / timeline_duration) as f32 * clips_w).max(1.0);
             self.quads
-                .push(Quad::colored([x, lane_y], [cw, TRACK_LANE_HEIGHT], clip_color));
+                .push(Quad::colored([x, lane_y], [cw, lane_h], clip_color));
 
             if let Some(src) = self.media.get(clip.source) {
                 let label_pad = 6.0;
@@ -903,7 +1047,11 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes())
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Ruve")
+                        .with_inner_size(LogicalSize::new(1920.0, 1080.0)),
+                )
                 .unwrap(),
         );
 
