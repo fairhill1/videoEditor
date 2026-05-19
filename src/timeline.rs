@@ -76,6 +76,12 @@ impl Timeline {
         id
     }
 
+    pub fn remove_source(&mut self, source: SourceId) {
+        for track in &mut self.tracks {
+            track.clips.retain(|c| c.source != source);
+        }
+    }
+
     pub fn duration(&self) -> f64 {
         self.tracks
             .iter()

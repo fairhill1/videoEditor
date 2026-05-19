@@ -108,6 +108,15 @@ impl TextRenderer {
         m.ascent
     }
 
+    /// Visual bounds of a single glyph: `(height, ymin)`, where `height` is the
+    /// rasterized bitmap height and `ymin` is the baseline offset such that the
+    /// glyph's top sits at `baseline - (ymin + height)`. Use this — not
+    /// `ascent` — when vertically centering a glyph inside a fixed-size box.
+    pub fn glyph_visual_bounds(&self, ch: char, size_px: f32) -> (f32, f32) {
+        let m = self.font.metrics(ch, size_px);
+        (m.height as f32, m.ymin as f32)
+    }
+
     /// Pen-advance width of `text` at `size_px`. Cheap — uses font metrics only,
     /// no rasterization or atlas lookups, so it's safe to call every frame for
     /// layout decisions (e.g. right-aligning a timer readout).

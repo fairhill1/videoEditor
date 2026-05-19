@@ -78,6 +78,11 @@ impl MediaPool {
         Ok(id)
     }
 
+    pub fn remove(&mut self, id: SourceId) {
+        self.sources.remove(&id);
+        self.order.retain(|x| *x != id);
+    }
+
     pub fn get(&self, id: SourceId) -> Option<&Source> {
         self.sources.get(&id)
     }

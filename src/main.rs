@@ -3,6 +3,7 @@ mod media;
 mod quad;
 mod text;
 mod timeline;
+mod ui;
 mod video;
 
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
 use timeline::{Clip, SourceId, Timeline, Track, TrackKind};
+use ui::{draw_button, draw_tooltip, Rect, TooltipSide};
 
 // Layout split ratios — tweak to taste.
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
@@ -44,9 +46,15 @@ const LABEL_PAD: f32 = 10.0;
 const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 const PLAYHEAD_WIDTH: f32 = 2.0;
 const TIMER_SIZE: f32 = 14.0;
-const TIMER_PAD: f32 = 12.0;
 const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
-const TIMER_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
+// Transport bar between preview and timeline; holds prev/play/next + timer.
+const TRANSPORT_BAR_H: f32 = 40.0;
+const TRANSPORT_BAR_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
+const TRANSPORT_BTN_W: f32 = 56.0;
+const TRANSPORT_BTN_H: f32 = 26.0;
+const TRANSPORT_GAP: f32 = 8.0;
+const TRANSPORT_LABEL_SIZE: f32 = 12.0;
+const TRANSPORT_TOOLTIP_SIZE: f32 = 11.0;
 
 // Timeline panel layout.
 // Lane height is computed per-frame to fill the timeline area; these bounds
@@ -73,6 +81,11 @@ const POOL_THUMB_H: f32 = POOL_ROW_HEIGHT - POOL_ROW_PAD * 2.0;
 const POOL_THUMB_BG: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
 const POOL_DUR_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.65];
 const POOL_DUR_TEXT: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+const POOL_CLOSE_SIZE: f32 = 18.0;
+const POOL_CLOSE_INSET: f32 = 3.0;
+const POOL_CLOSE_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.70];
+const POOL_CLOSE_BG_HOVER: [f32; 4] = [0.65, 0.25, 0.25, 0.95];
+const POOL_CLOSE_LABEL_SIZE: f32 = 13.0;
 
 // Clip interaction.
 const CLIP_EDGE_GRAB_PX: f32 = 6.0;
@@ -106,6 +119,15 @@ struct TimelineLayout {
     center_y: f32,
     lane_h: f32,
     duration: f64,
+}
+
+fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
+    Rect {
+        x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_SIZE,
+        y: row_y + POOL_CLOSE_INSET,
+        w: POOL_CLOSE_SIZE,
+        h: POOL_CLOSE_SIZE,
+    }
 }
 
 fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
@@ -192,6 +214,9 @@ struct State {
     cursor: [f32; 2],
     drag: DragMode,
     last_playing_source: Option<SourceId>,
+    transport: [Rect; 3],
+    timeline_split_btn: Rect,
+    pool_open_btn: Rect,
 }
 
 impl State {
@@ -246,6 +271,9 @@ impl State {
             cursor: [0.0, 0.0],
             drag: DragMode::None,
             last_playing_source: None,
+            transport: [Rect::default(); 3],
+            timeline_split_btn: Rect::default(),
+            pool_open_btn: Rect::default(),
         };
 
         state.configure_surface();
@@ -311,6 +339,28 @@ impl State {
             return None; // in the gap between rows
         }
         self.media.ids().get(i).copied()
+    }
+
+    fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
+        let w = self.size.width as f32;
+        let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
+        let row_w = (media_w - LABEL_PAD * 2.0).max(1.0);
+        for (i, &id) in self.media.ids().iter().enumerate() {
+            let row_y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
+            let close = pool_row_close_rect(LABEL_PAD, row_y, row_w);
+            if close.contains([cursor_x, cursor_y]) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn remove_source(&mut self, id: SourceId) {
+        self.media.remove(id);
+        self.timeline.remove_source(id);
+        if self.last_playing_source == Some(id) {
+            self.last_playing_source = None;
+        }
     }
 
     /// Locate the visual track lane under `cursor_y`. Returns the track index
@@ -388,6 +438,30 @@ impl State {
 
     fn begin_drag(&mut self) {
         let [cx, cy] = self.cursor;
+        if self.transport[0].contains([cx, cy]) {
+            self.step_frame(-1.0);
+            return;
+        }
+        if self.transport[1].contains([cx, cy]) {
+            self.toggle_playback();
+            return;
+        }
+        if self.transport[2].contains([cx, cy]) {
+            self.step_frame(1.0);
+            return;
+        }
+        if self.timeline_split_btn.contains([cx, cy]) {
+            self.split_at_playhead();
+            return;
+        }
+        if self.pool_open_btn.contains([cx, cy]) {
+            self.open_file_picker();
+            return;
+        }
+        if let Some(id) = self.pool_close_hit(cx, cy) {
+            self.remove_source(id);
+            return;
+        }
         if let Some(source) = self.pool_hit(cx, cy) {
             self.drag = DragMode::PoolDrag { source };
             return;
@@ -733,13 +807,20 @@ impl State {
             audio.tick(timeline, media);
         }
 
+        let preview_h = (top_h - TRANSPORT_BAR_H).max(0.0);
+
         self.quads.clear();
         self.quads
             .push(Quad::colored([0.0, 0.0], [media_w, top_h], MEDIA_POOL_COLOR));
         self.quads.push(Quad::colored(
             [media_w, 0.0],
-            [preview_w, top_h],
+            [preview_w, preview_h],
             PREVIEW_COLOR,
+        ));
+        self.quads.push(Quad::colored(
+            [media_w, preview_h],
+            [preview_w, TRANSPORT_BAR_H],
+            TRANSPORT_BAR_COLOR,
         ));
 
         // --- Preview: topmost active video clip ---
@@ -765,11 +846,11 @@ impl State {
 
                     let vw = src.stream.width() as f32;
                     let vh = src.stream.height() as f32;
-                    let scale = (preview_w / vw).min(top_h / vh);
+                    let scale = (preview_w / vw).min(preview_h / vh);
                     let draw_w = vw * scale;
                     let draw_h = vh * scale;
                     let dx = media_w + (preview_w - draw_w) * 0.5;
-                    let dy = (top_h - draw_h) * 0.5;
+                    let dy = (preview_h - draw_h) * 0.5;
                     quads.push_with(
                         Quad::textured([dx, dy], [draw_w, draw_h]),
                         Some(src.stream.texture()),
@@ -922,6 +1003,36 @@ impl State {
             LABEL_SIZE,
             LABEL_COLOR,
         );
+
+        // --- Media pool toolbar: just right of the MEDIA POOL label ---
+        let pool_label_w = self.text.measure_width("MEDIA POOL", LABEL_SIZE);
+        self.pool_open_btn = Rect {
+            x: (LABEL_PAD + pool_label_w + LABEL_PAD * 1.5).round(),
+            y: ((POOL_LIST_TOP - TRANSPORT_BTN_H) * 0.5).round(),
+            w: TRANSPORT_BTN_W,
+            h: TRANSPORT_BTN_H,
+        };
+        let pool_open_hovered = self.pool_open_btn.contains(self.cursor);
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            self.pool_open_btn,
+            "Open",
+            TRANSPORT_LABEL_SIZE,
+            pool_open_hovered,
+        );
+        if pool_open_hovered {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.pool_open_btn,
+                "Open file (O)",
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+            );
+        }
         self.text.draw(
             &self.queue,
             &mut self.quads,
@@ -939,7 +1050,58 @@ impl State {
             LABEL_COLOR,
         );
 
-        // --- Playback timer: bottom-right of preview, above any video frame ---
+        // --- Timeline toolbar: just right of the TIMELINE label ---
+        let timeline_label_w = self.text.measure_width("TIMELINE", LABEL_SIZE);
+        self.timeline_split_btn = Rect {
+            x: (LABEL_PAD + timeline_label_w + LABEL_PAD * 1.5).round(),
+            y: (top_h + (TIMELINE_TOP_PAD - TRANSPORT_BTN_H) * 0.5).round(),
+            w: TRANSPORT_BTN_W,
+            h: TRANSPORT_BTN_H,
+        };
+        let split_hovered = self.timeline_split_btn.contains(self.cursor);
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            self.timeline_split_btn,
+            "Split",
+            TRANSPORT_LABEL_SIZE,
+            split_hovered,
+        );
+        if split_hovered {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.timeline_split_btn,
+                "Split at playhead (S)",
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+            );
+        }
+
+        // --- Transport bar: prev / play / next centered; timer right-aligned ---
+        let bar_y = preview_h;
+        let bar_center_y = bar_y + TRANSPORT_BAR_H * 0.5;
+        let playing = self.audio.playing();
+        let labels = ["<", if playing { "Pause" } else { "Play" }, ">"];
+        let tooltips = [
+            "Prev frame (Left)",
+            if playing { "Pause (Space)" } else { "Play (Space)" },
+            "Next frame (Right)",
+        ];
+        let row_w = TRANSPORT_BTN_W * 3.0 + TRANSPORT_GAP * 2.0;
+        let row_x = (media_w + (preview_w - row_w) * 0.5).round();
+        let row_y = (bar_center_y - TRANSPORT_BTN_H * 0.5).round();
+        for i in 0..3 {
+            self.transport[i] = Rect {
+                x: row_x + i as f32 * (TRANSPORT_BTN_W + TRANSPORT_GAP),
+                y: row_y,
+                w: TRANSPORT_BTN_W,
+                h: TRANSPORT_BTN_H,
+            };
+        }
+
         let timer_text = format!(
             "{} / {}",
             format_timecode(t),
@@ -947,14 +1109,8 @@ impl State {
         );
         let timer_w = self.text.measure_width(&timer_text, TIMER_SIZE);
         let timer_ascent = self.text.ascent(TIMER_SIZE);
-        let timer_baseline = top_h - TIMER_PAD;
-        let timer_left = w - TIMER_PAD - timer_w;
-        let bg_pad = 6.0;
-        self.quads.push(Quad::colored(
-            [timer_left - bg_pad, timer_baseline - timer_ascent - bg_pad * 0.5],
-            [timer_w + bg_pad * 2.0, timer_ascent + bg_pad],
-            TIMER_BG_COLOR,
-        ));
+        let timer_baseline = (bar_center_y + timer_ascent * 0.5).round();
+        let timer_left = (w - LABEL_PAD - timer_w).round();
         self.text.draw(
             &self.queue,
             &mut self.quads,
@@ -963,6 +1119,29 @@ impl State {
             TIMER_SIZE,
             TIMER_COLOR,
         );
+        let hovered = (0..3).find(|&i| self.transport[i].contains(self.cursor));
+        for i in 0..3 {
+            draw_button(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.transport[i],
+                labels[i],
+                TRANSPORT_LABEL_SIZE,
+                hovered == Some(i),
+            );
+        }
+        if let Some(i) = hovered {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.transport[i],
+                tooltips[i],
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Above,
+            );
+        }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -1069,6 +1248,35 @@ impl State {
                 POOL_ITEM_NAME_SIZE,
                 CLIP_LABEL_COLOR,
             );
+
+            let row_hovered = self.cursor[0] >= row_x
+                && self.cursor[0] <= row_x + row_w
+                && self.cursor[1] >= row_y
+                && self.cursor[1] <= row_y + POOL_ROW_HEIGHT;
+            if row_hovered {
+                let close = pool_row_close_rect(row_x, row_y, row_w);
+                let close_hover = close.contains(self.cursor);
+                let bg = if close_hover {
+                    POOL_CLOSE_BG_HOVER
+                } else {
+                    POOL_CLOSE_BG
+                };
+                self.quads
+                    .push(Quad::colored([close.x, close.y], [close.w, close.h], bg));
+                let glyph = "X";
+                let gw = self.text.measure_width(glyph, POOL_CLOSE_LABEL_SIZE);
+                let (gh, gymin) = self.text.glyph_visual_bounds('X', POOL_CLOSE_LABEL_SIZE);
+                let gx = (close.x + (close.w - gw) * 0.5).round();
+                let gy = (close.y + (close.h + gh) * 0.5 + gymin).round();
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [gx, gy],
+                    glyph,
+                    POOL_CLOSE_LABEL_SIZE,
+                    [0.95, 0.95, 0.98, 1.0],
+                );
+            }
         }
     }
 
