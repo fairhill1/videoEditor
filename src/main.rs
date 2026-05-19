@@ -65,6 +65,12 @@ const TRACK_LANE_FILL: f32 = 0.9; // fraction of tracks-area height the lanes+ga
 const TRACK_LANE_GAP: f32 = 2.0;
 const TRACK_HEADER_WIDTH: f32 = 48.0;
 const TIMELINE_TOP_PAD: f32 = 30.0; // clear space for the "TIMELINE" label
+const TIMELINE_RULER_H: f32 = 22.0; // scrub strip between the title bar and lanes
+const TIMELINE_RULER_COLOR: [f32; 4] = [0.13, 0.13, 0.16, 1.0];
+const TIMELINE_RULER_TICK_COLOR: [f32; 4] = [0.50, 0.50, 0.55, 1.0];
+const TIMELINE_RULER_LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
+const TIMELINE_RULER_LABEL_SIZE: f32 = 10.0;
+const TIMELINE_RULER_TICK_H: f32 = 6.0;
 
 // Media pool list layout.
 const POOL_LIST_TOP: f32 = 36.0; // below the MEDIA POOL label
@@ -105,6 +111,7 @@ enum DragMode {
 
 enum TimelineHit {
     None,
+    Ruler,
     Lane { track: usize },
     ClipBody { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
@@ -127,6 +134,55 @@ fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
         y: row_y + POOL_CLOSE_INSET,
         w: POOL_CLOSE_SIZE,
         h: POOL_CLOSE_SIZE,
+    }
+}
+
+fn nice_tick_interval(pixels_per_sec: f32) -> f64 {
+    const TARGET_PX: f32 = 100.0;
+    if pixels_per_sec <= 0.0 {
+        return 60.0;
+    }
+    let raw_secs = (TARGET_PX / pixels_per_sec) as f64;
+    let nice = [
+        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+    ];
+    for &v in &nice {
+        if v >= raw_secs {
+            return v;
+        }
+    }
+    3600.0
+}
+
+fn format_tick_label(t: f64, interval: f64) -> String {
+    let total_sec = t.max(0.0);
+    if interval < 1.0 {
+        let total_ms = (total_sec * 1000.0).round() as u64;
+        let s_total = total_ms / 1000;
+        let cs = (total_ms % 1000) / 10;
+        let m = s_total / 60;
+        let s = s_total % 60;
+        format!("{}:{:02}.{:02}", m, s, cs)
+    } else {
+        let total = total_sec.round() as u64;
+        let h = total / 3600;
+        let m = (total / 60) % 60;
+        let s = total % 60;
+        if h > 0 {
+            format!("{}:{:02}:{:02}", h, m, s)
+        } else {
+            format!("{}:{:02}", m, s)
+        }
+    }
+}
+
+fn topmost_lane_top(center_y: f32, lane_h: f32, n_video: usize) -> f32 {
+    let half_gap = TRACK_LANE_GAP * 0.5;
+    if n_video == 0 {
+        center_y
+    } else {
+        center_y - half_gap - lane_h * n_video as f32
+            - (n_video as f32 - 1.0) * TRACK_LANE_GAP
     }
 }
 
@@ -324,6 +380,14 @@ impl State {
         }
     }
 
+    fn n_video_tracks(&self) -> usize {
+        self.timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .count()
+    }
+
     fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
         let w = self.size.width as f32;
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
@@ -367,7 +431,8 @@ impl State {
     /// whose lane *center* is nearest — gaps snap to the nearer lane so drops
     /// near a boundary feel forgiving.
     fn track_at_y(&self, cursor_y: f32, layout: &TimelineLayout) -> Option<usize> {
-        if cursor_y < layout.top + TIMELINE_TOP_PAD {
+        let topmost = topmost_lane_top(layout.center_y, layout.lane_h, self.n_video_tracks());
+        if cursor_y < topmost {
             return None;
         }
         let stride = layout.lane_h + TRACK_LANE_GAP;
@@ -407,6 +472,11 @@ impl State {
         let layout = self.timeline_layout();
         if cursor_y < layout.top {
             return TimelineHit::None;
+        }
+        let topmost = topmost_lane_top(layout.center_y, layout.lane_h, self.n_video_tracks());
+        let ruler_top = topmost - TIMELINE_RULER_H;
+        if cursor_y >= ruler_top && cursor_y < topmost && cursor_x >= layout.clips_x {
+            return TimelineHit::Ruler;
         }
         let Some(track_idx) = self.track_at_y(cursor_y, &layout) else {
             return TimelineHit::None;
@@ -476,7 +546,7 @@ impl State {
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
                 self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
             }
-            TimelineHit::Lane { .. } => {
+            TimelineHit::Lane { .. } | TimelineHit::Ruler => {
                 self.drag = DragMode::Scrub;
                 self.apply_scrub();
             }
@@ -912,6 +982,58 @@ impl State {
         let timeline_duration_display = self.timeline.duration().max(ghost_dur).max(1.0);
         let clips_x = TRACK_HEADER_WIDTH;
         let clips_w = (w - TRACK_HEADER_WIDTH).max(1.0);
+
+        // --- Timeline ruler: flush above the topmost video lane, with tick
+        //     marks + timecode labels along the bottom edge so the scale is
+        //     legible at a glance.
+        let topmost = topmost_lane_top(center_y, lane_h, video_tracks.len());
+        let ruler_bottom = topmost;
+        let ruler_top = ruler_bottom - TIMELINE_RULER_H;
+        self.quads.push(Quad::colored(
+            [0.0, ruler_top],
+            [w, TIMELINE_RULER_H],
+            TIMELINE_RULER_COLOR,
+        ));
+        self.quads.push(Quad::colored(
+            [0.0, ruler_bottom - 0.5],
+            [w, 1.0],
+            DIVIDER_COLOR,
+        ));
+        let pps = clips_w / timeline_duration_display as f32;
+        let interval = nice_tick_interval(pps);
+        let label_size = TIMELINE_RULER_LABEL_SIZE;
+        let label_ascent = self.text.ascent(label_size);
+        let label_baseline = (ruler_top + label_ascent + 3.0).round();
+        let mut i: usize = 0;
+        loop {
+            let t = i as f64 * interval;
+            if t > timeline_duration_display {
+                break;
+            }
+            let x = (clips_x + (t / timeline_duration_display) as f32 * clips_w).round();
+            self.quads.push(Quad::colored(
+                [x, ruler_bottom - TIMELINE_RULER_TICK_H],
+                [1.0, TIMELINE_RULER_TICK_H],
+                TIMELINE_RULER_TICK_COLOR,
+            ));
+            let label = format_tick_label(t, interval);
+            let lw = self.text.measure_width(&label, label_size);
+            let lx = (x + 3.0).round();
+            if lx + lw <= clips_x + clips_w {
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [lx, label_baseline],
+                    &label,
+                    label_size,
+                    TIMELINE_RULER_LABEL_COLOR,
+                );
+            }
+            i += 1;
+            if i > 10_000 {
+                break;
+            }
+        }
 
         // V1 sits just above the divider (leaving half_gap between its bottom
         // and center_y), V2 stacks above V1 with a full TRACK_LANE_GAP between.
@@ -1374,12 +1496,19 @@ impl State {
 
             if let Some(src) = self.media.get(clip.source) {
                 let label_pad = 6.0;
+                let label_max_w = (cw - label_pad * 2.0).max(0.0);
                 let label_baseline = lane_y + self.text.ascent(CLIP_LABEL_SIZE) + 4.0;
+                let name = truncate_to_width(
+                    &self.text,
+                    &src.name,
+                    CLIP_LABEL_SIZE,
+                    label_max_w,
+                );
                 self.text.draw(
                     &self.queue,
                     &mut self.quads,
                     [x + label_pad, label_baseline],
-                    &src.name,
+                    &name,
                     CLIP_LABEL_SIZE,
                     CLIP_LABEL_COLOR,
                 );

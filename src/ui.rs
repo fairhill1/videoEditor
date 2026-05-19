@@ -18,7 +18,7 @@ impl Rect {
 const BTN_BG: [f32; 4] = [0.18, 0.18, 0.22, 0.92];
 const BTN_BG_HOVER: [f32; 4] = [0.30, 0.30, 0.36, 0.95];
 const BTN_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
-const TOOLTIP_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.88];
+const TOOLTIP_BG: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 const TOOLTIP_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const TOOLTIP_GAP: f32 = 6.0;
 const TOOLTIP_PAD_X: f32 = 7.0;
