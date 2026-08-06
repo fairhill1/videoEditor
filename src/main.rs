@@ -28,12 +28,27 @@ use ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
 const MEDIA_PREVIEW_SPLIT: f32 = 0.28;
 
-// Panel colors (sRGB).
-const MEDIA_POOL_COLOR: [f32; 4] = [0.14, 0.14, 0.16, 1.0];
-const PREVIEW_COLOR: [f32; 4] = [0.04, 0.04, 0.05, 1.0];
-const TIMELINE_COLOR: [f32; 4] = [0.10, 0.10, 0.12, 1.0];
-const LANE_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
-const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.22, 1.0];
+// Surface elevation scale (sRGB), darkest first. Steps widen as they climb:
+// down near black a small numeric difference is imperceptible, so the low tiers
+// need real distance between them or the whole window reads as one flat mass.
+// Every panel picks a tier rather than its own value, so surfaces at the same
+// conceptual depth actually match.
+const SURFACE_WELL: [f32; 4] = [0.03, 0.03, 0.04, 1.0]; // content the app displays into
+const SURFACE_LANE: [f32; 4] = [0.05, 0.05, 0.06, 1.0]; // wells that hold clips
+const SURFACE_BASE: [f32; 4] = [0.09, 0.09, 0.11, 1.0]; // body behind the wells
+const SURFACE_PANEL: [f32; 4] = [0.15, 0.15, 0.18, 1.0]; // chrome that holds controls
+
+// Panel assignments.
+const MEDIA_POOL_COLOR: [f32; 4] = SURFACE_PANEL;
+const PREVIEW_COLOR: [f32; 4] = SURFACE_WELL;
+const TIMELINE_COLOR: [f32; 4] = SURFACE_BASE;
+const LANE_COLOR: [f32; 4] = SURFACE_LANE;
+// Edge between two panels, lighter than both — the flat-UI way to define a
+// boundary, standing in for the highlight/shadow pair of a bevel.
+const PANEL_BORDER_COLOR: [f32; 4] = [0.28, 0.28, 0.33, 1.0];
+// Softer line for divisions *within* a panel, which shouldn't read as loudly as
+// the panel's own edges.
+const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 const VIDEO_CLIP_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
 const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
 // Outline around each clip. Two butt-joined clips show it twice, so a split
@@ -45,8 +60,10 @@ const CLIP_BORDER_DARKEN: f32 = 0.40;
 const SNAP_PX: f32 = 8.0;
 const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
 const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
-const LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
-const TRACK_LABEL_COLOR: [f32; 4] = [0.45, 0.45, 0.50, 1.0];
+const LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
+// Was dim enough that V1/A1 were a squint to read; a track's identity should be
+// legible at a glance, not decorative.
+const TRACK_LABEL_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
 const LABEL_SIZE: f32 = 13.0;
 const CLIP_LABEL_SIZE: f32 = 11.0;
 const LABEL_PAD: f32 = 10.0;
@@ -56,7 +73,9 @@ const TIMER_SIZE: f32 = 14.0;
 const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 // Transport bar between preview and timeline; holds prev/play/next + timer.
 const TRANSPORT_BAR_H: f32 = 40.0;
-const TRANSPORT_BAR_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
+// Panel tier, not well tier: it holds controls, and at its old near-black value
+// it dissolved into the preview above it.
+const TRANSPORT_BAR_COLOR: [f32; 4] = SURFACE_PANEL;
 const TRANSPORT_BTN_W: f32 = 56.0;
 const TRANSPORT_BTN_H: f32 = 26.0;
 const TRANSPORT_GAP: f32 = 8.0;
@@ -71,11 +90,15 @@ const TRACK_LANE_MAX_H: f32 = 88.0;
 const TRACK_LANE_FILL: f32 = 0.9; // fraction of tracks-area height the lanes+gaps try to fill
 const TRACK_LANE_GAP: f32 = 2.0;
 const TRACK_HEADER_WIDTH: f32 = 48.0;
-const TIMELINE_TOP_PAD: f32 = 30.0; // clear space for the "TIMELINE" label
+// Height of the toolbar band above the ruler, holding the "TIMELINE" label and
+// its buttons. Sized as the button height plus even breathing room either side
+// rather than hugging it — at the old 30 the 26px buttons cleared the panel
+// edge by 2px and looked jammed against it.
+const TIMELINE_TOP_PAD: f32 = 46.0;
 const TIMELINE_RULER_H: f32 = 22.0; // scrub strip between the title bar and lanes
-const TIMELINE_RULER_COLOR: [f32; 4] = [0.13, 0.13, 0.16, 1.0];
-const TIMELINE_RULER_TICK_COLOR: [f32; 4] = [0.50, 0.50, 0.55, 1.0];
-const TIMELINE_RULER_LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
+const TIMELINE_RULER_COLOR: [f32; 4] = SURFACE_PANEL;
+const TIMELINE_RULER_TICK_COLOR: [f32; 4] = [0.58, 0.58, 0.64, 1.0];
+const TIMELINE_RULER_LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 const TIMELINE_RULER_LABEL_SIZE: f32 = 10.0;
 const TIMELINE_RULER_TICK_H: f32 = 6.0;
 
@@ -1163,6 +1186,18 @@ impl State {
             [preview_w, TRANSPORT_BAR_H],
             TRANSPORT_BAR_COLOR,
         ));
+        // Panel edges. Drawn just inside the lighter panel so the darker well
+        // beside it stays a clean field.
+        self.quads.push(Quad::colored(
+            [media_w - 1.0, 0.0],
+            [1.0, top_h],
+            PANEL_BORDER_COLOR,
+        ));
+        self.quads.push(Quad::colored(
+            [media_w, preview_h],
+            [preview_w, 1.0],
+            PANEL_BORDER_COLOR,
+        ));
 
         // --- Preview: topmost active video clip ---
         // Scoped disjoint borrows so the decoder advance + textured-quad push can
@@ -1205,6 +1240,8 @@ impl State {
         // --- Timeline panel background ---
         self.quads
             .push(Quad::colored([0.0, top_h], [w, bottom_h], TIMELINE_COLOR));
+        self.quads
+            .push(Quad::colored([0.0, top_h], [w, 1.0], PANEL_BORDER_COLOR));
 
         // --- Timeline tracks ---
         let tracks_top = top_h + TIMELINE_TOP_PAD;
@@ -1265,10 +1302,12 @@ impl State {
             [w, TIMELINE_RULER_H],
             TIMELINE_RULER_COLOR,
         ));
+        // Panel-weight, not divider-weight: this is where the ruler's chrome
+        // ends and the clip wells begin.
         self.quads.push(Quad::colored(
-            [0.0, ruler_bottom - 0.5],
+            [0.0, ruler_bottom - 1.0],
             [w, 1.0],
-            DIVIDER_COLOR,
+            PANEL_BORDER_COLOR,
         ));
         let pps = clips_w / timeline_duration_display as f32;
         let interval = nice_tick_interval(pps);
@@ -1435,18 +1474,24 @@ impl State {
             LABEL_SIZE,
             LABEL_COLOR,
         );
+        // --- Timeline toolbar: the label and its buttons share one row ---
+        // Both are centered on the same line, so widening the band moves them
+        // down together instead of drifting apart.
+        let toolbar_center_y = top_h + TIMELINE_TOP_PAD * 0.5;
         self.text.draw(
             &self.queue,
             &mut self.quads,
-            [LABEL_PAD, top_h + LABEL_PAD + self.text.ascent(LABEL_SIZE)],
+            [
+                LABEL_PAD,
+                (toolbar_center_y + self.text.ascent(LABEL_SIZE) * 0.5).round(),
+            ],
             "TIMELINE",
             LABEL_SIZE,
             LABEL_COLOR,
         );
 
-        // --- Timeline toolbar: just right of the TIMELINE label ---
         let timeline_label_w = self.text.measure_width("TIMELINE", LABEL_SIZE);
-        let btn_y = (top_h + (TIMELINE_TOP_PAD - TRANSPORT_BTN_H) * 0.5).round();
+        let btn_y = (toolbar_center_y - TRANSPORT_BTN_H * 0.5).round();
         let btn_x = (LABEL_PAD + timeline_label_w + LABEL_PAD * 1.5).round();
         let stride = TRANSPORT_BTN_W + TRANSPORT_GAP;
         self.timeline_split_btn = Rect {
