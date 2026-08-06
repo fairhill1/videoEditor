@@ -22,7 +22,7 @@ use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
 use timeline::{Clip, SourceId, Timeline, TimelineSnapshot, Track, TrackKind};
-use ui::{draw_button, draw_button_enabled, draw_tooltip, Rect, TooltipSide};
+use ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
 
 // Layout split ratios — tweak to taste.
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
@@ -1414,6 +1414,7 @@ impl State {
             "Open",
             TRANSPORT_LABEL_SIZE,
             pool_open_hovered,
+            BtnState::Normal,
         );
         if pool_open_hovered {
             draw_tooltip(
@@ -1470,25 +1471,42 @@ impl State {
             ..self.timeline_split_btn
         };
 
-        let can_undo = !self.undo_stack.is_empty();
-        let can_redo = !self.redo_stack.is_empty();
-        // Snap reuses the greyed-out styling to mean "off" rather than
-        // "unavailable" — it stays clickable either way, and dim-when-off is
-        // the reading a toggle wants anyway.
+        let avail = |yes: bool| {
+            if yes {
+                BtnState::Normal
+            } else {
+                BtnState::Disabled
+            }
+        };
         let buttons = [
-            (self.timeline_split_btn, "Split", "Split at playhead (S)", true),
-            (self.timeline_undo_btn, "Undo", "Undo (Ctrl+Z)", can_undo),
-            (self.timeline_redo_btn, "Redo", "Redo (Ctrl+Shift+Z)", can_redo),
+            (
+                self.timeline_split_btn,
+                "Split",
+                "Split at playhead (S)",
+                BtnState::Normal,
+            ),
+            (
+                self.timeline_undo_btn,
+                "Undo",
+                "Undo (Ctrl+Z)",
+                avail(!self.undo_stack.is_empty()),
+            ),
+            (
+                self.timeline_redo_btn,
+                "Redo",
+                "Redo (Ctrl+Shift+Z)",
+                avail(!self.redo_stack.is_empty()),
+            ),
             (
                 self.timeline_snap_btn,
                 "Snap",
                 "Snap to clip edges (N)",
-                self.snap_enabled,
+                BtnState::Toggle(self.snap_enabled),
             ),
         ];
-        for (rect, label, tip, enabled) in buttons {
+        for (rect, label, tip, state) in buttons {
             let hovered = rect.contains(self.cursor);
-            draw_button_enabled(
+            draw_button(
                 &mut self.quads,
                 &mut self.text,
                 &self.queue,
@@ -1496,7 +1514,7 @@ impl State {
                 label,
                 TRANSPORT_LABEL_SIZE,
                 hovered,
-                enabled,
+                state,
             );
             // Tooltip even when disabled — it's how you learn the shortcut.
             if hovered {
@@ -1571,6 +1589,7 @@ impl State {
                 labels[i],
                 TRANSPORT_LABEL_SIZE,
                 hovered == Some(i),
+                BtnState::Normal,
             );
         }
         if let Some(i) = hovered {

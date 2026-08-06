@@ -20,11 +20,33 @@ const BTN_BG_HOVER: [f32; 4] = [0.30, 0.30, 0.36, 0.95];
 const BTN_BG_DISABLED: [f32; 4] = [0.13, 0.13, 0.16, 0.92];
 const BTN_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const BTN_LABEL_DISABLED: [f32; 4] = [0.42, 0.42, 0.47, 1.0];
+// Indicator strip down the left edge of a toggle. The off color is dim but
+// clearly present: a strip that vanished entirely would lose the cue that the
+// button is a toggle at all, leaving "off" indistinguishable from a plain
+// button.
+const TOGGLE_ON: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
+const TOGGLE_OFF: [f32; 4] = [0.30, 0.30, 0.34, 1.0];
+const TOGGLE_STRIP_W: f32 = 3.0;
 const TOOLTIP_BG: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 const TOOLTIP_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const TOOLTIP_GAP: f32 = 6.0;
 const TOOLTIP_PAD_X: f32 = 7.0;
 const TOOLTIP_PAD_Y: f32 = 4.0;
+
+/// What a button says about itself beyond hover.
+///
+/// `Disabled` and `Toggle(false)` are deliberately distinct: greying out means
+/// "you can't press this", while a toggle that is off is fully pressable and
+/// must not look broken. They get different treatments — dimming versus an
+/// unlit indicator.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BtnState {
+    Normal,
+    /// Action unavailable right now, e.g. undo with an empty history.
+    Disabled,
+    /// Persistent on/off setting, shown by the indicator strip.
+    Toggle(bool),
+}
 
 pub fn draw_button(
     quads: &mut QuadRenderer,
@@ -34,30 +56,28 @@ pub fn draw_button(
     label: &str,
     label_size: f32,
     hovered: bool,
+    state: BtnState,
 ) {
-    draw_button_enabled(quads, text, queue, rect, label, label_size, hovered, true);
-}
-
-/// `draw_button` plus a greyed-out state, for actions that aren't always
-/// available (undo with an empty history).
-#[allow(clippy::too_many_arguments)]
-pub fn draw_button_enabled(
-    quads: &mut QuadRenderer,
-    text: &mut TextRenderer,
-    queue: &wgpu::Queue,
-    rect: Rect,
-    label: &str,
-    label_size: f32,
-    hovered: bool,
-    enabled: bool,
-) {
-    let bg = match (enabled, hovered) {
-        (false, _) => BTN_BG_DISABLED,
-        (true, true) => BTN_BG_HOVER,
-        (true, false) => BTN_BG,
+    let disabled = state == BtnState::Disabled;
+    let bg = match (disabled, hovered) {
+        (true, _) => BTN_BG_DISABLED,
+        (false, true) => BTN_BG_HOVER,
+        (false, false) => BTN_BG,
     };
-    let fg = if enabled { BTN_LABEL } else { BTN_LABEL_DISABLED };
+    let fg = if disabled { BTN_LABEL_DISABLED } else { BTN_LABEL };
     quads.push(Quad::colored([rect.x, rect.y], [rect.w, rect.h], bg));
+
+    if let BtnState::Toggle(on) = state {
+        let strip = if on { TOGGLE_ON } else { TOGGLE_OFF };
+        quads.push(Quad::colored(
+            [rect.x, rect.y],
+            [TOGGLE_STRIP_W, rect.h],
+            strip,
+        ));
+    }
+
+    // Centered on the whole rect, strip included, so a toggle's label keeps
+    // the same rhythm as the plain buttons beside it.
     let tw = text.measure_width(label, label_size);
     let ascent = text.ascent(label_size);
     let tx = (rect.x + (rect.w - tw) * 0.5).round();
