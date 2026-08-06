@@ -78,9 +78,24 @@ impl MediaPool {
         Ok(id)
     }
 
+    /// Drop `id` from the visible pool list. The decoded `Source` — GPU
+    /// textures, audio, waveform — is deliberately retained so undo can bring
+    /// the row back instantly instead of re-opening and re-scanning the file.
+    /// Nothing outside `order` is reachable from the UI, so a hidden source is
+    /// inert until `set_order` restores it.
     pub fn remove(&mut self, id: SourceId) {
-        self.sources.remove(&id);
         self.order.retain(|x| *x != id);
+    }
+
+    /// Restore a previously snapshotted pool order. Ids with no backing source
+    /// are skipped rather than trusted, so a stale snapshot can't resurrect a
+    /// row that would render as a blank entry.
+    pub fn set_order(&mut self, order: &[SourceId]) {
+        self.order = order
+            .iter()
+            .copied()
+            .filter(|id| self.sources.contains_key(id))
+            .collect();
     }
 
     pub fn get(&self, id: SourceId) -> Option<&Source> {

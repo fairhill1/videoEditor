@@ -13,7 +13,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -21,8 +21,8 @@ use audio::AudioEngine;
 use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
-use timeline::{Clip, SourceId, Timeline, Track, TrackKind};
-use ui::{draw_button, draw_tooltip, Rect, TooltipSide};
+use timeline::{Clip, SourceId, Timeline, TimelineSnapshot, Track, TrackKind};
+use ui::{draw_button, draw_button_enabled, draw_tooltip, Rect, TooltipSide};
 
 // Layout split ratios — tweak to taste.
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
@@ -108,6 +108,19 @@ enum DragMode {
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
 }
+
+/// One undo step: everything a user edit can change. Pool membership rides
+/// along with the timeline because deleting a pool item also deletes its
+/// clips — undoing that has to put both back in one move.
+#[derive(Clone, PartialEq)]
+struct EditSnapshot {
+    timeline: TimelineSnapshot,
+    pool_order: Vec<SourceId>,
+}
+
+/// Retained undo steps. Snapshots are small, but a long session shouldn't grow
+/// without bound; the oldest step is dropped past this.
+const UNDO_LIMIT: usize = 200;
 
 enum TimelineHit {
     None,
@@ -272,7 +285,20 @@ struct State {
     last_playing_source: Option<SourceId>,
     transport: [Rect; 3],
     timeline_split_btn: Rect,
+    timeline_undo_btn: Rect,
+    timeline_redo_btn: Rect,
     pool_open_btn: Rect,
+    modifiers: ModifiersState,
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    /// State captured before the in-flight edit. Held here rather than pushed
+    /// immediately so a drag that fires every mouse-move still collapses into
+    /// a single undo step, and so a no-op edit can be discarded.
+    pending_edit: Option<EditSnapshot>,
+    /// Open `begin_edit` calls. Only the outermost pair produces an undo step,
+    /// so a batch operation can wrap self-contained edits and still read as
+    /// one Ctrl+Z.
+    edit_depth: u32,
 }
 
 impl State {
@@ -329,7 +355,14 @@ impl State {
             last_playing_source: None,
             transport: [Rect::default(); 3],
             timeline_split_btn: Rect::default(),
+            timeline_undo_btn: Rect::default(),
+            timeline_redo_btn: Rect::default(),
             pool_open_btn: Rect::default(),
+            modifiers: ModifiersState::empty(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_edit: None,
+            edit_depth: 0,
         };
 
         state.configure_surface();
@@ -420,10 +453,89 @@ impl State {
     }
 
     fn remove_source(&mut self, id: SourceId) {
+        self.begin_edit();
         self.media.remove(id);
         self.timeline.remove_source(id);
         if self.last_playing_source == Some(id) {
             self.last_playing_source = None;
+        }
+        self.commit_edit();
+    }
+
+    fn edit_snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            timeline: self.timeline.snapshot(),
+            pool_order: self.media.ids().to_vec(),
+        }
+    }
+
+    /// Open an undoable edit. Nests: only the outermost begin/commit pair
+    /// yields a step, so a batch (multi-file import) can wrap operations that
+    /// each manage their own edit. Must be paired with `commit_edit`.
+    fn begin_edit(&mut self) {
+        if self.edit_depth == 0 {
+            self.pending_edit = Some(self.edit_snapshot());
+        }
+        self.edit_depth += 1;
+    }
+
+    /// Close the edit opened by `begin_edit`. Edits that changed nothing —
+    /// a click that never dragged, a split landing on a clip boundary — are
+    /// dropped so Ctrl+Z never appears to do nothing.
+    fn commit_edit(&mut self) {
+        self.edit_depth = self.edit_depth.saturating_sub(1);
+        if self.edit_depth > 0 {
+            return;
+        }
+        let Some(before) = self.pending_edit.take() else {
+            return;
+        };
+        if before == self.edit_snapshot() {
+            return;
+        }
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(before);
+        // A fresh edit invalidates the redo branch.
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop() else {
+            return;
+        };
+        let current = self.edit_snapshot();
+        self.apply_snapshot(&prev);
+        self.redo_stack.push(current);
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        let current = self.edit_snapshot();
+        self.apply_snapshot(&next);
+        self.undo_stack.push(current);
+    }
+
+    fn apply_snapshot(&mut self, snap: &EditSnapshot) {
+        // An in-flight drag holds (track, idx) coordinates that the restored
+        // timeline may no longer have — cancel it rather than index a clip
+        // that undo just deleted. Dropping the pending snapshot with it means
+        // the interrupted drag leaves no half-finished step behind.
+        self.drag = DragMode::None;
+        self.pending_edit = None;
+        self.edit_depth = 0;
+        self.timeline.restore(&snap.timeline);
+        self.media.set_order(&snap.pool_order);
+        // Recomputed from the timeline on the next render.
+        self.last_playing_source = None;
+        // Undoing a drop or a trim can shorten the timeline out from under
+        // the playhead; pull it back in bounds.
+        let duration = self.timeline.duration();
+        if self.audio.position() > duration {
+            self.audio.set_position(duration);
         }
     }
 
@@ -507,6 +619,14 @@ impl State {
     }
 
     fn begin_drag(&mut self) {
+        // A press with an edit still open means the matching release never
+        // arrived (focus lost mid-drag). Close it here — otherwise the depth
+        // counter leaks and every later edit nests inside it, silently
+        // stalling history for the rest of the session.
+        if self.edit_depth > 0 {
+            self.edit_depth = 1;
+            self.commit_edit();
+        }
         let [cx, cy] = self.cursor;
         if self.transport[0].contains([cx, cy]) {
             self.step_frame(-1.0);
@@ -524,6 +644,16 @@ impl State {
             self.split_at_playhead();
             return;
         }
+        // Consume the click even with an empty stack — undo() no-ops, and
+        // falling through would start a scrub under the toolbar.
+        if self.timeline_undo_btn.contains([cx, cy]) {
+            self.undo();
+            return;
+        }
+        if self.timeline_redo_btn.contains([cx, cy]) {
+            self.redo();
+            return;
+        }
         if self.pool_open_btn.contains([cx, cy]) {
             self.open_file_picker();
             return;
@@ -536,14 +666,19 @@ impl State {
             self.drag = DragMode::PoolDrag { source };
             return;
         }
+        // Clip drags mutate continuously; snapshot once here so the whole
+        // gesture collapses to one undo step (closed in `end_drag`).
         match self.timeline_hit(cx, cy) {
             TimelineHit::ClipTrimLeft { track, idx } => {
+                self.begin_edit();
                 self.drag = DragMode::ClipTrimLeft { track, idx };
             }
             TimelineHit::ClipTrimRight { track, idx } => {
+                self.begin_edit();
                 self.drag = DragMode::ClipTrimRight { track, idx };
             }
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
+                self.begin_edit();
                 self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
             }
             TimelineHit::Lane { .. } | TimelineHit::Ruler => {
@@ -692,6 +827,7 @@ impl State {
             let [cx, cy] = self.cursor;
             let layout = self.timeline_layout();
             if let Some(track_idx) = self.track_at_y(cy, &layout) {
+                self.begin_edit();
                 let drop_t = layout.cursor_to_t(cx).max(0.0);
                 let kind = self.timeline.tracks[track_idx].kind;
                 match kind {
@@ -745,6 +881,9 @@ impl State {
                 }
             }
         }
+        // Closes whichever edit `begin_drag` or the pool drop opened; a no-op
+        // gesture (click without move, drop that landed nowhere) discards it.
+        self.commit_edit();
         self.drag = DragMode::None;
     }
 
@@ -786,14 +925,20 @@ impl State {
 
     fn split_at_playhead(&mut self) {
         let t = self.audio.position();
+        self.begin_edit();
         self.timeline.split_at(t);
+        self.commit_edit();
     }
 
     fn toggle_playback(&mut self) {
         self.audio.toggle();
     }
 
+    /// Undoable: an import only adds a pool row, so undo hides it again.
+    /// Callers importing a batch should wrap the whole batch in their own
+    /// begin/commit pair to get one step for the batch.
     fn import_file(&mut self, path: &str) {
+        self.begin_edit();
         import_source(
             &mut self.media,
             path,
@@ -801,6 +946,7 @@ impl State {
             &self.queue,
             &self.quads,
         );
+        self.commit_edit();
     }
 
     fn open_file_picker(&mut self) {
@@ -812,11 +958,15 @@ impl State {
         else {
             return;
         };
+        // One picker interaction is one undo step, however many files it
+        // brought in — the per-file edits nest inside this one.
+        self.begin_edit();
         for path in paths {
             if let Some(p) = path.to_str() {
                 self.import_file(p);
             }
         }
+        self.commit_edit();
     }
 
     fn render(&mut self) {
@@ -1174,32 +1324,58 @@ impl State {
 
         // --- Timeline toolbar: just right of the TIMELINE label ---
         let timeline_label_w = self.text.measure_width("TIMELINE", LABEL_SIZE);
+        let btn_y = (top_h + (TIMELINE_TOP_PAD - TRANSPORT_BTN_H) * 0.5).round();
+        let btn_x = (LABEL_PAD + timeline_label_w + LABEL_PAD * 1.5).round();
+        let stride = TRANSPORT_BTN_W + TRANSPORT_GAP;
         self.timeline_split_btn = Rect {
-            x: (LABEL_PAD + timeline_label_w + LABEL_PAD * 1.5).round(),
-            y: (top_h + (TIMELINE_TOP_PAD - TRANSPORT_BTN_H) * 0.5).round(),
+            x: btn_x,
+            y: btn_y,
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
-        let split_hovered = self.timeline_split_btn.contains(self.cursor);
-        draw_button(
-            &mut self.quads,
-            &mut self.text,
-            &self.queue,
-            self.timeline_split_btn,
-            "Split",
-            TRANSPORT_LABEL_SIZE,
-            split_hovered,
-        );
-        if split_hovered {
-            draw_tooltip(
+        // Undo/redo sit with Split rather than in a window-level toolbar:
+        // history here covers timeline + pool edits, which is exactly what
+        // this strip governs.
+        self.timeline_undo_btn = Rect {
+            x: btn_x + stride,
+            ..self.timeline_split_btn
+        };
+        self.timeline_redo_btn = Rect {
+            x: btn_x + stride * 2.0,
+            ..self.timeline_split_btn
+        };
+
+        let can_undo = !self.undo_stack.is_empty();
+        let can_redo = !self.redo_stack.is_empty();
+        let buttons = [
+            (self.timeline_split_btn, "Split", "Split at playhead (S)", true),
+            (self.timeline_undo_btn, "Undo", "Undo (Ctrl+Z)", can_undo),
+            (self.timeline_redo_btn, "Redo", "Redo (Ctrl+Shift+Z)", can_redo),
+        ];
+        for (rect, label, tip, enabled) in buttons {
+            let hovered = rect.contains(self.cursor);
+            draw_button_enabled(
                 &mut self.quads,
                 &mut self.text,
                 &self.queue,
-                self.timeline_split_btn,
-                "Split at playhead (S)",
-                TRANSPORT_TOOLTIP_SIZE,
-                TooltipSide::Below,
+                rect,
+                label,
+                TRANSPORT_LABEL_SIZE,
+                hovered,
+                enabled,
             );
+            // Tooltip even when disabled — it's how you learn the shortcut.
+            if hovered {
+                draw_tooltip(
+                    &mut self.quads,
+                    &mut self.text,
+                    &self.queue,
+                    rect,
+                    tip,
+                    TRANSPORT_TOOLTIP_SIZE,
+                    TooltipSide::Below,
+                );
+            }
         }
 
         // --- Transport bar: prev / play / next centered; timer right-aligned ---
@@ -1580,6 +1756,9 @@ impl ApplicationHandler for App {
             } => {
                 state.end_drag();
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods.state();
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1589,17 +1768,28 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => match code {
-                // Arrows repeat so holding steps through frames.
-                KeyCode::ArrowLeft => state.step_frame(-1.0),
-                KeyCode::ArrowRight => state.step_frame(1.0),
-                // The rest are edge-triggered to avoid repeat spam.
-                _ if repeat => {}
-                KeyCode::Space => state.toggle_playback(),
-                KeyCode::KeyO => state.open_file_picker(),
-                KeyCode::KeyS => state.split_at_playhead(),
-                _ => {}
-            },
+            } => {
+                let ctrl = state.modifiers.control_key();
+                let shift = state.modifiers.shift_key();
+                match code {
+                    // Arrows repeat so holding steps through frames.
+                    KeyCode::ArrowLeft => state.step_frame(-1.0),
+                    KeyCode::ArrowRight => state.step_frame(1.0),
+                    // Undo/redo repeat too — holding Ctrl+Z to walk back
+                    // through history is the expected feel.
+                    KeyCode::KeyZ if ctrl && shift => state.redo(),
+                    KeyCode::KeyZ if ctrl => state.undo(),
+                    KeyCode::KeyY if ctrl => state.redo(),
+                    // The rest are edge-triggered to avoid repeat spam.
+                    _ if repeat => {}
+                    // Guarded on ctrl so unbound combos (Ctrl+S, Ctrl+O) don't
+                    // fall through to the bare-key action.
+                    KeyCode::Space if !ctrl => state.toggle_playback(),
+                    KeyCode::KeyO if !ctrl => state.open_file_picker(),
+                    KeyCode::KeyS if !ctrl => state.split_at_playhead(),
+                    _ => {}
+                }
+            }
             _ => (),
         }
     }

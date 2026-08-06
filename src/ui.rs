@@ -17,7 +17,9 @@ impl Rect {
 
 const BTN_BG: [f32; 4] = [0.18, 0.18, 0.22, 0.92];
 const BTN_BG_HOVER: [f32; 4] = [0.30, 0.30, 0.36, 0.95];
+const BTN_BG_DISABLED: [f32; 4] = [0.13, 0.13, 0.16, 0.92];
 const BTN_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+const BTN_LABEL_DISABLED: [f32; 4] = [0.42, 0.42, 0.47, 1.0];
 const TOOLTIP_BG: [f32; 4] = [0.05, 0.05, 0.07, 1.0];
 const TOOLTIP_LABEL: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const TOOLTIP_GAP: f32 = 6.0;
@@ -33,13 +35,34 @@ pub fn draw_button(
     label_size: f32,
     hovered: bool,
 ) {
-    let bg = if hovered { BTN_BG_HOVER } else { BTN_BG };
+    draw_button_enabled(quads, text, queue, rect, label, label_size, hovered, true);
+}
+
+/// `draw_button` plus a greyed-out state, for actions that aren't always
+/// available (undo with an empty history).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_button_enabled(
+    quads: &mut QuadRenderer,
+    text: &mut TextRenderer,
+    queue: &wgpu::Queue,
+    rect: Rect,
+    label: &str,
+    label_size: f32,
+    hovered: bool,
+    enabled: bool,
+) {
+    let bg = match (enabled, hovered) {
+        (false, _) => BTN_BG_DISABLED,
+        (true, true) => BTN_BG_HOVER,
+        (true, false) => BTN_BG,
+    };
+    let fg = if enabled { BTN_LABEL } else { BTN_LABEL_DISABLED };
     quads.push(Quad::colored([rect.x, rect.y], [rect.w, rect.h], bg));
     let tw = text.measure_width(label, label_size);
     let ascent = text.ascent(label_size);
     let tx = (rect.x + (rect.w - tw) * 0.5).round();
     let ty = (rect.y + (rect.h + ascent) * 0.5).round();
-    text.draw(queue, quads, [tx, ty], label, label_size, BTN_LABEL);
+    text.draw(queue, quads, [tx, ty], label, label_size, fg);
 }
 
 #[derive(Clone, Copy)]

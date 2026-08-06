@@ -7,7 +7,7 @@ pub enum TrackKind {
     Audio,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Clip {
     pub source: SourceId,
     pub source_in: f64,
@@ -60,6 +60,16 @@ pub struct Timeline {
     next_link: u32,
 }
 
+/// Complete copy of the timeline's mutable state, for undo/redo. Clips are
+/// `Copy` and a project holds thousands at most, so snapshotting the whole
+/// thing per edit is cheaper — and far less bug-prone — than maintaining an
+/// inverse operation for every edit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelineSnapshot {
+    tracks: Vec<(TrackKind, Vec<Clip>)>,
+    next_link: u32,
+}
+
 impl Timeline {
     pub fn new() -> Self {
         Self {
@@ -74,6 +84,31 @@ impl Timeline {
         let id = self.next_link;
         self.next_link += 1;
         id
+    }
+
+    pub fn snapshot(&self) -> TimelineSnapshot {
+        TimelineSnapshot {
+            tracks: self
+                .tracks
+                .iter()
+                .map(|t| (t.kind, t.clips.clone()))
+                .collect(),
+            next_link: self.next_link,
+        }
+    }
+
+    /// Rewinding `next_link` can't collide: every clip holding an id at or
+    /// above the restored counter is discarded by the same restore.
+    pub fn restore(&mut self, snap: &TimelineSnapshot) {
+        self.tracks = snap
+            .tracks
+            .iter()
+            .map(|(kind, clips)| Track {
+                kind: *kind,
+                clips: clips.clone(),
+            })
+            .collect();
+        self.next_link = snap.next_link;
     }
 
     pub fn remove_source(&mut self, source: SourceId) {
@@ -153,5 +188,84 @@ impl Timeline {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(start: f64, dur: f64) -> Clip {
+        Clip {
+            source: SourceId(0),
+            source_in: 0.0,
+            source_out: dur,
+            timeline_start: start,
+            link: None,
+        }
+    }
+
+    fn timeline_with(clips: Vec<Clip>) -> Timeline {
+        let mut tl = Timeline::new();
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks[0].clips = clips;
+        tl
+    }
+
+    #[test]
+    fn restore_undoes_a_split() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        let before = tl.snapshot();
+
+        tl.split_at(4.0);
+        assert_eq!(tl.tracks[0].clips.len(), 2);
+        assert_ne!(tl.snapshot(), before);
+
+        tl.restore(&before);
+        assert_eq!(tl.tracks[0].clips.len(), 1);
+        assert_eq!(tl.snapshot(), before);
+    }
+
+    #[test]
+    fn restore_rewinds_link_ids_so_a_redone_split_reuses_them() {
+        let mut tl = timeline_with(vec![Clip {
+            link: Some(0),
+            ..clip(0.0, 10.0)
+        }]);
+        tl.next_link = 1;
+        let before = tl.snapshot();
+
+        tl.split_at(4.0);
+        let first = tl.tracks[0].clips[1].link;
+
+        tl.restore(&before);
+        tl.split_at(4.0);
+        // The rewind is what keeps ids from drifting upward on every
+        // undo/redo cycle; the clip that held the old id is gone.
+        assert_eq!(tl.tracks[0].clips[1].link, first);
+    }
+
+    #[test]
+    fn snapshot_is_a_deep_copy() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        let before = tl.snapshot();
+        tl.tracks[0].clips[0].timeline_start = 99.0;
+        assert_ne!(tl.snapshot(), before);
+
+        tl.restore(&before);
+        assert_eq!(tl.tracks[0].clips[0].timeline_start, 0.0);
+    }
+
+    #[test]
+    fn restore_reinstates_clips_removed_with_their_source() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0), clip(20.0, 5.0)]);
+        let before = tl.snapshot();
+
+        tl.remove_source(SourceId(0));
+        assert!(tl.tracks[0].clips.is_empty());
+
+        tl.restore(&before);
+        assert_eq!(tl.tracks[0].clips.len(), 2);
+        assert_eq!(tl.duration(), 25.0);
     }
 }
