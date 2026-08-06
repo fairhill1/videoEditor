@@ -12,6 +12,9 @@ pub struct Source {
     pub audio: Option<AudioStream>,
     pub waveform: Option<Waveform>,
     pub name: String,
+    /// Kept so an export can open its own decoders from the original file
+    /// rather than borrowing the ones driving the preview.
+    pub path: String,
 }
 
 pub struct MediaPool {
@@ -72,6 +75,7 @@ impl MediaPool {
                 audio,
                 waveform,
                 name,
+                path: path.to_string(),
             },
         );
         self.order.push(id);

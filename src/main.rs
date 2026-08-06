@@ -1,4 +1,5 @@
 mod audio;
+mod export;
 mod media;
 mod quad;
 mod text;
@@ -6,7 +7,9 @@ mod timeline;
 mod ui;
 mod video;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::{
     application::ApplicationHandler,
@@ -18,6 +21,7 @@ use winit::{
 };
 
 use audio::AudioEngine;
+use export::{ExportJob, ExportRequest, Outcome, VideoSpec};
 use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
@@ -55,6 +59,11 @@ const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
 // reads as a 2px seam.
 const CLIP_BORDER_PX: f32 = 1.0;
 const CLIP_BORDER_DARKEN: f32 = 0.40;
+// Selection accent. Lighter than the toggle orange so it still separates from
+// the saturated blue and green clip fills it has to sit on.
+const CLIP_SELECTED_BORDER: [f32; 4] = [1.0, 0.72, 0.30, 1.0];
+const CLIP_SELECTED_BORDER_PX: f32 = 2.0;
+const CLIP_SELECTED_LIFT: f32 = 0.14;
 // How close a dragged edge must come to latch onto a snap target. In pixels
 // rather than seconds so the pull feels the same however long the timeline is.
 const SNAP_PX: f32 = 8.0;
@@ -81,6 +90,27 @@ const TRANSPORT_BTN_H: f32 = 26.0;
 const TRANSPORT_GAP: f32 = 8.0;
 const TRANSPORT_LABEL_SIZE: f32 = 12.0;
 const TRANSPORT_TOOLTIP_SIZE: f32 = 11.0;
+
+// Export readout, occupying the toolbar row between the edit buttons and the
+// right-aligned Export button. Doubles as the progress bar while a render runs
+// and the result message afterwards, so the two never fight for the same space.
+const EXPORT_BTN_W: f32 = 64.0;
+const EXPORT_READOUT_W: f32 = 190.0;
+const EXPORT_READOUT_GAP: f32 = 10.0;
+const EXPORT_BAR_H: f32 = 4.0;
+const EXPORT_BAR_TRACK: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
+const EXPORT_BAR_FILL: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
+const EXPORT_STATUS_SIZE: f32 = 11.0;
+const EXPORT_STATUS_OK: [f32; 4] = [0.60, 0.85, 0.65, 1.0];
+const EXPORT_STATUS_ERR: [f32; 4] = [0.92, 0.55, 0.55, 1.0];
+const EXPORT_STATUS_INFO: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
+/// How long a finished-export message lingers. Long enough to read, short
+/// enough that it clears itself instead of needing a dismiss affordance.
+const EXPORT_STATUS_SECONDS: f64 = 8.0;
+/// Fallback picture size when the timeline has video the pool can no longer
+/// describe. Only reachable if a source vanished from the pool mid-session.
+const EXPORT_FALLBACK_SIZE: (u32, u32) = (1920, 1080);
+const EXPORT_FALLBACK_FPS: f64 = 30.0;
 
 // Timeline panel layout.
 // Lane height is computed per-frame to fill the timeline area; these bounds
@@ -238,6 +268,16 @@ fn nearest_snap(edges: &[f64], targets: &[f64], threshold: f64) -> Option<f64> {
     best.map(|(_, adjust)| adjust)
 }
 
+/// Blend `c` toward white by `f`, leaving alpha alone.
+fn lighten(c: [f32; 4], f: f32) -> [f32; 4] {
+    [
+        c[0] + (1.0 - c[0]) * f,
+        c[1] + (1.0 - c[1]) * f,
+        c[2] + (1.0 - c[2]) * f,
+        c[3],
+    ]
+}
+
 fn darken(c: [f32; 4], f: f32) -> [f32; 4] {
     [c[0] * f, c[1] * f, c[2] * f, c[3]]
 }
@@ -343,6 +383,19 @@ struct State {
     timeline_undo_btn: Rect,
     timeline_redo_btn: Rect,
     timeline_snap_btn: Rect,
+    timeline_delete_btn: Rect,
+    /// Clip id, not a position — see [`Clip::id`]. A selection whose clip has
+    /// been deleted simply resolves to nothing, and comes back if an undo
+    /// restores the clip.
+    selected: Option<u32>,
+    /// Right-aligned in the toolbar row, well clear of the edit buttons: this
+    /// one produces a file rather than changing the timeline.
+    timeline_export_btn: Rect,
+    /// The render in flight, if any. Only one at a time — the button greys out
+    /// while it runs, and clicking it again cancels.
+    export: Option<ExportJob>,
+    /// Result of the last render, shown until it ages out.
+    export_status: Option<(String, [f32; 4], Instant)>,
     /// Magnetic snapping while dragging. Toggleable because there is no
     /// timeline zoom yet: on a long timeline the pixel threshold covers a wide
     /// time window, and without an escape hatch a clip could not be parked
@@ -419,6 +472,11 @@ impl State {
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
             timeline_snap_btn: Rect::default(),
+            timeline_delete_btn: Rect::default(),
+            selected: None,
+            timeline_export_btn: Rect::default(),
+            export: None,
+            export_status: None,
             snap_enabled: true,
             pool_open_btn: Rect::default(),
             modifiers: ModifiersState::empty(),
@@ -725,8 +783,16 @@ impl State {
             self.redo();
             return;
         }
+        if self.timeline_delete_btn.contains([cx, cy]) {
+            self.delete_selected();
+            return;
+        }
         if self.timeline_snap_btn.contains([cx, cy]) {
             self.snap_enabled = !self.snap_enabled;
+            return;
+        }
+        if self.timeline_export_btn.contains([cx, cy]) {
+            self.start_export();
             return;
         }
         if self.pool_open_btn.contains([cx, cy]) {
@@ -743,25 +809,38 @@ impl State {
         }
         // Clip drags mutate continuously; snapshot once here so the whole
         // gesture collapses to one undo step (closed in `end_drag`).
+        //
+        // Touching a clip at all selects it — including by its trim handles,
+        // since a press there is still a statement about which clip you mean.
+        // Pressing bare lane or ruler clears, so there is always a way to
+        // deselect without a modifier.
         match self.timeline_hit(cx, cy) {
             TimelineHit::ClipTrimLeft { track, idx } => {
+                self.select_clip_at(track, idx);
                 self.begin_edit();
                 self.drag = DragMode::ClipTrimLeft { track, idx };
             }
             TimelineHit::ClipTrimRight { track, idx } => {
+                self.select_clip_at(track, idx);
                 self.begin_edit();
                 self.drag = DragMode::ClipTrimRight { track, idx };
             }
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
+                self.select_clip_at(track, idx);
                 self.begin_edit();
                 self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
             }
             TimelineHit::Lane { .. } | TimelineHit::Ruler => {
+                self.selected = None;
                 self.drag = DragMode::Scrub;
                 self.apply_scrub();
             }
             TimelineHit::None => {}
         }
+    }
+
+    fn select_clip_at(&mut self, track: usize, idx: usize) {
+        self.selected = Some(self.timeline.tracks[track].clips[idx].id);
     }
 
     fn update_drag(&mut self) {
@@ -972,7 +1051,9 @@ impl State {
                             })
                             .flatten();
                         let link = audio_target.map(|_| self.timeline.new_link_id());
+                        let id = self.timeline.new_clip_id();
                         self.timeline.tracks[track_idx].clips.push(Clip {
+                            id,
                             source,
                             source_in: 0.0,
                             source_out: dur,
@@ -981,7 +1062,9 @@ impl State {
                         });
                         if let Some(audio_idx) = audio_target {
                             let adur = self.media.audio_duration(source).unwrap_or(dur);
+                            let id = self.timeline.new_clip_id();
                             self.timeline.tracks[audio_idx].clips.push(Clip {
+                                id,
                                 source,
                                 source_in: 0.0,
                                 source_out: adur,
@@ -992,7 +1075,9 @@ impl State {
                     }
                     TrackKind::Audio => {
                         if let Some(adur) = self.media.audio_duration(source) {
+                            let id = self.timeline.new_clip_id();
                             self.timeline.tracks[track_idx].clips.push(Clip {
+                                id,
                                 source,
                                 source_in: 0.0,
                                 source_out: adur,
@@ -1074,6 +1159,35 @@ impl State {
         self.commit_edit();
     }
 
+    /// Whether [`State::delete_selected`] would actually remove anything.
+    fn has_selection(&self) -> bool {
+        self.selected
+            .is_some_and(|id| self.timeline.find(id).is_some())
+    }
+
+    /// Remove the selected clip, taking its linked siblings with it. Linked
+    /// A/V travels as a unit everywhere else — move, trim, split — so deleting
+    /// only half of a pair would be the odd one out.
+    fn delete_selected(&mut self) {
+        let Some((track, idx)) = self.selected.and_then(|id| self.timeline.find(id)) else {
+            return;
+        };
+        // Resolve to ids before touching anything: every removal shifts the
+        // indices of the clips after it, so a list of positions goes stale the
+        // moment the first one is used.
+        let doomed: Vec<u32> = self
+            .linked_siblings(track, idx)
+            .into_iter()
+            .map(|(ti, ci)| self.timeline.tracks[ti].clips[ci].id)
+            .collect();
+        self.begin_edit();
+        for t in &mut self.timeline.tracks {
+            t.clips.retain(|c| !doomed.contains(&c.id));
+        }
+        self.commit_edit();
+        self.selected = None;
+    }
+
     fn toggle_playback(&mut self) {
         self.audio.toggle();
     }
@@ -1113,6 +1227,133 @@ impl State {
         self.commit_edit();
     }
 
+    /// Picture size and rate for a render, taken from the timeline's first
+    /// video clip — earliest start, lowest track on a tie. Matching one clip
+    /// rather than, say, the largest source keeps the common single-camera
+    /// timeline a straight passthrough; anything else letterboxes into it.
+    fn export_video_spec(&self) -> Option<VideoSpec> {
+        let mut reference: Option<(f64, usize, SourceId)> = None;
+        for (track_idx, track) in self.timeline.tracks.iter().enumerate() {
+            if track.kind != TrackKind::Video {
+                continue;
+            }
+            for clip in &track.clips {
+                let better = reference.is_none_or(|(start, ti, _)| {
+                    (clip.timeline_start, track_idx) < (start, ti)
+                });
+                if better {
+                    reference = Some((clip.timeline_start, track_idx, clip.source));
+                }
+            }
+        }
+        let (_, _, source) = reference?;
+        let (width, height, fps) = match self.media.get(source) {
+            Some(src) => (
+                src.stream.width(),
+                src.stream.height(),
+                src.stream.frame_rate(),
+            ),
+            None => (
+                EXPORT_FALLBACK_SIZE.0,
+                EXPORT_FALLBACK_SIZE.1,
+                EXPORT_FALLBACK_FPS,
+            ),
+        };
+        // H.264 in YUV420P cannot represent an odd dimension, and a source with
+        // one would otherwise fail deep inside the encoder.
+        Some(VideoSpec {
+            width: (width & !1).max(2),
+            height: (height & !1).max(2),
+            fps: if fps > 0.0 { fps } else { EXPORT_FALLBACK_FPS },
+        })
+    }
+
+    fn can_export(&self) -> bool {
+        self.export.is_none() && self.timeline.duration() > 0.0
+    }
+
+    fn set_export_status(&mut self, message: String, color: [f32; 4]) {
+        self.export_status = Some((message, color, Instant::now()));
+    }
+
+    fn start_export(&mut self) {
+        // Clicking Export while one is running cancels it — the button is the
+        // only affordance, so it has to be the stop as well as the start.
+        if let Some(job) = &self.export {
+            job.cancel();
+            self.set_export_status("Cancelling…".into(), EXPORT_STATUS_INFO);
+            return;
+        }
+        if self.timeline.duration() <= 0.0 {
+            self.set_export_status("Nothing to export".into(), EXPORT_STATUS_ERR);
+            return;
+        }
+        let Some(output) = rfd::FileDialog::new()
+            .add_filter("MP4 video", &["mp4"])
+            .set_file_name("export.mp4")
+            .save_file()
+        else {
+            return;
+        };
+
+        // Snapshot the timeline and resolve every path up front, so the worker
+        // renders what you saw when you pressed the button and you stay free to
+        // keep editing while it runs.
+        let tracks = self
+            .timeline
+            .tracks
+            .iter()
+            .map(|t| (t.kind, t.clips.clone()))
+            .collect::<Vec<_>>();
+        let mut paths = HashMap::new();
+        for (_, clips) in &tracks {
+            for clip in clips {
+                if let Some(src) = self.media.get(clip.source) {
+                    paths.insert(clip.source, src.path.clone());
+                }
+            }
+        }
+
+        let request = ExportRequest {
+            output,
+            video: self.export_video_spec(),
+            tracks,
+            paths,
+        };
+        self.export = Some(ExportJob::start(request));
+        self.set_export_status("Starting…".into(), EXPORT_STATUS_INFO);
+    }
+
+    /// Retire a finished job and turn its result into a status message. Called
+    /// once per frame; the worker reports through a mutex rather than the event
+    /// loop, so this poll is what surfaces it.
+    fn poll_export(&mut self) {
+        let Some(job) = &self.export else {
+            return;
+        };
+        let Some(outcome) = job.take_outcome() else {
+            return;
+        };
+        self.export = None;
+        match outcome {
+            Outcome::Done(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                self.set_export_status(format!("Exported {name}"), EXPORT_STATUS_OK);
+            }
+            Outcome::Cancelled => {
+                self.set_export_status("Export cancelled".into(), EXPORT_STATUS_INFO);
+            }
+            Outcome::Failed(err) => {
+                log::error!("export failed: {err}");
+                self.set_export_status(format!("Export failed: {err}"), EXPORT_STATUS_ERR);
+            }
+        }
+    }
+
     fn render(&mut self) {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
@@ -1136,6 +1377,10 @@ impl State {
                 format: Some(self.surface_format.add_srgb_suffix()),
                 ..Default::default()
             });
+
+        // The export worker reports through a mutex, not the event loop, so
+        // this poll is what turns a finished render into a status message.
+        self.poll_export();
 
         let w = self.size.width as f32;
         let h = self.size.height as f32;
@@ -1377,12 +1622,15 @@ impl State {
         }
 
         // --- Playhead: drawn last so it's on top of clips ---
+        // Starts at the ruler rather than the top of the panel: it marks a
+        // position on the time scale, and the toolbar above has no time axis
+        // for it to point at.
         if self.timeline.duration() > 0.0 {
             let ratio = (t / self.timeline.duration()).clamp(0.0, 1.0) as f32;
             let px = (clips_x + ratio * clips_w - PLAYHEAD_WIDTH * 0.5).round();
             self.quads.push(Quad::colored(
-                [px, top_h],
-                [PLAYHEAD_WIDTH, bottom_h],
+                [px, ruler_top],
+                [PLAYHEAD_WIDTH, h - ruler_top],
                 PLAYHEAD_COLOR,
             ));
         }
@@ -1464,6 +1712,7 @@ impl State {
                 "Open file (O)",
                 TRANSPORT_TOOLTIP_SIZE,
                 TooltipSide::Below,
+                w,
             );
         }
         self.text.draw(
@@ -1500,21 +1749,35 @@ impl State {
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
-        // Undo/redo sit with Split rather than in a window-level toolbar:
-        // history here covers timeline + pool edits, which is exactly what
-        // this strip governs.
-        self.timeline_undo_btn = Rect {
+        // Delete sits next to Split — both act on clips — with undo/redo after
+        // them. Those live here rather than in a window-level toolbar because
+        // history covers timeline + pool edits, which is what this strip
+        // governs.
+        self.timeline_delete_btn = Rect {
             x: btn_x + stride,
             ..self.timeline_split_btn
         };
-        self.timeline_redo_btn = Rect {
+        self.timeline_undo_btn = Rect {
             x: btn_x + stride * 2.0,
             ..self.timeline_split_btn
         };
-        self.timeline_snap_btn = Rect {
+        self.timeline_redo_btn = Rect {
             x: btn_x + stride * 3.0,
             ..self.timeline_split_btn
         };
+        self.timeline_snap_btn = Rect {
+            x: btn_x + stride * 4.0,
+            ..self.timeline_split_btn
+        };
+        // Pinned to the right edge rather than trailing the cluster: Export
+        // ends the workflow the other buttons edit, and the distance says so.
+        self.timeline_export_btn = Rect {
+            x: (w - LABEL_PAD - EXPORT_BTN_W).round(),
+            y: btn_y,
+            w: EXPORT_BTN_W,
+            h: TRANSPORT_BTN_H,
+        };
+        let exporting = self.export.is_some();
 
         let avail = |yes: bool| {
             if yes {
@@ -1529,6 +1792,12 @@ impl State {
                 "Split",
                 "Split at playhead (S)",
                 BtnState::Normal,
+            ),
+            (
+                self.timeline_delete_btn,
+                "Delete",
+                "Delete clip (Del)",
+                avail(self.has_selection()),
             ),
             (
                 self.timeline_undo_btn,
@@ -1547,6 +1816,16 @@ impl State {
                 "Snap",
                 "Snap to clip edges (N)",
                 BtnState::Toggle(self.snap_enabled),
+            ),
+            (
+                self.timeline_export_btn,
+                if exporting { "Stop" } else { "Export" },
+                if exporting {
+                    "Cancel this export"
+                } else {
+                    "Export to MP4 (Ctrl+E)"
+                },
+                avail(exporting || self.can_export()),
             ),
         ];
         for (rect, label, tip, state) in buttons {
@@ -1571,7 +1850,71 @@ impl State {
                     tip,
                     TRANSPORT_TOOLTIP_SIZE,
                     TooltipSide::Below,
+                    w,
                 );
+            }
+        }
+
+        // --- Export readout: progress while rendering, result once done ---
+        // Both share the strip left of the Export button, so a finished message
+        // appears exactly where the bar that produced it was.
+        let readout_right = self.timeline_export_btn.x - EXPORT_READOUT_GAP;
+        let readout_left = readout_right - EXPORT_READOUT_W;
+        let status_ascent = self.text.ascent(EXPORT_STATUS_SIZE);
+        if let Some(job) = &self.export {
+            let progress = job.progress();
+            let block_h = status_ascent + 3.0 + EXPORT_BAR_H;
+            let block_top = (toolbar_center_y - block_h * 0.5).round();
+            let text = format!("Exporting… {}%", (progress.fraction() * 100.0).round());
+            let text_w = self.text.measure_width(&text, EXPORT_STATUS_SIZE);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [
+                    (readout_right - text_w).round(),
+                    block_top + status_ascent,
+                ],
+                &text,
+                EXPORT_STATUS_SIZE,
+                EXPORT_STATUS_INFO,
+            );
+            let bar_y = (block_top + status_ascent + 3.0).round();
+            self.quads.push(Quad::colored(
+                [readout_left, bar_y],
+                [EXPORT_READOUT_W, EXPORT_BAR_H],
+                EXPORT_BAR_TRACK,
+            ));
+            let filled = (EXPORT_READOUT_W * progress.fraction()).round();
+            if filled > 0.0 {
+                self.quads.push(Quad::colored(
+                    [readout_left, bar_y],
+                    [filled, EXPORT_BAR_H],
+                    EXPORT_BAR_FILL,
+                ));
+            }
+        } else if let Some((message, color, since)) = &self.export_status {
+            if since.elapsed().as_secs_f64() < EXPORT_STATUS_SECONDS {
+                let (message, color) = (message.clone(), *color);
+                let message = truncate_to_width(
+                    &self.text,
+                    &message,
+                    EXPORT_STATUS_SIZE,
+                    EXPORT_READOUT_W,
+                );
+                let text_w = self.text.measure_width(&message, EXPORT_STATUS_SIZE);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [
+                        (readout_right - text_w).round(),
+                        (toolbar_center_y + status_ascent * 0.5).round(),
+                    ],
+                    &message,
+                    EXPORT_STATUS_SIZE,
+                    color,
+                );
+            } else {
+                self.export_status = None;
             }
         }
 
@@ -1646,6 +1989,7 @@ impl State {
                 tooltips[i],
                 TRANSPORT_TOOLTIP_SIZE,
                 TooltipSide::Above,
+                w,
             );
         }
 
@@ -1801,7 +2145,7 @@ impl State {
             TrackKind::Video => (VIDEO_CLIP_COLOR, "V"),
             TrackKind::Audio => (AUDIO_CLIP_COLOR, "A"),
         };
-        let border_color = darken(clip_color, CLIP_BORDER_DARKEN);
+        let unselected_border = darken(clip_color, CLIP_BORDER_DARKEN);
 
         // Lane background.
         self.quads.push(Quad::colored(
@@ -1826,8 +2170,22 @@ impl State {
         for clip in &track.clips {
             let x = clips_x + (clip.timeline_start / timeline_duration) as f32 * clips_w;
             let cw = ((clip.duration() / timeline_duration) as f32 * clips_w).max(1.0);
+            // Selection reads as a brighter version of the clip plus an accent
+            // outline, rather than a colour of its own: the blue/green split
+            // between video and audio is load-bearing, so recolouring the fill
+            // outright would cost more information than it gives.
+            let selected = self.selected == Some(clip.id);
+            let (fill, border_color, b) = if selected {
+                (
+                    lighten(clip_color, CLIP_SELECTED_LIFT),
+                    CLIP_SELECTED_BORDER,
+                    CLIP_SELECTED_BORDER_PX,
+                )
+            } else {
+                (clip_color, unselected_border, CLIP_BORDER_PX)
+            };
             self.quads
-                .push(Quad::colored([x, lane_y], [cw, lane_h], clip_color));
+                .push(Quad::colored([x, lane_y], [cw, lane_h], fill));
 
             // Waveform bars for audio clips. One 1px-wide vertical rect per
             // pixel column, height proportional to the max peak in that
@@ -1886,7 +2244,6 @@ impl State {
             // empty space between clips. For the same reason the outline is a
             // darkened tint of the clip rather than the lane color, so a seam
             // stays distinguishable from a real gap.
-            let b = CLIP_BORDER_PX;
             self.quads
                 .push(Quad::colored([x, lane_y], [cw, b], border_color));
             self.quads.push(Quad::colored(
@@ -2021,6 +2378,10 @@ impl ApplicationHandler for App {
                     KeyCode::KeyY if ctrl => state.redo(),
                     // The rest are edge-triggered to avoid repeat spam.
                     _ if repeat => {}
+                    KeyCode::KeyE if ctrl => state.start_export(),
+                    // Backspace too: both keys mean "delete" depending on the
+                    // keyboard you grew up with.
+                    KeyCode::Delete | KeyCode::Backspace => state.delete_selected(),
                     // Guarded on ctrl so unbound combos (Ctrl+S, Ctrl+O) don't
                     // fall through to the bare-key action.
                     KeyCode::Space if !ctrl => state.toggle_playback(),

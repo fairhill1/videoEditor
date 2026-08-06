@@ -46,6 +46,10 @@ const TOOLTIP_PAD_Y: f32 = 5.0;
 // should ever be.
 const TOOLTIP_SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.10];
 const TOOLTIP_SHADOW_STEPS: i32 = 3;
+/// Closest a tooltip may sit to the window edge. Without this a tooltip on a
+/// right-aligned button — which is wider than the button it describes — would
+/// centre itself off-screen and lose its tail.
+const TOOLTIP_MARGIN: f32 = 4.0;
 
 /// What a button says about itself beyond hover.
 ///
@@ -123,12 +127,19 @@ pub fn draw_tooltip(
     label: &str,
     size_px: f32,
     side: TooltipSide,
+    viewport_w: f32,
 ) {
     let tw = text.measure_width(label, size_px);
     let ascent = text.ascent(size_px);
     let box_w = tw + TOOLTIP_PAD_X * 2.0;
     let box_h = ascent + TOOLTIP_PAD_Y * 2.0;
-    let bx = (anchor.x + (anchor.w - box_w) * 0.5).round();
+    // Centre on the anchor, then slide back inside the window. `max` last so a
+    // tooltip wider than the window still starts at the left margin rather than
+    // being pushed off the other side.
+    let bx = (anchor.x + (anchor.w - box_w) * 0.5)
+        .min(viewport_w - box_w - TOOLTIP_MARGIN)
+        .max(TOOLTIP_MARGIN)
+        .round();
     let by = match side {
         TooltipSide::Above => (anchor.y - box_h - TOOLTIP_GAP).round(),
         TooltipSide::Below => (anchor.y + anchor.h + TOOLTIP_GAP).round(),

@@ -15,6 +15,11 @@ pub enum TrackKind {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Clip {
+    /// Stable name for this clip, unlike its position in `Track::clips`.
+    /// Splitting inserts, deleting removes, and dragging to another track moves
+    /// a clip between vectors — any of which silently reassigns indices. The
+    /// UI holds one of these to keep pointing at the clip you actually picked.
+    pub id: u32,
     pub source: SourceId,
     pub source_in: f64,
     pub source_out: f64,
@@ -64,6 +69,7 @@ impl Track {
 pub struct Timeline {
     pub tracks: Vec<Track>,
     next_link: u32,
+    next_clip: u32,
 }
 
 /// Complete copy of the timeline's mutable state, for undo/redo. Clips are
@@ -74,6 +80,7 @@ pub struct Timeline {
 pub struct TimelineSnapshot {
     tracks: Vec<(TrackKind, Vec<Clip>)>,
     next_link: u32,
+    next_clip: u32,
 }
 
 impl Timeline {
@@ -81,7 +88,29 @@ impl Timeline {
         Self {
             tracks: Vec::new(),
             next_link: 0,
+            next_clip: 0,
         }
+    }
+
+    /// Allocate a fresh clip id. Every `Clip` must get one from here so that
+    /// no two clips ever share a name.
+    pub fn new_clip_id(&mut self) -> u32 {
+        let id = self.next_clip;
+        self.next_clip += 1;
+        id
+    }
+
+    /// Position of the clip called `id`, or `None` once it has been deleted.
+    /// A stale id is inert rather than wrong — which is what lets a selection
+    /// survive an undo that brings its clip back.
+    pub fn find(&self, id: u32) -> Option<(usize, usize)> {
+        self.tracks.iter().enumerate().find_map(|(ti, track)| {
+            track
+                .clips
+                .iter()
+                .position(|c| c.id == id)
+                .map(|ci| (ti, ci))
+        })
     }
 
     /// Allocate a fresh link id. Call this when establishing a new linked
@@ -100,6 +129,7 @@ impl Timeline {
                 .map(|t| (t.kind, t.clips.clone()))
                 .collect(),
             next_link: self.next_link,
+            next_clip: self.next_clip,
         }
     }
 
@@ -115,6 +145,7 @@ impl Timeline {
             })
             .collect();
         self.next_link = snap.next_link;
+        self.next_clip = snap.next_clip;
     }
 
     pub fn remove_source(&mut self, source: SourceId) {
@@ -207,6 +238,9 @@ impl Timeline {
             relink.insert(old, new_id);
         }
 
+        // Held locally because the loop below borrows `self.tracks` mutably;
+        // written back once it releases.
+        let mut next_clip = self.next_clip;
         for track in &mut self.tracks {
             let mut i = 0;
             while i < track.clips.len() {
@@ -215,9 +249,14 @@ impl Timeline {
                     let split_source_t = orig.source_time(t);
                     track.clips[i].source_out = split_source_t;
                     let right_link = orig.link.map(|old| relink[&old]);
+                    // The left half keeps the original id, so a selection on
+                    // the clip you split stays on the part before the cut.
+                    let right_id = next_clip;
+                    next_clip += 1;
                     track.clips.insert(
                         i + 1,
                         Clip {
+                            id: right_id,
                             source: orig.source,
                             source_in: split_source_t,
                             source_out: orig.source_out,
@@ -231,6 +270,7 @@ impl Timeline {
                 }
             }
         }
+        self.next_clip = next_clip;
     }
 }
 
@@ -238,8 +278,11 @@ impl Timeline {
 mod tests {
     use super::*;
 
+    /// Ids are irrelevant to most of these tests, so they all share one;
+    /// `timeline_with` hands out distinct ones where it matters.
     fn clip(start: f64, dur: f64) -> Clip {
         Clip {
+            id: 0,
             source: SourceId(0),
             source_in: 0.0,
             source_out: dur,
@@ -252,6 +295,9 @@ mod tests {
         let mut tl = Timeline::new();
         tl.tracks.push(Track::new(TrackKind::Video));
         tl.tracks[0].clips = clips;
+        for i in 0..tl.tracks[0].clips.len() {
+            tl.tracks[0].clips[i].id = tl.new_clip_id();
+        }
         tl
     }
 
@@ -286,6 +332,69 @@ mod tests {
         // The rewind is what keeps ids from drifting upward on every
         // undo/redo cycle; the clip that held the old id is gone.
         assert_eq!(tl.tracks[0].clips[1].link, first);
+    }
+
+    #[test]
+    fn a_split_keeps_the_left_half_s_name_and_coins_one_for_the_right() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        let original = tl.tracks[0].clips[0].id;
+
+        tl.split_at(4.0);
+        assert_eq!(tl.tracks[0].clips[0].id, original);
+        assert_ne!(tl.tracks[0].clips[1].id, original);
+    }
+
+    #[test]
+    fn every_clip_a_split_produces_has_its_own_name() {
+        // Two tracks split at once: the right halves must not collide, or a
+        // selection would resolve to whichever the search reached first.
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        tl.tracks[1].clips = vec![Clip {
+            id: tl.new_clip_id(),
+            ..clip(0.0, 10.0)
+        }];
+
+        tl.split_at(4.0);
+        let ids: Vec<u32> = tl
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.id))
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "duplicate clip ids in {ids:?}");
+    }
+
+    #[test]
+    fn find_locates_a_clip_and_forgets_a_deleted_one() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0), clip(10.0, 5.0)]);
+        let second = tl.tracks[0].clips[1].id;
+        assert_eq!(tl.find(second), Some((0, 1)));
+
+        // Removing the clip in front of it shifts its index, which is the whole
+        // reason selection is held by id rather than position.
+        tl.tracks[0].clips.remove(0);
+        assert_eq!(tl.find(second), Some((0, 0)));
+
+        tl.tracks[0].clips.clear();
+        assert_eq!(tl.find(second), None);
+    }
+
+    #[test]
+    fn restore_rewinds_clip_ids_so_a_redone_split_reuses_them() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        let before = tl.snapshot();
+
+        tl.split_at(4.0);
+        let first = tl.tracks[0].clips[1].id;
+
+        tl.restore(&before);
+        tl.split_at(4.0);
+        // Without the rewind, ids would climb on every undo/redo cycle and a
+        // selection restored by undo would no longer match its clip.
+        assert_eq!(tl.tracks[0].clips[1].id, first);
     }
 
     #[test]
