@@ -1,3 +1,9 @@
+/// Slack when testing "is the playhead already on this boundary". Jumping to a
+/// boundary lands the playhead on it exactly, but the position round-trips
+/// through the audio engine, so an exact compare would let float drift strand
+/// the next jump.
+const EDIT_POINT_EPS: f64 = 1e-6;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceId(pub u32);
 
@@ -122,6 +128,43 @@ impl Timeline {
             .iter()
             .flat_map(|t| t.clips.iter().map(|c| c.timeline_end()))
             .fold(0.0_f64, f64::max)
+    }
+
+    /// Nearest clip boundary strictly before `t`, or `None` if `t` is at or
+    /// before the first one. Boundaries come from every track, so an
+    /// audio-only edit is navigable too; 0.0 always counts so the playhead can
+    /// get back to the start of a timeline whose first clip begins later.
+    ///
+    /// "Strictly before" is what makes repeated presses walk backwards instead
+    /// of dead-ending on the boundary the playhead already sits on.
+    pub fn prev_edit_point(&self, t: f64) -> Option<f64> {
+        self.edit_points()
+            .into_iter()
+            .filter(|&p| p < t - EDIT_POINT_EPS)
+            .fold(None, |acc: Option<f64>, p| {
+                Some(acc.map_or(p, |a| a.max(p)))
+            })
+    }
+
+    /// Nearest clip boundary strictly after `t`. See [`Timeline::prev_edit_point`].
+    pub fn next_edit_point(&self, t: f64) -> Option<f64> {
+        self.edit_points()
+            .into_iter()
+            .filter(|&p| p > t + EDIT_POINT_EPS)
+            .fold(None, |acc: Option<f64>, p| {
+                Some(acc.map_or(p, |a| a.min(p)))
+            })
+    }
+
+    fn edit_points(&self) -> Vec<f64> {
+        let mut pts = vec![0.0];
+        for track in &self.tracks {
+            for clip in &track.clips {
+                pts.push(clip.timeline_start);
+                pts.push(clip.timeline_end());
+            }
+        }
+        pts
     }
 
     /// Topmost active video clip at `t`. Higher track index = on top.
@@ -254,6 +297,45 @@ mod tests {
 
         tl.restore(&before);
         assert_eq!(tl.tracks[0].clips[0].timeline_start, 0.0);
+    }
+
+    #[test]
+    fn edit_points_from_mid_clip_are_that_clip_s_own_bounds() {
+        let tl = timeline_with(vec![clip(0.0, 10.0), clip(10.0, 5.0)]);
+        assert_eq!(tl.prev_edit_point(4.0), Some(0.0));
+        assert_eq!(tl.next_edit_point(4.0), Some(10.0));
+    }
+
+    #[test]
+    fn repeated_jumps_walk_past_the_current_boundary() {
+        let tl = timeline_with(vec![clip(0.0, 10.0), clip(10.0, 5.0)]);
+        // Standing exactly on the A|B seam: forward must reach B's end and
+        // back must reach A's start, rather than dead-ending where we are.
+        assert_eq!(tl.next_edit_point(10.0), Some(15.0));
+        assert_eq!(tl.prev_edit_point(10.0), Some(0.0));
+    }
+
+    #[test]
+    fn edit_points_terminate_at_the_ends() {
+        let tl = timeline_with(vec![clip(0.0, 10.0)]);
+        assert_eq!(tl.prev_edit_point(0.0), None);
+        assert_eq!(tl.next_edit_point(10.0), None);
+    }
+
+    #[test]
+    fn zero_is_reachable_when_the_first_clip_starts_later() {
+        let tl = timeline_with(vec![clip(5.0, 10.0)]);
+        assert_eq!(tl.prev_edit_point(3.0), Some(0.0));
+    }
+
+    #[test]
+    fn edit_points_span_every_track() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        tl.tracks[1].clips = vec![clip(3.0, 2.0)];
+        // The audio-only boundary at 3.0 is navigable from the video clip.
+        assert_eq!(tl.next_edit_point(1.0), Some(3.0));
+        assert_eq!(tl.next_edit_point(3.0), Some(5.0));
     }
 
     #[test]

@@ -36,6 +36,10 @@ const LANE_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
 const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.22, 1.0];
 const VIDEO_CLIP_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
 const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
+// Outline around each clip. Two butt-joined clips show it twice, so a split
+// reads as a 2px seam.
+const CLIP_BORDER_PX: f32 = 1.0;
+const CLIP_BORDER_DARKEN: f32 = 0.40;
 const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
 const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
@@ -189,6 +193,10 @@ fn format_tick_label(t: f64, interval: f64) -> String {
     }
 }
 
+fn darken(c: [f32; 4], f: f32) -> [f32; 4] {
+    [c[0] * f, c[1] * f, c[2] * f, c[3]]
+}
+
 fn topmost_lane_top(center_y: f32, lane_h: f32, n_video: usize) -> f32 {
     let half_gap = TRACK_LANE_GAP * 0.5;
     if n_video == 0 {
@@ -283,7 +291,9 @@ struct State {
     cursor: [f32; 2],
     drag: DragMode,
     last_playing_source: Option<SourceId>,
-    transport: [Rect; 3],
+    /// Prev-edit, prev-frame, play/pause, next-frame, next-edit — left to
+    /// right, so the outer buttons are the coarser jumps.
+    transport: [Rect; 5],
     timeline_split_btn: Rect,
     timeline_undo_btn: Rect,
     timeline_redo_btn: Rect,
@@ -353,7 +363,7 @@ impl State {
             cursor: [0.0, 0.0],
             drag: DragMode::None,
             last_playing_source: None,
-            transport: [Rect::default(); 3],
+            transport: [Rect::default(); 5],
             timeline_split_btn: Rect::default(),
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
@@ -629,15 +639,23 @@ impl State {
         }
         let [cx, cy] = self.cursor;
         if self.transport[0].contains([cx, cy]) {
-            self.step_frame(-1.0);
+            self.goto_edit_point(false);
             return;
         }
         if self.transport[1].contains([cx, cy]) {
-            self.toggle_playback();
+            self.step_frame(-1.0);
             return;
         }
         if self.transport[2].contains([cx, cy]) {
+            self.toggle_playback();
+            return;
+        }
+        if self.transport[3].contains([cx, cy]) {
             self.step_frame(1.0);
+            return;
+        }
+        if self.transport[4].contains([cx, cy]) {
+            self.goto_edit_point(true);
             return;
         }
         if self.timeline_split_btn.contains([cx, cy]) {
@@ -921,6 +939,25 @@ impl State {
             new_t = new_t.min(duration);
         }
         self.audio.set_position(new_t);
+    }
+
+    /// Jump to the clip boundary before/after the playhead. Pauses like
+    /// `step_frame` does — these sit in the same row of navigation buttons and
+    /// splitting the pause behavior between them would be arbitrary.
+    fn goto_edit_point(&mut self, forward: bool) {
+        let t = self.audio.position();
+        let target = if forward {
+            self.timeline.next_edit_point(t)
+        } else {
+            self.timeline.prev_edit_point(t)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if self.audio.playing() {
+            self.audio.set_playing(false);
+        }
+        self.audio.set_position(target);
     }
 
     fn split_at_playhead(&mut self) {
@@ -1382,16 +1419,26 @@ impl State {
         let bar_y = preview_h;
         let bar_center_y = bar_y + TRANSPORT_BAR_H * 0.5;
         let playing = self.audio.playing();
-        let labels = ["<", if playing { "Pause" } else { "Play" }, ">"];
+        let labels = [
+            "|<",
+            "<",
+            if playing { "Pause" } else { "Play" },
+            ">",
+            ">|",
+        ];
         let tooltips = [
+            "Prev edit (Shift+Left)",
             "Prev frame (Left)",
             if playing { "Pause (Space)" } else { "Play (Space)" },
             "Next frame (Right)",
+            "Next edit (Shift+Right)",
         ];
-        let row_w = TRANSPORT_BTN_W * 3.0 + TRANSPORT_GAP * 2.0;
+        let n_transport = self.transport.len();
+        let row_w = TRANSPORT_BTN_W * n_transport as f32
+            + TRANSPORT_GAP * (n_transport - 1) as f32;
         let row_x = (media_w + (preview_w - row_w) * 0.5).round();
         let row_y = (bar_center_y - TRANSPORT_BTN_H * 0.5).round();
-        for i in 0..3 {
+        for i in 0..n_transport {
             self.transport[i] = Rect {
                 x: row_x + i as f32 * (TRANSPORT_BTN_W + TRANSPORT_GAP),
                 y: row_y,
@@ -1417,8 +1464,8 @@ impl State {
             TIMER_SIZE,
             TIMER_COLOR,
         );
-        let hovered = (0..3).find(|&i| self.transport[i].contains(self.cursor));
-        for i in 0..3 {
+        let hovered = (0..n_transport).find(|&i| self.transport[i].contains(self.cursor));
+        for i in 0..n_transport {
             draw_button(
                 &mut self.quads,
                 &mut self.text,
@@ -1593,6 +1640,7 @@ impl State {
             TrackKind::Video => (VIDEO_CLIP_COLOR, "V"),
             TrackKind::Audio => (AUDIO_CLIP_COLOR, "A"),
         };
+        let border_color = darken(clip_color, CLIP_BORDER_DARKEN);
 
         // Lane background.
         self.quads.push(Quad::colored(
@@ -1668,6 +1716,33 @@ impl State {
                         }
                     }
                 }
+            }
+
+            // Outline, drawn after the waveform so peaks can't paint over it.
+            // Every clip gets one, so two butt-joined clips — the halves of a
+            // split — meet in a 2px seam. Deliberately not a gap: a split
+            // leaves no gap, and faking one would look identical to genuine
+            // empty space between clips. For the same reason the outline is a
+            // darkened tint of the clip rather than the lane color, so a seam
+            // stays distinguishable from a real gap.
+            let b = CLIP_BORDER_PX;
+            self.quads
+                .push(Quad::colored([x, lane_y], [cw, b], border_color));
+            self.quads.push(Quad::colored(
+                [x, lane_y + lane_h - b],
+                [cw, b],
+                border_color,
+            ));
+            // A sliver narrower than its own two edges would render as solid
+            // border; leave it as plain clip color instead.
+            if cw >= b * 3.0 {
+                self.quads
+                    .push(Quad::colored([x, lane_y], [b, lane_h], border_color));
+                self.quads.push(Quad::colored(
+                    [x + cw - b, lane_y],
+                    [b, lane_h],
+                    border_color,
+                ));
             }
 
             if let Some(src) = self.media.get(clip.source) {
@@ -1772,7 +1847,10 @@ impl ApplicationHandler for App {
                 let ctrl = state.modifiers.control_key();
                 let shift = state.modifiers.shift_key();
                 match code {
-                    // Arrows repeat so holding steps through frames.
+                    // Arrows repeat so holding steps through frames, or walks
+                    // through edit points with Shift.
+                    KeyCode::ArrowLeft if shift => state.goto_edit_point(false),
+                    KeyCode::ArrowRight if shift => state.goto_edit_point(true),
                     KeyCode::ArrowLeft => state.step_frame(-1.0),
                     KeyCode::ArrowRight => state.step_frame(1.0),
                     // Undo/redo repeat too — holding Ctrl+Z to walk back
