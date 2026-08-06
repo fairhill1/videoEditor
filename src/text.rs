@@ -5,8 +5,20 @@ use fontdue::{Font, FontSettings};
 use crate::quad::{Quad, QuadRenderer, Texture};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ShareTechMono-Regular.ttf");
+/// Lucide, subset to the icons the UI actually draws — see
+/// `tools/build-icon-font.sh`. An icon font rather than SVGs or PNGs because
+/// everything below already rasterizes glyph outlines into an atlas at whatever
+/// size is asked for: icons come out crisp at any scale, and cost no new code.
+const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/lucide-subset.ttf");
 const ATLAS_SIZE: u32 = 1024;
 const GLYPH_PAD: u32 = 1; // padding between glyphs to prevent bilinear bleed
+
+/// Unicode's Private Use Area, where Lucide puts every icon. The text face has
+/// nothing in that range, so a codepoint alone says which face it belongs to.
+/// That's why there is no separate icon-drawing path: `draw`, `measure_width`
+/// and the rest work on icons unchanged.
+const PUA_FIRST: char = '\u{E000}';
+const PUA_LAST: char = '\u{F8FF}';
 
 #[derive(Copy, Clone, Debug)]
 struct GlyphEntry {
@@ -20,6 +32,7 @@ struct GlyphEntry {
 
 pub struct TextRenderer {
     font: Font,
+    icons: Font,
     atlas: Texture,
     // Shelf packer state
     cursor_x: u32,
@@ -32,6 +45,8 @@ impl TextRenderer {
     pub fn new(device: &wgpu::Device, quads: &QuadRenderer) -> Self {
         let font = Font::from_bytes(FONT_BYTES, FontSettings::default())
             .expect("failed to parse font");
+        let icons = Font::from_bytes(ICON_FONT_BYTES, FontSettings::default())
+            .expect("failed to parse icon font");
         let atlas = quads.create_empty_texture(
             device,
             ATLAS_SIZE,
@@ -41,11 +56,21 @@ impl TextRenderer {
 
         Self {
             font,
+            icons,
             atlas,
             cursor_x: 0,
             cursor_y: 0,
             shelf_height: 0,
             glyphs: HashMap::new(),
+        }
+    }
+
+    /// Which face `ch` comes from. See [`PUA_FIRST`].
+    fn face(&self, ch: char) -> &Font {
+        if (PUA_FIRST..=PUA_LAST).contains(&ch) {
+            &self.icons
+        } else {
+            &self.font
         }
     }
 
@@ -67,7 +92,7 @@ impl TextRenderer {
 
         for ch in text.chars() {
             if ch == ' ' {
-                let metrics = self.font.metrics(ch, size_px);
+                let metrics = self.face(ch).metrics(ch, size_px);
                 pen_x += metrics.advance_width;
                 continue;
             }
@@ -113,7 +138,7 @@ impl TextRenderer {
     /// glyph's top sits at `baseline - (ymin + height)`. Use this — not
     /// `ascent` — when vertically centering a glyph inside a fixed-size box.
     pub fn glyph_visual_bounds(&self, ch: char, size_px: f32) -> (f32, f32) {
-        let m = self.font.metrics(ch, size_px);
+        let m = self.face(ch).metrics(ch, size_px);
         (m.height as f32, m.ymin as f32)
     }
 
@@ -122,7 +147,7 @@ impl TextRenderer {
     /// layout decisions (e.g. right-aligning a timer readout).
     pub fn measure_width(&self, text: &str, size_px: f32) -> f32 {
         text.chars()
-            .map(|ch| self.font.metrics(ch, size_px).advance_width)
+            .map(|ch| self.face(ch).metrics(ch, size_px).advance_width)
             .sum()
     }
 
@@ -133,7 +158,7 @@ impl TextRenderer {
         size_px: f32,
         size_key: u32,
     ) -> GlyphEntry {
-        let (metrics, bitmap) = self.font.rasterize(ch, size_px);
+        let (metrics, bitmap) = self.face(ch).rasterize(ch, size_px);
         let gw = metrics.width as u32;
         let gh = metrics.height as u32;
 

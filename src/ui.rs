@@ -66,13 +66,15 @@ pub enum BtnState {
     Toggle(bool),
 }
 
+/// Buttons are icon-only: each one's tooltip names the action and its
+/// shortcut, which is where the words live now.
 pub fn draw_button(
     quads: &mut QuadRenderer,
     text: &mut TextRenderer,
     queue: &wgpu::Queue,
     rect: Rect,
-    label: &str,
-    label_size: f32,
+    icon: char,
+    icon_size: f32,
     hovered: bool,
     state: BtnState,
 ) {
@@ -104,13 +106,16 @@ pub fn draw_button(
         ));
     }
 
-    // Centered on the whole rect, strip included, so a toggle's label keeps
-    // the same rhythm as the plain buttons beside it.
-    let tw = text.measure_width(label, label_size);
-    let ascent = text.ascent(label_size);
-    let tx = (rect.x + (rect.w - tw) * 0.5).round();
-    let ty = (rect.y + (rect.h + ascent) * 0.5).round();
-    text.draw(queue, quads, [tx, ty], label, label_size, fg);
+    // Centered on the whole rect, strip included, so a toggle's icon keeps the
+    // same rhythm as the plain buttons beside it. Centering uses the glyph's
+    // inked bounds rather than the font ascent: an icon is a standalone box
+    // with no baseline to share, and measuring by ascent hangs most of Lucide's
+    // glyphs noticeably low.
+    let glyph = icon.to_string();
+    let (gh, ymin) = text.glyph_visual_bounds(icon, icon_size);
+    let gx = (rect.x + (rect.w - text.measure_width(&glyph, icon_size)) * 0.5).round();
+    let gy = (rect.y + (rect.h + gh) * 0.5 + ymin).round();
+    text.draw(queue, quads, [gx, gy], &glyph, icon_size, fg);
 }
 
 #[derive(Clone, Copy)]

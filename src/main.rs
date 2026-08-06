@@ -28,6 +28,26 @@ use text::TextRenderer;
 use timeline::{Clip, SourceId, Timeline, TimelineSnapshot, Track, TrackKind};
 use ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
 
+// Lucide glyphs, from the subset in `assets/fonts/lucide-subset.ttf`. Named
+// here rather than spelled inline so a codepoint appears exactly once — they
+// are unreadable on sight, and `tools/build-icon-font.sh` is what keeps this
+// list and the font in step.
+const ICON_PREV_EDIT: char = '\u{E243}'; // chevron-first
+const ICON_PREV_FRAME: char = '\u{E06E}'; // chevron-left
+const ICON_PLAY: char = '\u{E13C}'; // play
+const ICON_PAUSE: char = '\u{E12E}'; // pause
+const ICON_NEXT_FRAME: char = '\u{E06F}'; // chevron-right
+const ICON_NEXT_EDIT: char = '\u{E244}'; // chevron-last
+const ICON_SPLIT: char = '\u{E3B6}'; // square-split-horizontal
+const ICON_DELETE: char = '\u{E18D}'; // trash
+const ICON_UNDO: char = '\u{E19B}'; // undo
+const ICON_REDO: char = '\u{E143}'; // redo
+const ICON_SNAP: char = '\u{E2B5}'; // magnet
+const ICON_RENDER: char = '\u{E0D0}'; // film
+const ICON_STOP: char = '\u{E167}'; // square
+const ICON_OPEN: char = '\u{E247}'; // folder-open
+const ICON_CLOSE: char = '\u{E1B2}'; // x
+
 // Layout split ratios — tweak to taste.
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
 const MEDIA_PREVIEW_SPLIT: f32 = 0.28;
@@ -85,16 +105,18 @@ const TRANSPORT_BAR_H: f32 = 40.0;
 // Panel tier, not well tier: it holds controls, and at its old near-black value
 // it dissolved into the preview above it.
 const TRANSPORT_BAR_COLOR: [f32; 4] = SURFACE_PANEL;
-const TRANSPORT_BTN_W: f32 = 56.0;
+// Buttons are icon-only, so they no longer need to fit a word — square-ish
+// keeps the glyph optically centered and tightens both toolbars considerably.
+const TRANSPORT_BTN_W: f32 = 32.0;
 const TRANSPORT_BTN_H: f32 = 26.0;
 const TRANSPORT_GAP: f32 = 8.0;
-const TRANSPORT_LABEL_SIZE: f32 = 12.0;
+const TRANSPORT_ICON_SIZE: f32 = 16.0;
 const TRANSPORT_TOOLTIP_SIZE: f32 = 11.0;
 
 // Export readout, occupying the toolbar row between the edit buttons and the
 // right-aligned Export button. Doubles as the progress bar while a render runs
 // and the result message afterwards, so the two never fight for the same space.
-const EXPORT_BTN_W: f32 = 64.0;
+const EXPORT_BTN_W: f32 = TRANSPORT_BTN_W;
 const EXPORT_READOUT_W: f32 = 190.0;
 const EXPORT_READOUT_GAP: f32 = 10.0;
 const EXPORT_BAR_H: f32 = 4.0;
@@ -1698,8 +1720,8 @@ impl State {
             &mut self.text,
             &self.queue,
             self.pool_open_btn,
-            "Open",
-            TRANSPORT_LABEL_SIZE,
+            ICON_OPEN,
+            TRANSPORT_ICON_SIZE,
             pool_open_hovered,
             BtnState::Normal,
         );
@@ -1789,37 +1811,37 @@ impl State {
         let buttons = [
             (
                 self.timeline_split_btn,
-                "Split",
+                ICON_SPLIT,
                 "Split at playhead (S)",
                 BtnState::Normal,
             ),
             (
                 self.timeline_delete_btn,
-                "Delete",
+                ICON_DELETE,
                 "Delete clip (Del)",
                 avail(self.has_selection()),
             ),
             (
                 self.timeline_undo_btn,
-                "Undo",
+                ICON_UNDO,
                 "Undo (Ctrl+Z)",
                 avail(!self.undo_stack.is_empty()),
             ),
             (
                 self.timeline_redo_btn,
-                "Redo",
+                ICON_REDO,
                 "Redo (Ctrl+Shift+Z)",
                 avail(!self.redo_stack.is_empty()),
             ),
             (
                 self.timeline_snap_btn,
-                "Snap",
+                ICON_SNAP,
                 "Snap to clip edges (N)",
                 BtnState::Toggle(self.snap_enabled),
             ),
             (
                 self.timeline_export_btn,
-                if exporting { "Stop" } else { "Export" },
+                if exporting { ICON_STOP } else { ICON_RENDER },
                 if exporting {
                     "Cancel this export"
                 } else {
@@ -1828,15 +1850,15 @@ impl State {
                 avail(exporting || self.can_export()),
             ),
         ];
-        for (rect, label, tip, state) in buttons {
+        for (rect, icon, tip, state) in buttons {
             let hovered = rect.contains(self.cursor);
             draw_button(
                 &mut self.quads,
                 &mut self.text,
                 &self.queue,
                 rect,
-                label,
-                TRANSPORT_LABEL_SIZE,
+                icon,
+                TRANSPORT_ICON_SIZE,
                 hovered,
                 state,
             );
@@ -1922,12 +1944,12 @@ impl State {
         let bar_y = preview_h;
         let bar_center_y = bar_y + TRANSPORT_BAR_H * 0.5;
         let playing = self.audio.playing();
-        let labels = [
-            "|<",
-            "<",
-            if playing { "Pause" } else { "Play" },
-            ">",
-            ">|",
+        let icons = [
+            ICON_PREV_EDIT,
+            ICON_PREV_FRAME,
+            if playing { ICON_PAUSE } else { ICON_PLAY },
+            ICON_NEXT_FRAME,
+            ICON_NEXT_EDIT,
         ];
         let tooltips = [
             "Prev edit (Shift+Left)",
@@ -1974,8 +1996,8 @@ impl State {
                 &mut self.text,
                 &self.queue,
                 self.transport[i],
-                labels[i],
-                TRANSPORT_LABEL_SIZE,
+                icons[i],
+                TRANSPORT_ICON_SIZE,
                 hovered == Some(i),
                 BtnState::Normal,
             );
@@ -2113,16 +2135,17 @@ impl State {
                 };
                 self.quads
                     .push(Quad::colored([close.x, close.y], [close.w, close.h], bg));
-                let glyph = "X";
-                let gw = self.text.measure_width(glyph, POOL_CLOSE_LABEL_SIZE);
-                let (gh, gymin) = self.text.glyph_visual_bounds('X', POOL_CLOSE_LABEL_SIZE);
+                let glyph = ICON_CLOSE.to_string();
+                let gw = self.text.measure_width(&glyph, POOL_CLOSE_LABEL_SIZE);
+                let (gh, gymin) =
+                    self.text.glyph_visual_bounds(ICON_CLOSE, POOL_CLOSE_LABEL_SIZE);
                 let gx = (close.x + (close.w - gw) * 0.5).round();
                 let gy = (close.y + (close.h + gh) * 0.5 + gymin).round();
                 self.text.draw(
                     &self.queue,
                     &mut self.quads,
                     [gx, gy],
-                    glyph,
+                    &glyph,
                     POOL_CLOSE_LABEL_SIZE,
                     [0.95, 0.95, 0.98, 1.0],
                 );
