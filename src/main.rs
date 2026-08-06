@@ -40,6 +40,9 @@ const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
 // reads as a 2px seam.
 const CLIP_BORDER_PX: f32 = 1.0;
 const CLIP_BORDER_DARKEN: f32 = 0.40;
+// How close a dragged edge must come to latch onto a snap target. In pixels
+// rather than seconds so the pull feels the same however long the timeline is.
+const SNAP_PX: f32 = 8.0;
 const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
 const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 const LABEL_COLOR: [f32; 4] = [0.65, 0.65, 0.70, 1.0];
@@ -193,6 +196,25 @@ fn format_tick_label(t: f64, interval: f64) -> String {
     }
 }
 
+/// Closest latch of any `edge` onto any `target` within `threshold`, expressed
+/// as the offset to add to the drag delta. `None` when nothing is in range.
+///
+/// Every edge competes against every target and the smallest gap wins, so a
+/// clip latches by whichever end you brought near a neighbour rather than by a
+/// fixed leading edge.
+fn nearest_snap(edges: &[f64], targets: &[f64], threshold: f64) -> Option<f64> {
+    let mut best: Option<(f64, f64)> = None;
+    for &edge in edges {
+        for &target in targets {
+            let dist = (target - edge).abs();
+            if dist <= threshold && best.is_none_or(|(bd, _)| dist < bd) {
+                best = Some((dist, target - edge));
+            }
+        }
+    }
+    best.map(|(_, adjust)| adjust)
+}
+
 fn darken(c: [f32; 4], f: f32) -> [f32; 4] {
     [c[0] * f, c[1] * f, c[2] * f, c[3]]
 }
@@ -297,6 +319,12 @@ struct State {
     timeline_split_btn: Rect,
     timeline_undo_btn: Rect,
     timeline_redo_btn: Rect,
+    timeline_snap_btn: Rect,
+    /// Magnetic snapping while dragging. Toggleable because there is no
+    /// timeline zoom yet: on a long timeline the pixel threshold covers a wide
+    /// time window, and without an escape hatch a clip could not be parked
+    /// near a neighbour without latching onto it.
+    snap_enabled: bool,
     pool_open_btn: Rect,
     modifiers: ModifiersState,
     undo_stack: Vec<EditSnapshot>,
@@ -367,6 +395,8 @@ impl State {
             timeline_split_btn: Rect::default(),
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
+            timeline_snap_btn: Rect::default(),
+            snap_enabled: true,
             pool_open_btn: Rect::default(),
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
@@ -672,6 +702,10 @@ impl State {
             self.redo();
             return;
         }
+        if self.timeline_snap_btn.contains([cx, cy]) {
+            self.snap_enabled = !self.snap_enabled;
+            return;
+        }
         if self.pool_open_btn.contains([cx, cy]) {
             self.open_file_picker();
             return;
@@ -782,6 +816,52 @@ impl State {
         v
     }
 
+    /// Times a dragged edge can latch onto: every other clip's edges, the
+    /// timeline start, and the playhead. Targets are collected across all
+    /// tracks so a clip can be lined up with one on another lane — that's how
+    /// you align a cutaway to an edit below it.
+    ///
+    /// `exclude` is the moving group. A linked pair travels as a unit, so
+    /// leaving its own edges in the target set would pin it in place.
+    fn snap_targets(&self, exclude: &[(usize, usize)]) -> Vec<f64> {
+        let mut pts = vec![0.0, self.audio.position()];
+        for (ti, tr) in self.timeline.tracks.iter().enumerate() {
+            for (ci, c) in tr.clips.iter().enumerate() {
+                if exclude.contains(&(ti, ci)) {
+                    continue;
+                }
+                pts.push(c.timeline_start);
+                pts.push(c.timeline_end());
+            }
+        }
+        pts
+    }
+
+    /// Nudge `delta` so the closest dragged edge lands exactly on a snap
+    /// target. Returns `delta` untouched when nothing is in range or snapping
+    /// is off.
+    fn snap_move_delta(&self, siblings: &[(usize, usize)], delta: f64) -> f64 {
+        if !self.snap_enabled {
+            return delta;
+        }
+        let layout = self.timeline_layout();
+        // The threshold is authored in pixels, so convert with the same
+        // seconds-per-pixel mapping the drag itself uses.
+        let px_per_sec = layout.clips_w as f64 / layout.duration;
+        if !px_per_sec.is_finite() || px_per_sec <= 0.0 {
+            return delta;
+        }
+        let edges: Vec<f64> = siblings
+            .iter()
+            .flat_map(|&(ti, ci)| {
+                let c = &self.timeline.tracks[ti].clips[ci];
+                [c.timeline_start + delta, c.timeline_end() + delta]
+            })
+            .collect();
+        let targets = self.snap_targets(siblings);
+        delta + nearest_snap(&edges, &targets, SNAP_PX as f64 / px_per_sec).unwrap_or(0.0)
+    }
+
     fn apply_move_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
         let siblings = self.linked_siblings(track, idx);
         // Clamp so the earliest-starting sibling doesn't go negative —
@@ -790,7 +870,11 @@ impl State {
             .iter()
             .map(|&(ti, ci)| self.timeline.tracks[ti].clips[ci].timeline_start)
             .fold(f64::INFINITY, f64::min);
-        let delta = desired_delta.max(-min_start);
+        // Snap after the zero-clamp so the latch is computed against where the
+        // clip can actually go, then re-clamp as a backstop.
+        let delta = self
+            .snap_move_delta(&siblings, desired_delta.max(-min_start))
+            .max(-min_start);
         for (ti, ci) in siblings {
             self.timeline.tracks[ti].clips[ci].timeline_start += delta;
         }
@@ -1381,13 +1465,26 @@ impl State {
             x: btn_x + stride * 2.0,
             ..self.timeline_split_btn
         };
+        self.timeline_snap_btn = Rect {
+            x: btn_x + stride * 3.0,
+            ..self.timeline_split_btn
+        };
 
         let can_undo = !self.undo_stack.is_empty();
         let can_redo = !self.redo_stack.is_empty();
+        // Snap reuses the greyed-out styling to mean "off" rather than
+        // "unavailable" — it stays clickable either way, and dim-when-off is
+        // the reading a toggle wants anyway.
         let buttons = [
             (self.timeline_split_btn, "Split", "Split at playhead (S)", true),
             (self.timeline_undo_btn, "Undo", "Undo (Ctrl+Z)", can_undo),
             (self.timeline_redo_btn, "Redo", "Redo (Ctrl+Shift+Z)", can_redo),
+            (
+                self.timeline_snap_btn,
+                "Snap",
+                "Snap to clip edges (N)",
+                self.snap_enabled,
+            ),
         ];
         for (rect, label, tip, enabled) in buttons {
             let hovered = rect.contains(self.cursor);
@@ -1865,11 +1962,58 @@ impl ApplicationHandler for App {
                     KeyCode::Space if !ctrl => state.toggle_playback(),
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),
+                    KeyCode::KeyN if !ctrl => {
+                        state.snap_enabled = !state.snap_enabled;
+                    }
                     _ => {}
                 }
             }
             _ => (),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Snap offsets are differences of decimal literals, so they carry the
+    /// usual float dust; compare within a tolerance far tighter than any
+    /// audible or visible difference.
+    fn assert_close(got: Option<f64>, want: f64) {
+        let got = got.expect("expected a snap");
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn snaps_the_trailing_edge_flush_against_a_neighbour() {
+        // Clip [0,10) dragged so its end sits at 9.7; a neighbour starts at
+        // 10. The gap closes exactly, leaving no overlap and no seam.
+        assert_close(nearest_snap(&[-0.3, 9.7], &[10.0, 15.0], 0.5), 0.3);
+    }
+
+    #[test]
+    fn snaps_by_whichever_edge_is_closest() {
+        // Leading edge is 0.1 from a target, trailing edge 0.4 from another.
+        // The leading edge wins even though both are in range.
+        assert_close(nearest_snap(&[4.9, 14.6], &[5.0, 15.0], 0.5), 0.1);
+    }
+
+    #[test]
+    fn nothing_latches_outside_the_threshold() {
+        assert_eq!(nearest_snap(&[4.0], &[5.0], 0.5), None);
+    }
+
+    #[test]
+    fn snapping_pulls_backwards_too() {
+        // Overlapping a neighbour by 0.2 pulls back out to flush, so a drag
+        // that overshoots still lands clean.
+        assert_close(nearest_snap(&[10.2], &[10.0], 0.5), -0.2);
+    }
+
+    #[test]
+    fn no_targets_means_no_snap() {
+        assert_eq!(nearest_snap(&[4.0, 9.0], &[], 0.5), None);
     }
 }
 
