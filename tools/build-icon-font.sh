@@ -25,6 +25,7 @@ ICONS=(
     square                    # timeline: stop a running render
     folder-open               # media pool: open files
     x                         # media pool: remove a row
+    settings                  # timeline: project canvas settings
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

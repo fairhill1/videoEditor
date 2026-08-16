@@ -118,6 +118,57 @@ pub fn draw_button(
     text.draw(queue, quads, [gx, gy], &glyph, icon_size, fg);
 }
 
+const MENU_ROW_HOVER: [f32; 4] = BTN_BG_HOVER;
+const MENU_ROW_LABEL: [f32; 4] = [0.86, 0.86, 0.90, 1.0];
+const MENU_ROW_LABEL_SELECTED: [f32; 4] = BTN_LABEL;
+const MENU_ROW_PAD_X: f32 = 8.0;
+
+/// One row of a settings popup: a label, an optional hover fill, and the same
+/// orange indicator strip the toggle buttons use.
+///
+/// Reusing that strip is deliberate — a picked row and a lit toggle mean the
+/// same thing ("this is the setting in force"), and inventing a second visual
+/// language for it would make the popup read as unrelated to the toolbar that
+/// opened it.
+pub fn draw_menu_row(
+    quads: &mut QuadRenderer,
+    text: &mut TextRenderer,
+    queue: &wgpu::Queue,
+    rect: Rect,
+    label: &str,
+    size_px: f32,
+    hovered: bool,
+    selected: bool,
+) {
+    if hovered {
+        quads.push(Quad::colored([rect.x, rect.y], [rect.w, rect.h], MENU_ROW_HOVER));
+    }
+    if selected {
+        quads.push(Quad::colored(
+            [rect.x, rect.y],
+            [TOGGLE_STRIP_W, rect.h],
+            TOGGLE_ON,
+        ));
+    }
+    let color = if selected {
+        MENU_ROW_LABEL_SELECTED
+    } else {
+        MENU_ROW_LABEL
+    };
+    let ascent = text.ascent(size_px);
+    text.draw(
+        queue,
+        quads,
+        [
+            (rect.x + MENU_ROW_PAD_X).round(),
+            (rect.y + (rect.h + ascent) * 0.5).round(),
+        ],
+        label,
+        size_px,
+        color,
+    );
+}
+
 #[derive(Clone, Copy)]
 pub enum TooltipSide {
     Above,

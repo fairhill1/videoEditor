@@ -26,7 +26,7 @@ use media::MediaPool;
 use quad::{Quad, QuadRenderer};
 use text::TextRenderer;
 use timeline::{Clip, SourceId, Timeline, TimelineSnapshot, Track, TrackKind};
-use ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
+use ui::{draw_button, draw_menu_row, draw_tooltip, BtnState, Rect, TooltipSide};
 
 // Lucide glyphs, from the subset in `assets/fonts/lucide-subset.ttf`. Named
 // here rather than spelled inline so a codepoint appears exactly once — they
@@ -47,6 +47,7 @@ const ICON_RENDER: char = '\u{E0D0}'; // film
 const ICON_STOP: char = '\u{E167}'; // square
 const ICON_OPEN: char = '\u{E247}'; // folder-open
 const ICON_CLOSE: char = '\u{E1B2}'; // x
+const ICON_SETTINGS: char = '\u{E154}'; // settings (gear)
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -89,6 +90,10 @@ const SURFACE_PANEL: [f32; 4] = [0.15, 0.15, 0.18, 1.0]; // chrome that holds co
 // Panel assignments.
 const MEDIA_POOL_COLOR: [f32; 4] = SURFACE_PANEL;
 const PREVIEW_COLOR: [f32; 4] = SURFACE_WELL;
+/// The canvas itself, sitting inside the preview well. True black rather than
+/// the well's near-black: it's picture area, and it has to read as distinct
+/// from the panel it floats in even when no clip is playing.
+const CANVAS_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const TIMELINE_COLOR: [f32; 4] = SURFACE_BASE;
 const LANE_COLOR: [f32; 4] = SURFACE_LANE;
 // Edge between two panels, lighter than both — the flat-UI way to define a
@@ -153,10 +158,40 @@ const EXPORT_STATUS_INFO: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 /// How long a finished-export message lingers. Long enough to read, short
 /// enough that it clears itself instead of needing a dismiss affordance.
 const EXPORT_STATUS_SECONDS: f64 = 8.0;
-/// Fallback picture size when the timeline has video the pool can no longer
-/// describe. Only reachable if a source vanished from the pool mid-session.
+/// Canvas format used when nothing better is known: an empty timeline, or a
+/// source that has vanished from the pool mid-session.
 const EXPORT_FALLBACK_SIZE: (u32, u32) = (1920, 1080);
 const EXPORT_FALLBACK_FPS: f64 = 30.0;
+
+// Project canvas presets, offered by the settings popup.
+const RES_PRESETS: [(u32, u32); 4] = [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)];
+/// Grouped by column as they're laid out: film rates, standard, high. Keeping
+/// the grouping in the data means the popup's columns can't drift from the
+/// meaning they're supposed to carry.
+const FPS_COLUMNS: [&[f64]; 3] = [
+    &[23.976, 24.0],
+    &[25.0, 29.97, 30.0],
+    &[50.0, 59.94, 60.0],
+];
+
+// Project settings popup.
+const MENU_BG: [f32; 4] = [0.13, 0.13, 0.16, 1.0];
+const MENU_BORDER: [f32; 4] = [0.34, 0.34, 0.40, 1.0];
+const MENU_PAD: f32 = 10.0;
+const MENU_ROW_H: f32 = 22.0;
+const MENU_ROW_GAP: f32 = 1.0;
+const MENU_SECTION_GAP: f32 = 12.0;
+const MENU_HEADER_SIZE: f32 = 10.0;
+const MENU_HEADER_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
+const MENU_ROW_SIZE: f32 = 12.0;
+const MENU_RES_W: f32 = 132.0;
+const MENU_FPS_COL_W: f32 = 60.0;
+const MENU_FPS_COL_GAP: f32 = 4.0;
+/// Gap between the gear and the popup it opens, and the same faked soft shadow
+/// the tooltips use — see the note on `TOOLTIP_SHADOW` in `ui.rs`.
+const MENU_GAP: f32 = 7.0;
+const MENU_SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.10];
+const MENU_SHADOW_STEPS: i32 = 3;
 
 // Timeline panel layout.
 // Lane height is computed per-frame to fill the timeline area; these bounds
@@ -217,6 +252,57 @@ enum DragMode {
     /// the panels sit is a view preference, and burying a real edit one step
     /// further back in the history every time you resize would be maddening.
     Splitter(Splitter),
+}
+
+/// The project canvas: the picture every clip is composed onto, and the format
+/// the export is encoded in.
+///
+/// This is the frame the preview draws and clips are fitted into, not merely an
+/// export setting — when clips gain a position/scale/crop, those are expressed
+/// relative to this.
+#[derive(Copy, Clone, PartialEq, Debug)]
+struct Canvas {
+    width: u32,
+    height: u32,
+    fps: f64,
+}
+
+impl Canvas {
+    /// Where a `sw x sh` source lands on the canvas, in canvas pixels.
+    ///
+    /// Currently always an aspect-preserving fit, centered. This is the seam a
+    /// per-clip transform replaces: once clips carry their own position, scale
+    /// and crop, this becomes "apply that clip's transform" and both the
+    /// preview and the export follow automatically, because both compose
+    /// through here rather than each doing their own arithmetic.
+    fn fit(&self, sw: f32, sh: f32) -> (f32, f32, f32, f32) {
+        let (cw, ch) = (self.width as f32, self.height as f32);
+        if sw <= 0.0 || sh <= 0.0 {
+            return (0.0, 0.0, cw, ch);
+        }
+        let scale = (cw / sw).min(ch / sh);
+        let (w, h) = (sw * scale, sh * scale);
+        ((cw - w) * 0.5, (ch - h) * 0.5, w, h)
+    }
+}
+
+/// A canvas dimension the user has pinned, or `Auto` to follow the footage.
+///
+/// `Auto` is the default and reproduces the original behavior — take the format
+/// of the first clip on the timeline. It stays a live mode rather than being
+/// snapshotted at import, so an empty project that gains its first clip adopts
+/// that clip, and the user can pin the format the moment that guess is wrong.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Setting<T> {
+    Auto,
+    Fixed(T),
+}
+
+/// One clickable row in the settings popup.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum ProjectChoice {
+    Resolution(Setting<(u32, u32)>),
+    Fps(Setting<f64>),
 }
 
 /// The two panel dividers, each named for what it separates.
@@ -368,6 +454,17 @@ fn topmost_lane_top(center_y: f32, lane_h: f32, n_video: usize) -> f32 {
     }
 }
 
+/// Frame rates as editors write them: whole numbers bare, the broadcast rates
+/// to as many decimals as they need and no more (29.97, not 29.970).
+fn fmt_fps(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.001 {
+        format!("{}", fps.round() as i64)
+    } else {
+        let s = format!("{fps:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
 fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
     let n = n_tracks.max(1) as f32;
     let gaps = (n - 1.0).max(0.0) * TRACK_LANE_GAP;
@@ -467,6 +564,16 @@ struct State {
     /// and [`State::media_pool_w`], which apply the panel minimums.
     split_top_bottom: f32,
     split_pool_preview: f32,
+    /// Canvas format, each dimension either pinned or following the footage.
+    /// Read together through [`State::canvas`].
+    canvas_res: Setting<(u32, u32)>,
+    canvas_fps: Setting<f64>,
+    project_menu_open: bool,
+    /// Popup geometry, filled in while drawing and consumed by the next click.
+    /// Storing what was drawn — rather than recomputing the layout to hit-test
+    /// it — is what keeps the two from disagreeing about where a row is.
+    project_menu_rect: Rect,
+    project_menu_items: Vec<(Rect, ProjectChoice)>,
     /// Last icon handed to the window, so a hover that doesn't change the
     /// cursor doesn't re-set it every frame.
     cursor_icon: CursorIcon,
@@ -487,6 +594,7 @@ struct State {
     /// Right-aligned in the toolbar row, well clear of the edit buttons: this
     /// one produces a file rather than changing the timeline.
     timeline_export_btn: Rect,
+    timeline_project_btn: Rect,
     /// The render in flight, if any. Only one at a time — the button greys out
     /// while it runs, and clicking it again cancels.
     export: Option<ExportJob>,
@@ -566,6 +674,11 @@ impl State {
             cursor: [0.0, 0.0],
             split_top_bottom: TOP_BOTTOM_SPLIT,
             split_pool_preview: MEDIA_PREVIEW_SPLIT,
+            canvas_res: Setting::Auto,
+            canvas_fps: Setting::Auto,
+            project_menu_open: false,
+            project_menu_rect: Rect::default(),
+            project_menu_items: Vec::new(),
             cursor_icon: CursorIcon::Default,
             drag: DragMode::None,
             last_playing_source: None,
@@ -577,6 +690,7 @@ impl State {
             timeline_delete_btn: Rect::default(),
             selected: None,
             timeline_export_btn: Rect::default(),
+            timeline_project_btn: Rect::default(),
             export: None,
             export_status: None,
             snap_enabled: true,
@@ -914,6 +1028,28 @@ impl State {
             self.commit_edit();
         }
         let [cx, cy] = self.cursor;
+        // The popup is drawn over everything, so it is tested before everything
+        // — including the splitters, which it can overlap.
+        if self.project_menu_open {
+            if let Some((_, choice)) = self
+                .project_menu_items
+                .iter()
+                .find(|(rect, _)| rect.contains([cx, cy]))
+            {
+                let choice = *choice;
+                self.apply_project_choice(choice);
+                return;
+            }
+            // A click anywhere else dismisses it, and is swallowed rather than
+            // falling through: a press meant to close a popup should not also
+            // scrub the timeline or clear the selection underneath it.
+            self.project_menu_open = false;
+            return;
+        }
+        if self.timeline_project_btn.contains([cx, cy]) {
+            self.project_menu_open = true;
+            return;
+        }
         // Before every button and panel: a divider sits on top of the panels it
         // separates, and its grab band overlaps them by design. Nothing else
         // lives within a few points of one, so this costs the rest nothing.
@@ -1298,13 +1434,12 @@ impl State {
         self.audio.set_position(t);
     }
 
+    /// Frame stepping follows the canvas, not the clip under the playhead: a
+    /// frame is a unit of the project, and on a mixed-rate timeline stepping by
+    /// whatever happens to be underneath made a "frame" change length partway
+    /// along the sequence.
     fn current_fps(&self) -> f64 {
-        let t = self.audio.position();
-        self.timeline
-            .topmost_video_clip(t)
-            .and_then(|(_, c)| self.media.get(c.source))
-            .map(|s| s.stream.frame_rate())
-            .unwrap_or(30.0)
+        self.canvas().fps
     }
 
     fn step_frame(&mut self, dir: f64) {
@@ -1419,7 +1554,9 @@ impl State {
     /// video clip — earliest start, lowest track on a tie. Matching one clip
     /// rather than, say, the largest source keeps the common single-camera
     /// timeline a straight passthrough; anything else letterboxes into it.
-    fn export_video_spec(&self) -> Option<VideoSpec> {
+    /// The video clip whose format `Setting::Auto` follows: earliest on the
+    /// timeline, ties broken by the lower track.
+    fn reference_video_source(&self) -> Option<SourceId> {
         let mut reference: Option<(f64, usize, SourceId)> = None;
         for (track_idx, track) in self.timeline.tracks.iter().enumerate() {
             if track.kind != TrackKind::Video {
@@ -1434,26 +1571,188 @@ impl State {
                 }
             }
         }
-        let (_, _, source) = reference?;
-        let (width, height, fps) = match self.media.get(source) {
-            Some(src) => (
-                src.stream.width(),
-                src.stream.height(),
-                src.stream.frame_rate(),
-            ),
-            None => (
-                EXPORT_FALLBACK_SIZE.0,
-                EXPORT_FALLBACK_SIZE.1,
-                EXPORT_FALLBACK_FPS,
-            ),
+        reference.map(|(_, _, source)| source)
+    }
+
+    /// The project canvas: pinned dimensions where the user set them, the
+    /// reference clip's where they didn't.
+    ///
+    /// Single source of truth for the preview, the export and frame stepping.
+    /// They used to derive their formats separately, so on a mixed-rate
+    /// timeline stepping "one frame" and exporting one frame meant different
+    /// durations.
+    fn canvas(&self) -> Canvas {
+        let reference = self
+            .reference_video_source()
+            .and_then(|source| self.media.get(source));
+        let (width, height) = match self.canvas_res {
+            Setting::Fixed(size) => size,
+            Setting::Auto => reference
+                .map(|src| (src.stream.width(), src.stream.height()))
+                .unwrap_or(EXPORT_FALLBACK_SIZE),
         };
-        // H.264 in YUV420P cannot represent an odd dimension, and a source with
-        // one would otherwise fail deep inside the encoder.
-        Some(VideoSpec {
+        let fps = match self.canvas_fps {
+            Setting::Fixed(fps) => fps,
+            Setting::Auto => reference.map(|src| src.stream.frame_rate()).unwrap_or(0.0),
+        };
+        Canvas {
+            // H.264 in YUV420P cannot represent an odd dimension, and a source
+            // with one would otherwise fail deep inside the encoder. Applied
+            // here rather than at export so the preview frames exactly what
+            // will be written.
             width: (width & !1).max(2),
             height: (height & !1).max(2),
             fps: if fps > 0.0 { fps } else { EXPORT_FALLBACK_FPS },
+        }
+    }
+
+    /// `None` renders audio-only. A canvas exists either way, but with no video
+    /// on the timeline there is nothing to draw on it, and encoding a silent
+    /// black picture is not what "export" means here.
+    fn export_video_spec(&self) -> Option<VideoSpec> {
+        self.reference_video_source()?;
+        let canvas = self.canvas();
+        Some(VideoSpec {
+            width: canvas.width,
+            height: canvas.height,
+            fps: canvas.fps,
         })
+    }
+
+    /// Draw the project settings popup and record where its rows landed.
+    ///
+    /// Anchored below the gear when there's room and above it when there isn't,
+    /// then pulled inside the window — the toolbar sits partway down the
+    /// window, so which side has space depends on where the user has dragged
+    /// the timeline splitter.
+    fn draw_project_menu(&mut self, anchor: Rect, win_w: f32, win_h: f32) {
+        self.project_menu_items.clear();
+
+        let fps_grid_w = MENU_FPS_COL_W * 3.0 + MENU_FPS_COL_GAP * 2.0;
+        let body_w = MENU_RES_W.max(fps_grid_w);
+        let menu_w = body_w + MENU_PAD * 2.0;
+
+        let header_h = (self.text.ascent(MENU_HEADER_SIZE) + 8.0).round();
+        let stride = MENU_ROW_H + MENU_ROW_GAP;
+        let fps_rows = FPS_COLUMNS.iter().map(|c| c.len()).max().unwrap_or(0) as f32;
+        let menu_h = MENU_PAD * 2.0
+            + header_h
+            + stride * (RES_PRESETS.len() + 1) as f32
+            + MENU_SECTION_GAP
+            + header_h
+            + stride * (1.0 + fps_rows);
+
+        let below = anchor.y + anchor.h + MENU_GAP;
+        let above = anchor.y - MENU_GAP - menu_h;
+        let y = if below + menu_h <= win_h - MENU_PAD {
+            below
+        } else {
+            above.max(MENU_PAD)
+        }
+        .round();
+        // Right-aligned to the gear, since the gear is itself near the right
+        // edge; the `max` keeps a narrow window from pushing it off the left.
+        let x = (anchor.x + anchor.w - menu_w)
+            .min(win_w - menu_w - MENU_PAD)
+            .max(MENU_PAD)
+            .round();
+        self.project_menu_rect = Rect { x, y, w: menu_w, h: menu_h };
+
+        for step in (1..=MENU_SHADOW_STEPS).rev() {
+            let g = step as f32;
+            self.quads.push(Quad::colored(
+                [x - g, y - g + 1.0],
+                [menu_w + g * 2.0, menu_h + g * 2.0],
+                MENU_SHADOW,
+            ));
+        }
+        self.quads.push(Quad::colored(
+            [x - 1.0, y - 1.0],
+            [menu_w + 2.0, menu_h + 2.0],
+            MENU_BORDER,
+        ));
+        self.quads
+            .push(Quad::colored([x, y], [menu_w, menu_h], MENU_BG));
+
+        let mut cursor_y = y + MENU_PAD;
+        let header = |state: &mut Self, label: &str, cy: f32| {
+            let ascent = state.text.ascent(MENU_HEADER_SIZE);
+            state.text.draw(
+                &state.queue,
+                &mut state.quads,
+                [(x + MENU_PAD).round(), (cy + ascent).round()],
+                label,
+                MENU_HEADER_SIZE,
+                MENU_HEADER_COLOR,
+            );
+        };
+
+        header(self, "RESOLUTION", cursor_y);
+        cursor_y += header_h;
+        let res_options = std::iter::once((Setting::Auto, "Match first clip".to_string())).chain(
+            RES_PRESETS
+                .iter()
+                .map(|&(rw, rh)| (Setting::Fixed((rw, rh)), format!("{rw} x {rh}"))),
+        );
+        for (setting, label) in res_options {
+            let rect = Rect { x: x + MENU_PAD, y: cursor_y, w: body_w, h: MENU_ROW_H };
+            self.push_menu_row(rect, &label, setting == self.canvas_res, ProjectChoice::Resolution(setting));
+            cursor_y += stride;
+        }
+
+        cursor_y += MENU_SECTION_GAP;
+        header(self, "FRAME RATE", cursor_y);
+        cursor_y += header_h;
+        let auto_rect = Rect { x: x + MENU_PAD, y: cursor_y, w: body_w, h: MENU_ROW_H };
+        self.push_menu_row(
+            auto_rect,
+            "Match first clip",
+            self.canvas_fps == Setting::Auto,
+            ProjectChoice::Fps(Setting::Auto),
+        );
+        cursor_y += stride;
+        for (col, rates) in FPS_COLUMNS.iter().enumerate() {
+            let col_x = x + MENU_PAD + col as f32 * (MENU_FPS_COL_W + MENU_FPS_COL_GAP);
+            for (row, &fps) in rates.iter().enumerate() {
+                let rect = Rect {
+                    x: col_x,
+                    y: cursor_y + row as f32 * stride,
+                    w: MENU_FPS_COL_W,
+                    h: MENU_ROW_H,
+                };
+                let setting = Setting::Fixed(fps);
+                self.push_menu_row(
+                    rect,
+                    &fmt_fps(fps),
+                    self.canvas_fps == setting,
+                    ProjectChoice::Fps(setting),
+                );
+            }
+        }
+    }
+
+    fn push_menu_row(&mut self, rect: Rect, label: &str, selected: bool, choice: ProjectChoice) {
+        draw_menu_row(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            rect,
+            label,
+            MENU_ROW_SIZE,
+            rect.contains(self.cursor),
+            selected,
+        );
+        self.project_menu_items.push((rect, choice));
+    }
+
+    /// Apply a popup choice. The popup stays open: resolution and rate are two
+    /// decisions people usually make together, and closing after the first
+    /// would mean reopening to make the second.
+    fn apply_project_choice(&mut self, choice: ProjectChoice) {
+        match choice {
+            ProjectChoice::Resolution(setting) => self.canvas_res = setting,
+            ProjectChoice::Fps(setting) => self.canvas_fps = setting,
+        }
     }
 
     fn can_export(&self) -> bool {
@@ -1633,7 +1932,29 @@ impl State {
             PANEL_BORDER_COLOR,
         ));
 
-        // --- Preview: topmost active video clip ---
+        // --- Preview: the canvas, and the topmost active clip composed on it ---
+        // The canvas is fitted into the panel first, then the clip is fitted
+        // into the canvas — two stages, not one. Fitting the clip straight to
+        // the panel is what used to hide format mismatches: a 4:3 clip filled a
+        // 16:9 preview edge to edge and then exported pillarboxed, with nothing
+        // on screen to warn you.
+        let canvas = self.canvas();
+        let canvas_scale = (preview_w / canvas.width as f32)
+            .min(preview_h / canvas.height as f32)
+            .max(0.0);
+        let canvas_w = (canvas.width as f32 * canvas_scale).round();
+        let canvas_h = (canvas.height as f32 * canvas_scale).round();
+        let canvas_x = (media_w + (preview_w - canvas_w) * 0.5).round();
+        let canvas_y = ((preview_h - canvas_h) * 0.5).round();
+        // Black, unlike the near-black panel around it, so the frame is visible
+        // as a frame even with nothing playing — that outline is the only thing
+        // showing what shape the project is.
+        self.quads.push(Quad::colored(
+            [canvas_x, canvas_y],
+            [canvas_w, canvas_h],
+            CANVAS_COLOR,
+        ));
+
         // Scoped disjoint borrows so the decoder advance + textured-quad push can
         // share this block without leaking borrows past it.
         {
@@ -1654,15 +1975,16 @@ impl State {
                 if let Some(src) = media.get_mut(source_id) {
                     src.stream.goto(queue, source_t);
 
-                    let vw = src.stream.width() as f32;
-                    let vh = src.stream.height() as f32;
-                    let scale = (preview_w / vw).min(preview_h / vh);
-                    let draw_w = vw * scale;
-                    let draw_h = vh * scale;
-                    let dx = media_w + (preview_w - draw_w) * 0.5;
-                    let dy = (preview_h - draw_h) * 0.5;
+                    // Placement is computed in canvas pixels and then scaled to
+                    // the panel, rather than fitted to the panel directly, so
+                    // the preview is a faithful scale model of the export.
+                    let (cx, cy, cw, ch) =
+                        canvas.fit(src.stream.width() as f32, src.stream.height() as f32);
                     quads.push_with(
-                        Quad::textured([dx, dy], [draw_w, draw_h]),
+                        Quad::textured(
+                            [canvas_x + cx * canvas_scale, canvas_y + cy * canvas_scale],
+                            [cw * canvas_scale, ch * canvas_scale],
+                        ),
                         Some(src.stream.texture()),
                     );
                 }
@@ -1966,7 +2288,23 @@ impl State {
             w: EXPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
+        // Immediately left of Export, because it decides what Export produces.
+        self.timeline_project_btn = Rect {
+            x: (self.timeline_export_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
+            y: btn_y,
+            w: TRANSPORT_BTN_W,
+            h: TRANSPORT_BTN_H,
+        };
         let exporting = self.export.is_some();
+        // The gear's tooltip is the only place the resolved canvas is spelled
+        // out, which matters most when both settings are on Auto and the popup
+        // just says "Match first clip".
+        let project_tip = format!(
+            "Project canvas: {}x{} @ {}",
+            canvas.width,
+            canvas.height,
+            fmt_fps(canvas.fps)
+        );
 
         let avail = |yes: bool| {
             if yes {
@@ -2005,6 +2343,12 @@ impl State {
                 ICON_SNAP,
                 "Snap to clip edges (N)",
                 BtnState::Toggle(self.snap_enabled),
+            ),
+            (
+                self.timeline_project_btn,
+                ICON_SETTINGS,
+                project_tip.as_str(),
+                BtnState::Toggle(self.project_menu_open),
             ),
             (
                 self.timeline_export_btn,
@@ -2047,7 +2391,7 @@ impl State {
         // --- Export readout: progress while rendering, result once done ---
         // Both share the strip left of the Export button, so a finished message
         // appears exactly where the bar that produced it was.
-        let readout_right = self.timeline_export_btn.x - EXPORT_READOUT_GAP;
+        let readout_right = self.timeline_project_btn.x - EXPORT_READOUT_GAP;
         let readout_left = readout_right - EXPORT_READOUT_W;
         let status_ascent = self.text.ascent(EXPORT_STATUS_SIZE);
         if let Some(job) = &self.export {
@@ -2205,6 +2549,11 @@ impl State {
                 SPLITTER_ACTIVE_COLOR,
             )),
             None => {}
+        }
+
+        // --- Project settings popup: topmost, and first to be hit-tested ---
+        if self.project_menu_open {
+            self.draw_project_menu(self.timeline_project_btn, w, h);
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -2599,6 +2948,7 @@ impl ApplicationHandler for App {
                     KeyCode::KeyY if ctrl => state.redo(),
                     // The rest are edge-triggered to avoid repeat spam.
                     _ if repeat => {}
+                    KeyCode::Escape => state.project_menu_open = false,
                     KeyCode::KeyE if ctrl => state.start_export(),
                     // Backspace too: both keys mean "delete" depending on the
                     // keyboard you grew up with.
