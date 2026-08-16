@@ -483,7 +483,7 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
     let mut bucket_peak = 0.0f32;
     let mut bucket_count: usize = 0;
 
-    let mut absorb = |frame: &ffmpeg::frame::Audio,
+    let absorb = |frame: &ffmpeg::frame::Audio,
                       resampler: &mut ffmpeg::software::resampling::Context,
                       peaks: &mut Vec<f32>,
                       bucket_peak: &mut f32,

@@ -256,27 +256,6 @@ impl QuadRenderer {
         }
     }
 
-    pub fn create_texture(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-        format: wgpu::TextureFormat,
-    ) -> Texture {
-        create_texture_inner(
-            device,
-            Some(queue),
-            &self.texture_bgl,
-            &self.sampler,
-            width,
-            height,
-            Some(rgba),
-            format,
-        )
-    }
-
     pub fn create_empty_texture(
         &self,
         device: &wgpu::Device,

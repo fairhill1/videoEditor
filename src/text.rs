@@ -146,22 +146,13 @@ impl TextRenderer {
         }
     }
 
-    /// Height of one line in points at the given size. Useful for vertical stacking.
+    /// Ascent (points above baseline) at the given size.
     ///
     /// This and the measurements below all query the font at the physical size
     /// and divide back down, rather than querying at the logical size directly.
     /// The two differ once rasterization rounds a glyph's box to whole pixels,
     /// and layout that disagreed with [`TextRenderer::draw`] about a width is
     /// exactly how text starts overflowing the box drawn to hold it.
-    pub fn line_height(&self, size_px: f32) -> f32 {
-        let m = self
-            .font
-            .horizontal_line_metrics(size_px * self.scale)
-            .expect("font has no horizontal line metrics");
-        m.new_line_size / self.scale
-    }
-
-    /// Ascent (points above baseline) at the given size.
     pub fn ascent(&self, size_px: f32) -> f32 {
         let m = self
             .font

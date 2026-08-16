@@ -158,7 +158,7 @@ impl State {
                 self.begin_edit();
                 self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
             }
-            TimelineHit::Lane { .. } | TimelineHit::Ruler => {
+            TimelineHit::Lane | TimelineHit::Ruler => {
                 self.selected = None;
                 self.drag = DragMode::Scrub;
                 self.apply_scrub();

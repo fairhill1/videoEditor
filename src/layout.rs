@@ -40,7 +40,7 @@ pub(crate) fn resolve_split(frac: f32, total: f32, min_before: f32, min_after: f
 pub(crate) enum TimelineHit {
     None,
     Ruler,
-    Lane { track: usize },
+    Lane,
     ClipBody { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
@@ -234,7 +234,7 @@ impl State {
                 };
             }
         }
-        TimelineHit::Lane { track: track_idx }
+        TimelineHit::Lane
     }
 
     pub(crate) fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
