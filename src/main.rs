@@ -125,12 +125,30 @@ const LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 // Was dim enough that V1/A1 were a squint to read; a track's identity should be
 // legible at a glance, not decorative.
 const TRACK_LABEL_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
-const LABEL_SIZE: f32 = 13.0;
-const CLIP_LABEL_SIZE: f32 = 11.0;
+// The type scale. Every font size below is one of these steps, so a new piece
+// of chrome picks a step rather than inventing a value a half point off one
+// that already exists.
+//
+// `TYPE_SM` is the floor: nothing renders text smaller. The ruler labels and the
+// pool's format line used to sit a point under it and read as a squint rather
+// than as small print, and anything reaching lower is reaching for the same
+// mistake. These are points, so the floor holds its physical size across
+// displays — see [`State::scale`].
+const TYPE_SM: f32 = 11.0;
+const TYPE_MD: f32 = 12.0;
+const TYPE_LG: f32 = 13.0;
+const TYPE_XL: f32 = 14.0;
+/// Icon glyphs sit above the text steps: a Lucide glyph fills its em box where
+/// a letter leaves clearance above and below, so matching a text size optically
+/// means exceeding it numerically.
+const TYPE_ICON: f32 = 16.0;
+
+const LABEL_SIZE: f32 = TYPE_LG;
+const CLIP_LABEL_SIZE: f32 = TYPE_SM;
 const LABEL_PAD: f32 = 10.0;
 const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 const PLAYHEAD_WIDTH: f32 = 2.0;
-const TIMER_SIZE: f32 = 14.0;
+const TIMER_SIZE: f32 = TYPE_XL;
 const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 // Transport bar between preview and timeline; holds prev/play/next + timer.
 const TRANSPORT_BAR_H: f32 = 40.0;
@@ -142,8 +160,8 @@ const TRANSPORT_BAR_COLOR: [f32; 4] = SURFACE_PANEL;
 const TRANSPORT_BTN_W: f32 = 32.0;
 const TRANSPORT_BTN_H: f32 = 26.0;
 const TRANSPORT_GAP: f32 = 8.0;
-const TRANSPORT_ICON_SIZE: f32 = 16.0;
-const TRANSPORT_TOOLTIP_SIZE: f32 = 11.0;
+const TRANSPORT_ICON_SIZE: f32 = TYPE_ICON;
+const TRANSPORT_TOOLTIP_SIZE: f32 = TYPE_SM;
 
 // Status readout, occupying the toolbar row between the edit buttons and the
 // right-aligned Export button. Doubles as the progress bar while a render runs
@@ -155,7 +173,7 @@ const EXPORT_READOUT_GAP: f32 = 10.0;
 const EXPORT_BAR_H: f32 = 4.0;
 const EXPORT_BAR_TRACK: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
 const EXPORT_BAR_FILL: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
-const STATUS_SIZE: f32 = 11.0;
+const STATUS_SIZE: f32 = TYPE_SM;
 const STATUS_OK: [f32; 4] = [0.60, 0.85, 0.65, 1.0];
 const STATUS_ERR: [f32; 4] = [0.92, 0.55, 0.55, 1.0];
 const STATUS_INFO: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
@@ -185,9 +203,9 @@ const MENU_PAD: f32 = 10.0;
 const MENU_ROW_H: f32 = 22.0;
 const MENU_ROW_GAP: f32 = 1.0;
 const MENU_SECTION_GAP: f32 = 12.0;
-const MENU_HEADER_SIZE: f32 = 10.0;
+const MENU_HEADER_SIZE: f32 = TYPE_SM;
 const MENU_HEADER_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
-const MENU_ROW_SIZE: f32 = 12.0;
+const MENU_ROW_SIZE: f32 = TYPE_MD;
 const MENU_RES_W: f32 = 132.0;
 const MENU_FPS_COL_W: f32 = 60.0;
 const MENU_FPS_COL_GAP: f32 = 4.0;
@@ -214,7 +232,7 @@ const TIMELINE_RULER_H: f32 = 22.0; // scrub strip between the title bar and lan
 const TIMELINE_RULER_COLOR: [f32; 4] = SURFACE_PANEL;
 const TIMELINE_RULER_TICK_COLOR: [f32; 4] = [0.58, 0.58, 0.64, 1.0];
 const TIMELINE_RULER_LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
-const TIMELINE_RULER_LABEL_SIZE: f32 = 10.0;
+const TIMELINE_RULER_LABEL_SIZE: f32 = TYPE_SM;
 const TIMELINE_RULER_TICK_H: f32 = 6.0;
 
 // Media pool list layout.
@@ -223,8 +241,8 @@ const POOL_ROW_HEIGHT: f32 = 64.0;
 const POOL_ROW_GAP: f32 = 4.0;
 const POOL_ROW_PAD: f32 = 6.0;
 const POOL_ROW_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
-const POOL_ITEM_NAME_SIZE: f32 = 12.0;
-const POOL_ITEM_META_SIZE: f32 = 10.0;
+const POOL_ITEM_NAME_SIZE: f32 = TYPE_MD;
+const POOL_ITEM_META_SIZE: f32 = TYPE_SM;
 /// Format line under each pool row's filename. Dimmer than the name and a size
 /// down, so a row still reads as "a clip called X" at a glance rather than as
 /// two competing lines.
@@ -237,11 +255,14 @@ const POOL_THUMB_H: f32 = POOL_ROW_HEIGHT - POOL_ROW_PAD * 2.0;
 const POOL_THUMB_BG: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
 const POOL_DUR_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.65];
 const POOL_DUR_TEXT: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
-const POOL_CLOSE_SIZE: f32 = 18.0;
+/// The close button's hit box, not a font size — hence `BOX`. Every `_SIZE` in
+/// this file is a step on the type scale, which is what makes a stray literal
+/// on one of them easy to spot.
+const POOL_CLOSE_BOX: f32 = 18.0;
 const POOL_CLOSE_INSET: f32 = 3.0;
 const POOL_CLOSE_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.70];
 const POOL_CLOSE_BG_HOVER: [f32; 4] = [0.65, 0.25, 0.25, 0.95];
-const POOL_CLOSE_LABEL_SIZE: f32 = 13.0;
+const POOL_CLOSE_LABEL_SIZE: f32 = TYPE_LG;
 
 // Clip interaction.
 const CLIP_EDGE_GRAB_PX: f32 = 6.0;
@@ -377,10 +398,10 @@ struct TimelineLayout {
 
 fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
     Rect {
-        x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_SIZE,
+        x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_BOX,
         y: row_y + POOL_CLOSE_INSET,
-        w: POOL_CLOSE_SIZE,
-        h: POOL_CLOSE_SIZE,
+        w: POOL_CLOSE_BOX,
+        h: POOL_CLOSE_BOX,
     }
 }
 
