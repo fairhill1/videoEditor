@@ -48,9 +48,11 @@ const ICON_REDO: char = '\u{E143}'; // redo
 const ICON_SNAP: char = '\u{E2B5}'; // magnet
 const ICON_RENDER: char = '\u{E0D0}'; // film
 const ICON_STOP: char = '\u{E167}'; // square
-const ICON_OPEN: char = '\u{E247}'; // folder-open
+const ICON_IMPORT: char = '\u{E22F}'; // import
 const ICON_CLOSE: char = '\u{E1B2}'; // x
 const ICON_SETTINGS: char = '\u{E154}'; // settings (gear)
+const ICON_OPEN: char = '\u{E247}'; // folder-open
+const ICON_SAVE: char = '\u{E14D}'; // save (floppy)
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -668,6 +670,11 @@ struct State {
     /// one produces a file rather than changing the timeline.
     timeline_export_btn: Rect,
     timeline_project_btn: Rect,
+    /// The project-file pair, left of the gear. Grouped at the right end with
+    /// the settings and export buttons because all four concern the project
+    /// rather than the timeline, which is what the left cluster edits.
+    timeline_open_btn: Rect,
+    timeline_save_btn: Rect,
     /// The render in flight, if any. Only one at a time — the button greys out
     /// while it runs, and clicking it again cancels.
     export: Option<ExportJob>,
@@ -781,6 +788,8 @@ impl State {
             selected: None,
             timeline_export_btn: Rect::default(),
             timeline_project_btn: Rect::default(),
+            timeline_open_btn: Rect::default(),
+            timeline_save_btn: Rect::default(),
             export: None,
             status: None,
             snap_enabled: true,
@@ -1206,6 +1215,19 @@ impl State {
         }
         if self.timeline_export_btn.contains([cx, cy]) {
             self.start_export();
+            return;
+        }
+        if self.timeline_open_btn.contains([cx, cy]) {
+            self.open_project();
+            return;
+        }
+        // Consumed even when the project is clean and the button is greyed, for
+        // the same reason as undo: falling through would scrub the timeline
+        // underneath the toolbar.
+        if self.timeline_save_btn.contains([cx, cy]) {
+            if self.dirty {
+                self.save_project(false);
+            }
             return;
         }
         if self.pool_open_btn.contains([cx, cy]) {
@@ -2575,7 +2597,10 @@ impl State {
             &mut self.text,
             &self.queue,
             self.pool_open_btn,
-            ICON_OPEN,
+            // `import`, not `folder-open`: that glyph now means "open a
+            // project" in the timeline toolbar, and one icon standing for two
+            // different actions in the same window is worse than either choice.
+            ICON_IMPORT,
             TRANSPORT_ICON_SIZE,
             pool_open_hovered,
             BtnState::Normal,
@@ -2586,7 +2611,7 @@ impl State {
                 &mut self.text,
                 &self.queue,
                 self.pool_open_btn,
-                "Open file (O)",
+                "Import media (O)",
                 TRANSPORT_TOOLTIP_SIZE,
                 TooltipSide::Below,
                 w,
@@ -2661,6 +2686,16 @@ impl State {
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
+        // Save then Open, continuing leftward. Ordered so the pair reads
+        // open-then-save left to right, the order you do them in.
+        self.timeline_save_btn = Rect {
+            x: (self.timeline_project_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
+            ..self.timeline_project_btn
+        };
+        self.timeline_open_btn = Rect {
+            x: (self.timeline_save_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
+            ..self.timeline_project_btn
+        };
         let exporting = self.export.is_some();
         // The gear's tooltip is the only place the resolved canvas is spelled
         // out, which matters most when both settings are on Auto and the popup
@@ -2680,6 +2715,25 @@ impl State {
             }
         };
         let buttons = [
+            (
+                self.timeline_open_btn,
+                ICON_OPEN,
+                "Open project (Ctrl+O)",
+                BtnState::Normal,
+            ),
+            (
+                self.timeline_save_btn,
+                ICON_SAVE,
+                // Greying out when there is nothing to save is what gives the
+                // dirty state a home inside the window, rather than only in
+                // the title bar where a maximised window hides it.
+                if self.dirty {
+                    "Save project (Ctrl+S)"
+                } else {
+                    "No unsaved changes"
+                },
+                avail(self.dirty),
+            ),
             (
                 self.timeline_split_btn,
                 ICON_SPLIT,
@@ -2757,7 +2811,7 @@ impl State {
         // --- Export readout: progress while rendering, result once done ---
         // Both share the strip left of the Export button, so a finished message
         // appears exactly where the bar that produced it was.
-        let readout_right = self.timeline_project_btn.x - EXPORT_READOUT_GAP;
+        let readout_right = self.timeline_open_btn.x - EXPORT_READOUT_GAP;
         let readout_left = readout_right - EXPORT_READOUT_W;
         let status_ascent = self.text.ascent(STATUS_SIZE);
         if let Some(job) = &self.export {

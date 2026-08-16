@@ -23,9 +23,11 @@ ICONS=(
     magnet                    # timeline: snap toggle
     film                      # timeline: render to file
     square                    # timeline: stop a running render
-    folder-open               # media pool: open files
+    import                    # media pool: add files to the bin
     x                         # media pool: remove a row
     settings                  # timeline: project canvas settings
+    folder-open               # timeline: open a project
+    save                      # timeline: save the project
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
