@@ -105,8 +105,23 @@ const PANEL_BORDER_COLOR: [f32; 4] = [0.28, 0.28, 0.33, 1.0];
 // Softer line for divisions *within* a panel, which shouldn't read as loudly as
 // the panel's own edges.
 const DIVIDER_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
-const VIDEO_CLIP_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 1.0];
-const AUDIO_CLIP_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 1.0];
+// Clip fills. Blue is video and green is audio, and both are darker than they
+// look like they want to be, because `CLIP_LABEL_COLOR` sits directly on them:
+// at the original lightness the filename ran 4.3:1 on video and 3.1:1 on audio,
+// under the 4.5:1 WCAG AA wants for text this size. Each fill is the *lightest*
+// value that clears it, so they give up no more saturation than they must.
+//
+// Derived by scaling all three channels by one factor, which leaves hue and
+// saturation untouched and moves only lightness — the blue is still the same
+// blue. The budget is set by the selected state, not the resting one:
+// `CLIP_SELECTED_LIFT` blends the fill toward white, so the label's worst case
+// is a selected clip, and that is the case these were solved for.
+//
+// Audio stays the lighter of the two by the same 1.5x in luminance it always
+// was. That gap is the only cue separating them for a viewer who can't tell the
+// hues apart, so matching them in lightness would have cost more than it saved.
+const VIDEO_CLIP_COLOR: [f32; 4] = [0.19, 0.28, 0.44, 1.0];
+const AUDIO_CLIP_COLOR: [f32; 4] = [0.19, 0.38, 0.25, 1.0];
 // Outline around each clip. Two butt-joined clips show it twice, so a split
 // reads as a 2px seam.
 const CLIP_BORDER_PX: f32 = 1.0;
@@ -267,8 +282,22 @@ const POOL_CLOSE_LABEL_SIZE: f32 = TYPE_LG;
 // Clip interaction.
 const CLIP_EDGE_GRAB_PX: f32 = 6.0;
 const MIN_CLIP_DURATION: f64 = 0.05; // seconds — keeps trim from zeroing a clip
-const DRAG_GHOST_VIDEO_COLOR: [f32; 4] = [0.30, 0.45, 0.70, 0.55];
-const DRAG_GHOST_AUDIO_COLOR: [f32; 4] = [0.30, 0.60, 0.40, 0.55];
+/// The drag ghost is a clip's own fill at reduced alpha. Derived from that fill
+/// rather than restated, because these were literal copies of it and would have
+/// gone on drawing the old, lower-contrast blue and green after the fills moved.
+const DRAG_GHOST_ALPHA: f32 = 0.55;
+const DRAG_GHOST_VIDEO_COLOR: [f32; 4] = [
+    VIDEO_CLIP_COLOR[0],
+    VIDEO_CLIP_COLOR[1],
+    VIDEO_CLIP_COLOR[2],
+    DRAG_GHOST_ALPHA,
+];
+const DRAG_GHOST_AUDIO_COLOR: [f32; 4] = [
+    AUDIO_CLIP_COLOR[0],
+    AUDIO_CLIP_COLOR[1],
+    AUDIO_CLIP_COLOR[2],
+    DRAG_GHOST_ALPHA,
+];
 
 #[derive(Copy, Clone, Debug)]
 enum DragMode {
