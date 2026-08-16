@@ -17,7 +17,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 use audio::AudioEngine;
@@ -48,9 +48,33 @@ const ICON_STOP: char = '\u{E167}'; // square
 const ICON_OPEN: char = '\u{E247}'; // folder-open
 const ICON_CLOSE: char = '\u{E1B2}'; // x
 
-// Layout split ratios — tweak to taste.
+// Starting layout split ratios. Both are draggable at runtime and live on
+// `State` from then on; these are only where a fresh session begins.
 const TOP_BOTTOM_SPLIT: f32 = 0.55;
 const MEDIA_PREVIEW_SPLIT: f32 = 0.28;
+
+// Splitter behavior.
+/// How far either side of a divider counts as grabbing it. Generous next to
+/// `CLIP_EDGE_GRAB_PX`, because missing a splitter is worse than missing a trim
+/// handle: the click lands on whatever is behind it and scrubs or deselects.
+const SPLITTER_GRAB_PX: f32 = 5.0;
+/// Width of the band drawn over a divider while it is hovered or dragged. Wider
+/// than the 1pt edge it covers, so the divider visibly becomes a handle rather
+/// than just changing color, and centered on that edge so nothing shifts.
+const SPLITTER_ACTIVE_W: f32 = 3.0;
+const SPLITTER_ACTIVE_COLOR: [f32; 4] = [0.45, 0.45, 0.53, 1.0];
+/// Floors for the four panels a splitter can squeeze, in points.
+///
+/// The preview minimum is set by its transport bar rather than the picture:
+/// five buttons plus gaps plus the timecode readout is the point below which
+/// controls would start overlapping, and a preview can always letterbox.
+const POOL_MIN_W: f32 = 160.0;
+const PREVIEW_MIN_W: f32 = 340.0;
+/// Enough for the transport bar plus a sliver of picture above it.
+const TOP_MIN_H: f32 = TRANSPORT_BAR_H + 60.0;
+/// Toolbar, ruler and one lane at its minimum height — below this the timeline
+/// stops being a timeline.
+const TIMELINE_MIN_H: f32 = TIMELINE_TOP_PAD + TIMELINE_RULER_H + TRACK_LANE_MIN_H;
 
 // Surface elevation scale (sRGB), darkest first. Steps widen as they climb:
 // down near black a small numeric difference is imperceptible, so the low tiers
@@ -189,6 +213,36 @@ enum DragMode {
     ClipMove { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
+    /// Dragging a panel divider. Deliberately outside the undo system: where
+    /// the panels sit is a view preference, and burying a real edit one step
+    /// further back in the history every time you resize would be maddening.
+    Splitter(Splitter),
+}
+
+/// The two panel dividers, each named for what it separates.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Splitter {
+    /// Horizontal, between the timeline and everything above it.
+    TopBottom,
+    /// Vertical, between the media pool and the preview.
+    PoolPreview,
+}
+
+/// Resolve a stored split fraction into a position in points, honouring the
+/// minimum size of the panel on either side.
+///
+/// Splits are kept as fractions so a resized window keeps its proportions, but
+/// a fraction alone will happily squeeze a panel to nothing on a small window.
+/// Clamping here — on every read, not just while dragging — means a window
+/// shrunk past a minimum and grown again finds its split where it left it.
+fn resolve_split(frac: f32, total: f32, min_before: f32, min_after: f32) -> f32 {
+    if total <= min_before + min_after {
+        // Not enough room for both minimums. Divide what there is in the ratio
+        // of the minimums themselves: neither panel vanishes, and the result is
+        // stable rather than depending on which one we chose to satisfy first.
+        return (total * min_before / (min_before + min_after)).round();
+    }
+    (frac * total).round().clamp(min_before, total - min_after)
 }
 
 /// One undo step: everything a user edit can change. Pool membership rides
@@ -408,6 +462,14 @@ struct State {
     audio: AudioEngine,
     /// In logical points, matching the rects it is tested against.
     cursor: [f32; 2],
+    /// Fraction of the window height that sits above the timeline, and fraction
+    /// of the width given to the media pool. Read through [`State::timeline_top`]
+    /// and [`State::media_pool_w`], which apply the panel minimums.
+    split_top_bottom: f32,
+    split_pool_preview: f32,
+    /// Last icon handed to the window, so a hover that doesn't change the
+    /// cursor doesn't re-set it every frame.
+    cursor_icon: CursorIcon,
     drag: DragMode,
     last_playing_source: Option<SourceId>,
     /// Prev-edit, prev-frame, play/pause, next-frame, next-edit — left to
@@ -502,6 +564,9 @@ impl State {
             timeline,
             audio: AudioEngine::new(),
             cursor: [0.0, 0.0],
+            split_top_bottom: TOP_BOTTOM_SPLIT,
+            split_pool_preview: MEDIA_PREVIEW_SPLIT,
+            cursor_icon: CursorIcon::Default,
             drag: DragMode::None,
             last_playing_source: None,
             transport: [Rect::default(); 5],
@@ -570,8 +635,55 @@ impl State {
         ]
     }
 
+    /// Y of the divider between the timeline and the panels above it.
     fn timeline_top(&self) -> f32 {
-        (self.logical_size()[1] * TOP_BOTTOM_SPLIT).round()
+        let h = self.logical_size()[1];
+        resolve_split(self.split_top_bottom, h, TOP_MIN_H, TIMELINE_MIN_H)
+    }
+
+    /// Width of the media pool, i.e. X of the divider between it and the preview.
+    fn media_pool_w(&self) -> f32 {
+        let w = self.logical_size()[0];
+        resolve_split(self.split_pool_preview, w, POOL_MIN_W, PREVIEW_MIN_W)
+    }
+
+    /// Which divider, if any, the cursor is close enough to grab.
+    ///
+    /// The horizontal one is tested first and spans the full width, so at the
+    /// T-junction where the two meet it wins. Either answer is defensible
+    /// there; what matters is that the hover highlight and the press agree,
+    /// which they do by both coming through here.
+    fn splitter_at(&self, [cx, cy]: [f32; 2]) -> Option<Splitter> {
+        let top = self.timeline_top();
+        if (cy - top).abs() <= SPLITTER_GRAB_PX {
+            return Some(Splitter::TopBottom);
+        }
+        if cy < top && (cx - self.media_pool_w()).abs() <= SPLITTER_GRAB_PX {
+            return Some(Splitter::PoolPreview);
+        }
+        None
+    }
+
+    /// Point the cursor at whichever divider it is over or dragging. Dragging
+    /// takes priority: once a splitter has been grabbed the cursor keeps its
+    /// resize shape even as it runs past the panel's minimum and off the line.
+    fn update_cursor_icon(&mut self) {
+        let splitter = match self.drag {
+            DragMode::Splitter(s) => Some(s),
+            DragMode::None => self.splitter_at(self.cursor),
+            // Mid-gesture on something else: leave the pointer alone rather
+            // than flickering to a resize arrow while a clip is dragged past.
+            _ => None,
+        };
+        let icon = match splitter {
+            Some(Splitter::TopBottom) => CursorIcon::RowResize,
+            Some(Splitter::PoolPreview) => CursorIcon::ColResize,
+            None => CursorIcon::Default,
+        };
+        if icon != self.cursor_icon {
+            self.window.set_cursor(icon);
+            self.cursor_icon = icon;
+        }
     }
 
     fn timeline_layout(&self) -> TimelineLayout {
@@ -598,8 +710,7 @@ impl State {
     }
 
     fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let w = self.logical_size()[0];
-        let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
+        let media_w = self.media_pool_w();
         let top_h = self.timeline_top();
         if cursor_x < 0.0 || cursor_x > media_w || cursor_y < POOL_LIST_TOP || cursor_y > top_h {
             return None;
@@ -615,8 +726,7 @@ impl State {
     }
 
     fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let w = self.logical_size()[0];
-        let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
+        let media_w = self.media_pool_w();
         let row_w = (media_w - LABEL_PAD * 2.0).max(1.0);
         for (i, &id) in self.media.ids().iter().enumerate() {
             let row_y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
@@ -804,6 +914,13 @@ impl State {
             self.commit_edit();
         }
         let [cx, cy] = self.cursor;
+        // Before every button and panel: a divider sits on top of the panels it
+        // separates, and its grab band overlaps them by design. Nothing else
+        // lives within a few points of one, so this costs the rest nothing.
+        if let Some(splitter) = self.splitter_at([cx, cy]) {
+            self.drag = DragMode::Splitter(splitter);
+            return;
+        }
         if self.transport[0].contains([cx, cy]) {
             self.goto_edit_point(false);
             return;
@@ -902,6 +1019,22 @@ impl State {
         match self.drag {
             DragMode::None | DragMode::PoolDrag { .. } => {}
             DragMode::Scrub => self.apply_scrub(),
+            // Store the clamped position rather than the raw cursor. Past a
+            // minimum the divider stops either way, but re-clamping on write
+            // means it is back under the cursor the instant you drag back,
+            // instead of trailing by however far you overshot.
+            // The `max` keeps a zero-sized window (minimized, on some platforms)
+            // from storing a NaN fraction, which would never wash back out.
+            DragMode::Splitter(Splitter::TopBottom) => {
+                let h = self.logical_size()[1].max(1.0);
+                let y = resolve_split(self.cursor[1] / h, h, TOP_MIN_H, TIMELINE_MIN_H);
+                self.split_top_bottom = y / h;
+            }
+            DragMode::Splitter(Splitter::PoolPreview) => {
+                let w = self.logical_size()[0].max(1.0);
+                let x = resolve_split(self.cursor[0] / w, w, POOL_MIN_W, PREVIEW_MIN_W);
+                self.split_pool_preview = x / w;
+            }
             DragMode::ClipMove { track, idx, grab_t_offset } => {
                 let layout = self.timeline_layout();
                 // Allow vertical drag: if the cursor is over a different
@@ -1437,10 +1570,12 @@ impl State {
         // this poll is what turns a finished render into a status message.
         self.poll_export();
 
+        self.update_cursor_icon();
+
         let [w, h] = self.logical_size();
-        let top_h = (h * TOP_BOTTOM_SPLIT).round();
+        let top_h = self.timeline_top();
         let bottom_h = h - top_h;
-        let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
+        let media_w = self.media_pool_w();
         let preview_w = w - media_w;
 
         // Clamp playhead to [0, duration]. The audio engine drives time forward
@@ -2045,6 +2180,31 @@ impl State {
                 TooltipSide::Above,
                 w,
             );
+        }
+
+        // --- Splitter handle: last, so it sits over both panels it divides ---
+        // A grabbed divider stays lit even once the cursor has run past a panel
+        // minimum and left the line behind, which is the only feedback saying
+        // the drag is still live and simply has nowhere further to go.
+        let active = match self.drag {
+            DragMode::Splitter(s) => Some(s),
+            DragMode::None => self.splitter_at(self.cursor),
+            _ => None,
+        };
+        match active {
+            // Centered on the 1pt edge each panel already draws, so lighting up
+            // moves nothing.
+            Some(Splitter::TopBottom) => self.quads.push(Quad::colored(
+                [0.0, top_h - (SPLITTER_ACTIVE_W - 1.0) * 0.5],
+                [w, SPLITTER_ACTIVE_W],
+                SPLITTER_ACTIVE_COLOR,
+            )),
+            Some(Splitter::PoolPreview) => self.quads.push(Quad::colored(
+                [media_w - 1.0 - (SPLITTER_ACTIVE_W - 1.0) * 0.5, 0.0],
+                [SPLITTER_ACTIVE_W, top_h],
+                SPLITTER_ACTIVE_COLOR,
+            )),
+            None => {}
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
