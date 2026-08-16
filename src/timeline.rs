@@ -1,19 +1,25 @@
+use serde::{Deserialize, Serialize};
+
 /// Slack when testing "is the playhead already on this boundary". Jumping to a
 /// boundary lands the playhead on it exactly, but the position round-trips
 /// through the audio engine, so an exact compare would let float drift strand
 /// the next jump.
 const EDIT_POINT_EPS: f64 = 1e-6;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// `transparent` so a project file writes `source: 0` rather than
+/// `source: SourceId(0)` — the wrapper earns its keep in the type system, not
+/// on disk.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SourceId(pub u32);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind {
     Video,
     Audio,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     /// Stable name for this clip, unlike its position in `Track::clips`.
     /// Splitting inserts, deleting removes, and dragging to another track moves
@@ -146,6 +152,20 @@ impl Timeline {
             .collect();
         self.next_link = snap.next_link;
         self.next_clip = snap.next_clip;
+    }
+
+    /// Re-derive the id counters from the clips actually present, so the next
+    /// id handed out is clear of every one in use.
+    ///
+    /// This is how a loaded project gets its counters, rather than storing
+    /// them in the file. Uniqueness is the only thing these ids owe anyone,
+    /// and deriving them means a file that was hand-edited — or trimmed by an
+    /// older build — can't seed a counter low enough to reissue an id some
+    /// clip already holds.
+    pub fn reseed_counters(&mut self) {
+        let clips = || self.tracks.iter().flat_map(|t| t.clips.iter());
+        self.next_clip = clips().map(|c| c.id + 1).max().unwrap_or(0);
+        self.next_link = clips().filter_map(|c| c.link.map(|l| l + 1)).max().unwrap_or(0);
     }
 
     pub fn remove_source(&mut self, source: SourceId) {
@@ -445,6 +465,42 @@ mod tests {
         // The audio-only boundary at 3.0 is navigable from the video clip.
         assert_eq!(tl.next_edit_point(1.0), Some(3.0));
         assert_eq!(tl.next_edit_point(3.0), Some(5.0));
+    }
+
+    #[test]
+    fn reseeding_clears_every_id_in_use() {
+        let mut tl = timeline_with(vec![
+            Clip { id: 7, link: Some(3), ..clip(0.0, 10.0) },
+            Clip { id: 2, link: None, ..clip(10.0, 5.0) },
+        ]);
+        // `timeline_with` renumbers, so put the ids we care about back.
+        tl.tracks[0].clips[0].id = 7;
+        tl.tracks[0].clips[1].id = 2;
+        tl.next_clip = 0;
+        tl.next_link = 0;
+
+        tl.reseed_counters();
+        assert_eq!(tl.new_clip_id(), 8);
+        assert_eq!(tl.new_link_id(), 4);
+    }
+
+    /// A project saved with nothing on the timeline must not start its
+    /// counters somewhere odd.
+    #[test]
+    fn reseeding_an_empty_timeline_starts_from_zero() {
+        let mut tl = timeline_with(vec![]);
+        tl.next_clip = 99;
+        tl.reseed_counters();
+        assert_eq!(tl.new_clip_id(), 0);
+        assert_eq!(tl.new_link_id(), 0);
+    }
+
+    /// Unlinked clips must not drag the link counter up to their clip ids.
+    #[test]
+    fn reseeding_ignores_clip_ids_when_seeding_links() {
+        let mut tl = timeline_with(vec![clip(0.0, 10.0); 5]);
+        tl.reseed_counters();
+        assert_eq!(tl.new_link_id(), 0);
     }
 
     #[test]

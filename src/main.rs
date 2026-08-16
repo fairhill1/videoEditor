@@ -1,6 +1,7 @@
 mod audio;
 mod export;
 mod media;
+mod project;
 mod quad;
 mod text;
 mod timeline;
@@ -8,9 +9,11 @@ mod ui;
 mod video;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -142,22 +145,23 @@ const TRANSPORT_GAP: f32 = 8.0;
 const TRANSPORT_ICON_SIZE: f32 = 16.0;
 const TRANSPORT_TOOLTIP_SIZE: f32 = 11.0;
 
-// Export readout, occupying the toolbar row between the edit buttons and the
+// Status readout, occupying the toolbar row between the edit buttons and the
 // right-aligned Export button. Doubles as the progress bar while a render runs
-// and the result message afterwards, so the two never fight for the same space.
+// and the message line the rest of the time, so a render's progress and the
+// result of a save never fight for the same space.
 const EXPORT_BTN_W: f32 = TRANSPORT_BTN_W;
 const EXPORT_READOUT_W: f32 = 190.0;
 const EXPORT_READOUT_GAP: f32 = 10.0;
 const EXPORT_BAR_H: f32 = 4.0;
 const EXPORT_BAR_TRACK: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
 const EXPORT_BAR_FILL: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
-const EXPORT_STATUS_SIZE: f32 = 11.0;
-const EXPORT_STATUS_OK: [f32; 4] = [0.60, 0.85, 0.65, 1.0];
-const EXPORT_STATUS_ERR: [f32; 4] = [0.92, 0.55, 0.55, 1.0];
-const EXPORT_STATUS_INFO: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
-/// How long a finished-export message lingers. Long enough to read, short
-/// enough that it clears itself instead of needing a dismiss affordance.
-const EXPORT_STATUS_SECONDS: f64 = 8.0;
+const STATUS_SIZE: f32 = 11.0;
+const STATUS_OK: [f32; 4] = [0.60, 0.85, 0.65, 1.0];
+const STATUS_ERR: [f32; 4] = [0.92, 0.55, 0.55, 1.0];
+const STATUS_INFO: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
+/// How long a status message lingers. Long enough to read, short enough that
+/// it clears itself instead of needing a dismiss affordance.
+const STATUS_SECONDS: f64 = 8.0;
 /// Canvas format used when nothing better is known: an empty timeline, or a
 /// source that has vanished from the pool mid-session.
 const EXPORT_FALLBACK_SIZE: (u32, u32) = (1920, 1080);
@@ -221,6 +225,11 @@ const POOL_ROW_PAD: f32 = 6.0;
 const POOL_ROW_COLOR: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 const POOL_ITEM_NAME_SIZE: f32 = 12.0;
 const POOL_ITEM_META_SIZE: f32 = 10.0;
+/// Format line under each pool row's filename. Dimmer than the name and a size
+/// down, so a row still reads as "a clip called X" at a glance rather than as
+/// two competing lines.
+const POOL_ITEM_META_COLOR: [f32; 4] = LABEL_COLOR;
+const POOL_ITEM_META_GAP: f32 = 5.0;
 // Thumbnail slot inside each row — fixed ~16:9 slot, actual thumb is
 // letterboxed into it preserving source aspect.
 const POOL_THUMB_W: f32 = 92.0;
@@ -292,7 +301,10 @@ impl Canvas {
 /// of the first clip on the timeline. It stays a live mode rather than being
 /// snapshotted at import, so an empty project that gains its first clip adopts
 /// that clip, and the user can pin the format the moment that guess is wrong.
-#[derive(Copy, Clone, PartialEq, Debug)]
+///
+/// Saving the mode rather than the resolved value is the whole point: an `Auto`
+/// project reopened after its footage was swapped follows the new footage.
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
 enum Setting<T> {
     Auto,
     Fixed(T),
@@ -521,6 +533,17 @@ fn format_timecode(t: f64) -> String {
     format!("{:02}:{:02}.{:03}", m, s, ms)
 }
 
+/// V1, V2, A1, A2 — the model supports arbitrary mixes; this is just a sensible
+/// starting point so a blank session shows multiple lanes immediately.
+fn default_tracks() -> Vec<Track> {
+    vec![
+        Track::new(TrackKind::Video),
+        Track::new(TrackKind::Video),
+        Track::new(TrackKind::Audio),
+        Track::new(TrackKind::Audio),
+    ]
+}
+
 fn import_source(
     media: &mut MediaPool,
     path: &str,
@@ -598,8 +621,9 @@ struct State {
     /// The render in flight, if any. Only one at a time — the button greys out
     /// while it runs, and clicking it again cancels.
     export: Option<ExportJob>,
-    /// Result of the last render, shown until it ages out.
-    export_status: Option<(String, [f32; 4], Instant)>,
+    /// Outcome of the last thing worth reporting — a render, a save, a failed
+    /// open — shown until it ages out.
+    status: Option<(String, [f32; 4], Instant)>,
     /// Magnetic snapping while dragging. Toggleable because there is no
     /// timeline zoom yet: on a long timeline the pixel threshold covers a wide
     /// time window, and without an escape hatch a clip could not be parked
@@ -617,6 +641,15 @@ struct State {
     /// so a batch operation can wrap self-contained edits and still read as
     /// one Ctrl+Z.
     edit_depth: u32,
+    /// Where Ctrl+S writes without asking. `None` until the project has been
+    /// saved once or opened from disk.
+    project_path: Option<PathBuf>,
+    /// Whether anything has changed since the last save. Drives the dot in the
+    /// title bar and the prompt on close.
+    dirty: bool,
+    /// Last string handed to the window manager, so the title is only re-set
+    /// when it actually changes rather than every frame.
+    title_shown: String,
 }
 
 impl State {
@@ -642,17 +675,24 @@ impl State {
         let quads = QuadRenderer::new(&device, &queue, surface_format.add_srgb_suffix());
         let text = TextRenderer::new(&device, &quads);
 
-        // Start with V1, V2, A1, A2 — the model supports arbitrary mixes; this is
-        // just a sensible default so the UI shows multiple lanes immediately.
         let mut timeline = Timeline::new();
-        timeline.tracks.push(Track::new(TrackKind::Video));
-        timeline.tracks.push(Track::new(TrackKind::Video));
-        timeline.tracks.push(Track::new(TrackKind::Audio));
-        timeline.tracks.push(Track::new(TrackKind::Audio));
+        timeline.tracks = default_tracks();
+
+        // A project on the command line replaces the arguments-as-media path
+        // entirely, so `videoEditor edit.vedit` opens the edit rather than
+        // trying to decode it. Deferred until `State` exists, since loading
+        // one is a method on it.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let project_arg = args
+            .iter()
+            .find(|a| Path::new(a).extension().is_some_and(|e| e == project::EXTENSION))
+            .cloned();
 
         let mut media = MediaPool::new();
-        for path in std::env::args().skip(1) {
-            import_source(&mut media, &path, &device, &queue, &quads);
+        if project_arg.is_none() {
+            for path in &args {
+                import_source(&mut media, path, &device, &queue, &quads);
+            }
         }
 
         let scale = window.scale_factor() as f32;
@@ -692,7 +732,7 @@ impl State {
             timeline_export_btn: Rect::default(),
             timeline_project_btn: Rect::default(),
             export: None,
-            export_status: None,
+            status: None,
             snap_enabled: true,
             pool_open_btn: Rect::default(),
             modifiers: ModifiersState::empty(),
@@ -700,10 +740,17 @@ impl State {
             redo_stack: Vec::new(),
             pending_edit: None,
             edit_depth: 0,
+            project_path: None,
+            dirty: false,
+            title_shown: String::new(),
         };
 
         state.configure_surface();
         state.set_scale(scale);
+        if let Some(path) = project_arg {
+            state.load_project(Path::new(&path));
+        }
+        state.update_title();
 
         state
     }
@@ -899,6 +946,9 @@ impl State {
         self.undo_stack.push(before);
         // A fresh edit invalidates the redo branch.
         self.redo_stack.clear();
+        // Only reached when the edit actually changed something, which is
+        // exactly when the saved file goes stale.
+        self.dirty = true;
     }
 
     fn undo(&mut self) {
@@ -908,6 +958,10 @@ impl State {
         let current = self.edit_snapshot();
         self.apply_snapshot(&prev);
         self.redo_stack.push(current);
+        // Undoing back to exactly the saved state still counts as dirty. The
+        // alternative is comparing against a snapshot taken at save time, which
+        // is more bookkeeping than an over-eager prompt is worth.
+        self.dirty = true;
     }
 
     fn redo(&mut self) {
@@ -917,6 +971,7 @@ impl State {
         let current = self.edit_snapshot();
         self.apply_snapshot(&next);
         self.undo_stack.push(current);
+        self.dirty = true;
     }
 
     fn apply_snapshot(&mut self, snap: &EditSnapshot) {
@@ -1749,18 +1804,279 @@ impl State {
     /// decisions people usually make together, and closing after the first
     /// would mean reopening to make the second.
     fn apply_project_choice(&mut self, choice: ProjectChoice) {
+        let before = (self.canvas_res, self.canvas_fps);
         match choice {
             ProjectChoice::Resolution(setting) => self.canvas_res = setting,
             ProjectChoice::Fps(setting) => self.canvas_fps = setting,
         }
+        // Canvas settings sit outside the undo system, so they mark the project
+        // dirty directly rather than riding along on an edit step. Re-picking
+        // the row that is already active changes nothing and shouldn't.
+        if before != (self.canvas_res, self.canvas_fps) {
+            self.dirty = true;
+        }
+    }
+
+    /// Name for the title bar and dialogs. Untitled until the project has a
+    /// file of its own.
+    fn project_display_name(&self) -> &str {
+        self.project_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+    }
+
+    /// Keep the window title in step with the project and whether it has
+    /// unsaved work. Called once a frame; comparing against `title_shown` is
+    /// what keeps that from being a window-manager round trip every frame.
+    fn update_title(&mut self) {
+        let title = format!(
+            "{}{} - videoEditor",
+            if self.dirty { "• " } else { "" },
+            self.project_display_name()
+        );
+        if title != self.title_shown {
+            self.window.set_title(&title);
+            self.title_shown = title;
+        }
+    }
+
+    /// Ask before throwing unsaved work away; `true` means go ahead. A clean
+    /// project never prompts, which is what makes the prompt meaningful when
+    /// it does appear.
+    fn confirm_discard(&self, action: &str) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let name = self.project_display_name();
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description(format!("{action} will discard unsaved changes to {name}."))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show()
+            == rfd::MessageDialogResult::Ok
+    }
+
+    /// Gather the session into a serializable project, with every path stored
+    /// relative to `dir` where it can be.
+    ///
+    /// The whole pool goes in, not just the sources the timeline uses: a bin of
+    /// imported footage is part of the project even before it reaches a track,
+    /// and reopening to find the unused imports gone would be a quiet loss.
+    fn as_project(&self, dir: &Path) -> project::Project {
+        let mut ids = self.media.ids().to_vec();
+        // A clip whose source has left the pool can't currently arise —
+        // removing a pool row removes its clips too — but writing a clip that
+        // points at a source the file doesn't carry would make a project that
+        // silently drops that clip when reopened. Append rather than trust.
+        for track in &self.timeline.tracks {
+            for clip in &track.clips {
+                if !ids.contains(&clip.source) {
+                    ids.push(clip.source);
+                }
+            }
+        }
+        project::Project {
+            version: project::FORMAT_VERSION,
+            canvas: project::CanvasSettings {
+                resolution: self.canvas_res,
+                fps: self.canvas_fps,
+            },
+            sources: ids
+                .iter()
+                .filter_map(|&id| {
+                    self.media.get(id).map(|src| project::SourceEntry {
+                        id,
+                        path: project::Project::store_path(Path::new(&src.path), dir),
+                    })
+                })
+                .collect(),
+            tracks: self
+                .timeline
+                .tracks
+                .iter()
+                .map(|t| project::TrackEntry {
+                    kind: t.kind,
+                    clips: t.clips.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Write the project, asking for a location when it hasn't got one or when
+    /// `save_as` forces the dialog.
+    fn save_project(&mut self, save_as: bool) {
+        let path = match &self.project_path {
+            Some(path) if !save_as => path.clone(),
+            _ => {
+                let Some(picked) = rfd::FileDialog::new()
+                    .add_filter("videoEditor project", &[project::EXTENSION])
+                    .set_file_name(format!("untitled.{}", project::EXTENSION))
+                    .save_file()
+                else {
+                    return;
+                };
+                // A picker the user cleared the suffix in would otherwise
+                // produce a file the open dialog's own filter then hides.
+                if picked.extension().is_some() {
+                    picked
+                } else {
+                    picked.with_extension(project::EXTENSION)
+                }
+            }
+        };
+
+        let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let project = self.as_project(&dir);
+        if let Err(e) = project::write(&path, &project) {
+            log::error!("failed to save {}: {e}", path.display());
+            self.set_status(format!("Save failed: {e}"), STATUS_ERR);
+            return;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        self.project_path = Some(path);
+        self.dirty = false;
+        self.set_status(format!("Saved {name}"), STATUS_OK);
+    }
+
+    fn open_project(&mut self) {
+        if !self.confirm_discard("Opening another project") {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("videoEditor project", &[project::EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        self.load_project(&path);
+    }
+
+    /// Replace the session with the project at `path`.
+    ///
+    /// Media that won't open is reported and its clips are dropped, rather than
+    /// refusing the whole file: one moved clip shouldn't make a project
+    /// unopenable, and nothing is written back until the next save. There is no
+    /// relink UI yet, so saying so loudly is the only warning available.
+    fn load_project(&mut self, path: &Path) {
+        let loaded = match project::read(path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                log::error!("failed to open {}: {e}", path.display());
+                self.set_status(format!("Open failed: {e}"), STATUS_ERR);
+                return;
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+
+        // Re-import into a pool of its own. Ids come from the fresh pool rather
+        // than the file, so every clip's source has to be remapped through
+        // `imported` — a source that failed to open simply has no entry, which
+        // is what identifies the clips that can't be kept.
+        let mut media = MediaPool::new();
+        let mut imported: HashMap<SourceId, SourceId> = HashMap::new();
+        let mut missing = 0;
+        for entry in &loaded.sources {
+            let resolved = project::Project::resolve_path(&entry.path, &dir);
+            match resolved
+                .to_str()
+                .ok_or(ffmpeg_next::Error::InvalidData)
+                .and_then(|p| media.add(p, &self.device, &self.queue, &self.quads))
+            {
+                Ok(new_id) => {
+                    imported.insert(entry.id, new_id);
+                }
+                Err(e) => {
+                    log::error!("missing media {}: {e}", resolved.display());
+                    missing += 1;
+                }
+            }
+        }
+
+        let mut dropped = 0;
+        let mut tracks = Vec::new();
+        for entry in &loaded.tracks {
+            let mut track = Track::new(entry.kind);
+            for clip in &entry.clips {
+                match imported.get(&clip.source) {
+                    Some(&source) => track.clips.push(Clip { source, ..*clip }),
+                    None => dropped += 1,
+                }
+            }
+            tracks.push(track);
+        }
+
+        self.audio.set_playing(false);
+        self.audio.set_position(0.0);
+        self.media = media;
+        self.timeline = Timeline::new();
+        self.timeline.tracks = tracks;
+        self.timeline.reseed_counters();
+        self.canvas_res = loaded.canvas.resolution;
+        self.canvas_fps = loaded.canvas.fps;
+        self.reset_session_state();
+        self.project_path = Some(path.to_path_buf());
+        self.dirty = false;
+
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        if missing == 0 {
+            self.set_status(format!("Opened {name}"), STATUS_OK);
+        } else {
+            self.set_status(
+                format!("Opened {name}: {missing} media missing, {dropped} clips dropped"),
+                STATUS_ERR,
+            );
+        }
+    }
+
+    /// Start over with an empty timeline. Without this, opening a project would
+    /// be a one-way door: nothing else gets you back to a blank session short
+    /// of relaunching.
+    fn new_project(&mut self) {
+        if !self.confirm_discard("Starting a new project") {
+            return;
+        }
+        self.audio.set_playing(false);
+        self.audio.set_position(0.0);
+        self.media = MediaPool::new();
+        self.timeline = Timeline::new();
+        self.timeline.tracks = default_tracks();
+        self.canvas_res = Setting::Auto;
+        self.canvas_fps = Setting::Auto;
+        self.reset_session_state();
+        self.project_path = None;
+        self.dirty = false;
+    }
+
+    /// Drop everything that pointed into the timeline that was just replaced.
+    /// Undo history is the dangerous one: a step from the previous project
+    /// restores clips referencing sources this one has never imported.
+    fn reset_session_state(&mut self) {
+        self.selected = None;
+        self.drag = DragMode::None;
+        self.last_playing_source = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.pending_edit = None;
+        self.edit_depth = 0;
     }
 
     fn can_export(&self) -> bool {
         self.export.is_none() && self.timeline.duration() > 0.0
     }
 
-    fn set_export_status(&mut self, message: String, color: [f32; 4]) {
-        self.export_status = Some((message, color, Instant::now()));
+    fn set_status(&mut self, message: String, color: [f32; 4]) {
+        self.status = Some((message, color, Instant::now()));
     }
 
     fn start_export(&mut self) {
@@ -1768,11 +2084,11 @@ impl State {
         // only affordance, so it has to be the stop as well as the start.
         if let Some(job) = &self.export {
             job.cancel();
-            self.set_export_status("Cancelling…".into(), EXPORT_STATUS_INFO);
+            self.set_status("Cancelling…".into(), STATUS_INFO);
             return;
         }
         if self.timeline.duration() <= 0.0 {
-            self.set_export_status("Nothing to export".into(), EXPORT_STATUS_ERR);
+            self.set_status("Nothing to export".into(), STATUS_ERR);
             return;
         }
         let Some(output) = rfd::FileDialog::new()
@@ -1808,7 +2124,7 @@ impl State {
             paths,
         };
         self.export = Some(ExportJob::start(request));
-        self.set_export_status("Starting…".into(), EXPORT_STATUS_INFO);
+        self.set_status("Starting…".into(), STATUS_INFO);
     }
 
     /// Retire a finished job and turn its result into a status message. Called
@@ -1829,14 +2145,14 @@ impl State {
                     .and_then(|s| s.to_str())
                     .unwrap_or("file")
                     .to_string();
-                self.set_export_status(format!("Exported {name}"), EXPORT_STATUS_OK);
+                self.set_status(format!("Exported {name}"), STATUS_OK);
             }
             Outcome::Cancelled => {
-                self.set_export_status("Export cancelled".into(), EXPORT_STATUS_INFO);
+                self.set_status("Export cancelled".into(), STATUS_INFO);
             }
             Outcome::Failed(err) => {
                 log::error!("export failed: {err}");
-                self.set_export_status(format!("Export failed: {err}"), EXPORT_STATUS_ERR);
+                self.set_status(format!("Export failed: {err}"), STATUS_ERR);
             }
         }
     }
@@ -2393,13 +2709,13 @@ impl State {
         // appears exactly where the bar that produced it was.
         let readout_right = self.timeline_project_btn.x - EXPORT_READOUT_GAP;
         let readout_left = readout_right - EXPORT_READOUT_W;
-        let status_ascent = self.text.ascent(EXPORT_STATUS_SIZE);
+        let status_ascent = self.text.ascent(STATUS_SIZE);
         if let Some(job) = &self.export {
             let progress = job.progress();
             let block_h = status_ascent + 3.0 + EXPORT_BAR_H;
             let block_top = (toolbar_center_y - block_h * 0.5).round();
             let text = format!("Exporting… {}%", (progress.fraction() * 100.0).round());
-            let text_w = self.text.measure_width(&text, EXPORT_STATUS_SIZE);
+            let text_w = self.text.measure_width(&text, STATUS_SIZE);
             self.text.draw(
                 &self.queue,
                 &mut self.quads,
@@ -2408,8 +2724,8 @@ impl State {
                     block_top + status_ascent,
                 ],
                 &text,
-                EXPORT_STATUS_SIZE,
-                EXPORT_STATUS_INFO,
+                STATUS_SIZE,
+                STATUS_INFO,
             );
             let bar_y = (block_top + status_ascent + 3.0).round();
             self.quads.push(Quad::colored(
@@ -2425,16 +2741,16 @@ impl State {
                     EXPORT_BAR_FILL,
                 ));
             }
-        } else if let Some((message, color, since)) = &self.export_status {
-            if since.elapsed().as_secs_f64() < EXPORT_STATUS_SECONDS {
+        } else if let Some((message, color, since)) = &self.status {
+            if since.elapsed().as_secs_f64() < STATUS_SECONDS {
                 let (message, color) = (message.clone(), *color);
                 let message = truncate_to_width(
                     &self.text,
                     &message,
-                    EXPORT_STATUS_SIZE,
+                    STATUS_SIZE,
                     EXPORT_READOUT_W,
                 );
-                let text_w = self.text.measure_width(&message, EXPORT_STATUS_SIZE);
+                let text_w = self.text.measure_width(&message, STATUS_SIZE);
                 self.text.draw(
                     &self.queue,
                     &mut self.quads,
@@ -2443,11 +2759,11 @@ impl State {
                         (toolbar_center_y + status_ascent * 0.5).round(),
                     ],
                     &message,
-                    EXPORT_STATUS_SIZE,
+                    STATUS_SIZE,
                     color,
                 );
             } else {
-                self.export_status = None;
+                self.status = None;
             }
         }
 
@@ -2646,12 +2962,22 @@ impl State {
                 POOL_DUR_TEXT,
             );
 
-            // Name to the right of the thumb, vertically centered. Clamp with
-            // an ellipsis if the filename would otherwise bleed into the preview.
+            // Name and format line to the right of the thumb, the pair centered
+            // as a block. Both clamp with an ellipsis rather than bleeding into
+            // the preview — a narrow pool loses the tail of the filename, which
+            // is the half worth losing.
+            //
+            // The format is worth the second line because it's what decides
+            // whether a clip matches the canvas, and `Setting::Auto` means the
+            // canvas is inherited from one of these rows: without it, the only
+            // way to see what you're inheriting is to look at the export.
             let name_x = slot_x + POOL_THUMB_W + POOL_ROW_PAD + 4.0;
             let name_max_w = (row_x + row_w - POOL_ROW_PAD - name_x).max(0.0);
             let name_ascent = self.text.ascent(POOL_ITEM_NAME_SIZE);
-            let name_baseline = row_y + (POOL_ROW_HEIGHT + name_ascent) * 0.5;
+            let meta_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
+            let block_h = name_ascent + POOL_ITEM_META_GAP + meta_ascent;
+            let name_baseline = (row_y + (POOL_ROW_HEIGHT - block_h) * 0.5 + name_ascent).round();
+            let meta_baseline = name_baseline + POOL_ITEM_META_GAP + meta_ascent;
             let name = truncate_to_width(&self.text, &src.name, POOL_ITEM_NAME_SIZE, name_max_w);
             self.text.draw(
                 &self.queue,
@@ -2660,6 +2986,25 @@ impl State {
                 &name,
                 POOL_ITEM_NAME_SIZE,
                 CLIP_LABEL_COLOR,
+            );
+
+            // ASCII throughout: the UI font is a stock TTF rather than a subset
+            // we control, so a '×' or '·' that turned out to be missing would
+            // fail as a blank rather than as a build error.
+            let meta = format!(
+                "{}x{} @ {} fps",
+                src.stream.width(),
+                src.stream.height(),
+                fmt_fps(src.stream.frame_rate()),
+            );
+            let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [name_x, meta_baseline],
+                &meta,
+                POOL_ITEM_META_SIZE,
+                POOL_ITEM_META_COLOR,
             );
 
             let row_hovered = self.cursor[0] >= row_x
@@ -2880,8 +3225,11 @@ impl ApplicationHandler for App {
         let state = self.state.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
-                println!("The close button was pressed; stopping");
-                event_loop.exit();
+                // The one place unsaved work can vanish without the user
+                // choosing to lose it, so it's the one place worth a prompt.
+                if state.confirm_discard("Quitting") {
+                    event_loop.exit();
+                }
             }
             WindowEvent::DroppedFile(path) => {
                 if let Some(path_str) = path.to_str() {
@@ -2889,6 +3237,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                state.update_title();
                 state.render();
                 state.get_window().request_redraw();
             }
@@ -2950,11 +3299,14 @@ impl ApplicationHandler for App {
                     _ if repeat => {}
                     KeyCode::Escape => state.project_menu_open = false,
                     KeyCode::KeyE if ctrl => state.start_export(),
+                    KeyCode::KeyS if ctrl => state.save_project(shift),
+                    KeyCode::KeyO if ctrl => state.open_project(),
+                    KeyCode::KeyN if ctrl => state.new_project(),
                     // Backspace too: both keys mean "delete" depending on the
                     // keyboard you grew up with.
                     KeyCode::Delete | KeyCode::Backspace => state.delete_selected(),
-                    // Guarded on ctrl so unbound combos (Ctrl+S, Ctrl+O) don't
-                    // fall through to the bare-key action.
+                    // Guarded on ctrl so the file-management combos above win
+                    // rather than falling through to the bare-key action.
                     KeyCode::Space if !ctrl => state.toggle_playback(),
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),

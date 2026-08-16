@@ -13,6 +13,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 log = "0.4.29"
 pollster = "0.4.0"
 rfd = "0.17"
+ron = "=0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
 wgpu = "29.0.1"
 winit = "0.30.13"
 
