@@ -387,7 +387,18 @@ struct State {
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Surface size in physical pixels. Only the swapchain and the projection
+    /// want this — everything else works through [`State::logical_size`].
     size: winit::dpi::PhysicalSize<u32>,
+    /// Physical pixels per logical point, i.e. 2.0 on a Retina display.
+    ///
+    /// Every layout constant in this file is in points, so the UI keeps the
+    /// same *physical* size across displays instead of halving on a HiDPI one,
+    /// while a bigger window shows more timeline rather than a bigger toolbar.
+    /// Nothing multiplies by this directly: the projection is fed a viewport in
+    /// points, which makes the conversion the GPU's job. A user zoom
+    /// preference, when it arrives, folds in here as a second factor.
+    scale: f32,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     quads: QuadRenderer,
@@ -395,6 +406,7 @@ struct State {
     media: MediaPool,
     timeline: Timeline,
     audio: AudioEngine,
+    /// In logical points, matching the rects it is tested against.
     cursor: [f32; 2],
     drag: DragMode,
     last_playing_source: Option<SourceId>,
@@ -473,12 +485,15 @@ impl State {
             import_source(&mut media, &path, &device, &queue, &quads);
         }
 
-        let state = State {
+        let scale = window.scale_factor() as f32;
+
+        let mut state = State {
             instance,
             window,
             device,
             queue,
             size,
+            scale,
             surface,
             surface_format,
             quads,
@@ -509,6 +524,7 @@ impl State {
         };
 
         state.configure_surface();
+        state.set_scale(scale);
 
         state
     }
@@ -536,14 +552,31 @@ impl State {
         self.configure_surface();
     }
 
+    /// Adopt a new device pixel ratio, e.g. after the window is dragged onto a
+    /// display with a different one. The surface itself needs no work here:
+    /// winit follows a scale change with a `Resized` carrying the new physical
+    /// size, which [`State::resize`] handles.
+    fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
+        self.text.set_scale(scale);
+    }
+
+    /// Window size in logical points — the coordinate space all layout, hit
+    /// testing and drawing below is written in. See [`State::scale`].
+    fn logical_size(&self) -> [f32; 2] {
+        [
+            self.size.width as f32 / self.scale,
+            self.size.height as f32 / self.scale,
+        ]
+    }
+
     fn timeline_top(&self) -> f32 {
-        (self.size.height as f32 * TOP_BOTTOM_SPLIT).round()
+        (self.logical_size()[1] * TOP_BOTTOM_SPLIT).round()
     }
 
     fn timeline_layout(&self) -> TimelineLayout {
-        let w = self.size.width as f32;
+        let [w, bottom] = self.logical_size();
         let top = self.timeline_top();
-        let bottom = self.size.height as f32;
         let tracks_top = top + TIMELINE_TOP_PAD;
         let tracks_area_h = (bottom - tracks_top).max(0.0);
         TimelineLayout {
@@ -565,7 +598,7 @@ impl State {
     }
 
     fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let w = self.size.width as f32;
+        let w = self.logical_size()[0];
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
         let top_h = self.timeline_top();
         if cursor_x < 0.0 || cursor_x > media_w || cursor_y < POOL_LIST_TOP || cursor_y > top_h {
@@ -582,7 +615,7 @@ impl State {
     }
 
     fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let w = self.size.width as f32;
+        let w = self.logical_size()[0];
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
         let row_w = (media_w - LABEL_PAD * 2.0).max(1.0);
         for (i, &id) in self.media.ids().iter().enumerate() {
@@ -1404,8 +1437,7 @@ impl State {
         // this poll is what turns a finished render into a status message.
         self.poll_export();
 
-        let w = self.size.width as f32;
-        let h = self.size.height as f32;
+        let [w, h] = self.logical_size();
         let top_h = (h * TOP_BOTTOM_SPLIT).round();
         let bottom_h = h - top_h;
         let media_w = (w * MEDIA_PREVIEW_SPLIT).round();
@@ -2354,8 +2386,14 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 state.resize(size);
             }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.set_scale(scale_factor as f32);
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                state.cursor = [position.x as f32, position.y as f32];
+                // To points, so hit testing shares a coordinate space with the
+                // rects that were drawn.
+                let position = position.to_logical::<f32>(state.scale as f64);
+                state.cursor = [position.x, position.y];
                 state.update_drag();
             }
             WindowEvent::MouseInput {

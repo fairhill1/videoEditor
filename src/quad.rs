@@ -330,6 +330,10 @@ impl QuadRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass,
+        // Viewport in the same units the quads are positioned in — logical
+        // points, not physical pixels. Dividing by it is what maps a
+        // display-independent layout onto whatever surface the window has, so
+        // HiDPI scaling costs the drawing code nothing.
         screen_size: [f32; 2],
     ) {
         if self.quads.is_empty() {
