@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Setting;
+use crate::canvas::Setting;
 use crate::timeline::{Clip, SourceId, TrackKind};
 
 /// Written into every file and checked on the way back in.
