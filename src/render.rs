@@ -9,9 +9,46 @@ use crate::canvas::Canvas;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
 use crate::layout::{pool_row_close_rect, Splitter};
-use crate::quad::Quad;
+use crate::audio::Waveform;
+use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::theme::*;
+
+/// Draw a whole source's waveform into a box, one column per pixel of width.
+///
+/// The media pool's stand-in for a thumbnail on a source with no picture. Same
+/// column-per-pixel construction as the timeline's waveform, but summarizing
+/// the entire file rather than a clip's slice of it, so the shape in the pool
+/// is the shape of the file.
+fn draw_waveform_summary(
+    quads: &mut QuadRenderer,
+    wf: &Waveform,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    if wf.peaks.is_empty() || w < 1.0 {
+        return;
+    }
+    let mid_y = y + h * 0.5;
+    let max_half_h = (h * 0.42).max(1.0);
+    let cols = w as i32;
+    for col in 0..cols {
+        let start = wf.peaks.len() * col as usize / cols as usize;
+        let end = (wf.peaks.len() * (col + 1) as usize / cols as usize).max(start + 1);
+        let peak = wf.peaks[start..end.min(wf.peaks.len())]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let half_h = (peak * max_half_h).max(0.5);
+        quads.push(Quad::colored(
+            [x + col as f32, mid_y - half_h],
+            [1.0, half_h * 2.0],
+            AUDIO_WAVE_COLOR,
+        ));
+    }
+}
 
 impl State {
     pub(crate) fn render(&mut self) {
@@ -217,20 +254,20 @@ impl State {
                 .map(|(_, c)| (c.source, c.source_time(t)));
             if let Some((source_id, source_t)) = active_info {
                 *last_playing_source = Some(source_id);
-                if let Some(src) = media.get_mut(source_id) {
-                    src.stream.goto(queue, source_t);
+                if let Some(stream) = media.get_mut(source_id).and_then(|s| s.stream.as_mut()) {
+                    stream.goto(queue, source_t);
 
                     // Placement is computed in canvas pixels and then scaled to
                     // the panel, rather than fitted to the panel directly, so
                     // the preview is a faithful scale model of the export.
                     let (cx, cy, cw, ch) =
-                        canvas.fit(src.stream.width() as f32, src.stream.height() as f32);
+                        canvas.fit(stream.width() as f32, stream.height() as f32);
                     quads.push_with(
                         Quad::textured(
                             [canvas_x + cx * canvas_scale, canvas_y + cy * canvas_scale],
                             [cw * canvas_scale, ch * canvas_scale],
                         ),
-                        Some(src.stream.texture()),
+                        Some(stream.texture()),
                     );
                 }
             } else {
@@ -270,19 +307,35 @@ impl State {
             ));
 
             // Fit the baked thumbnail into the slot, preserving source aspect.
-            let thumb = src.stream.thumbnail();
-            let tw = thumb.width as f32;
-            let th = thumb.height as f32;
-            let scale = (POOL_THUMB_W / tw).min(POOL_THUMB_H / th);
-            let dw = (tw * scale).round();
-            let dh = (th * scale).round();
-            let dx = (slot_x + (POOL_THUMB_W - dw) * 0.5).round();
-            let dy = (slot_y + (POOL_THUMB_H - dh) * 0.5).round();
-            self.quads
-                .push_with(Quad::textured([dx, dy], [dw, dh]), Some(thumb));
+            // A source with no picture gets its waveform in the same slot
+            // instead of an empty box or a stand-in icon: it is the one
+            // thumbnail an audio file actually has, and it distinguishes a
+            // music bed from a voiceover at a glance the way a frame does for
+            // video.
+            if let Some(video) = src.stream.as_ref() {
+                let thumb = video.thumbnail();
+                let tw = thumb.width as f32;
+                let th = thumb.height as f32;
+                let scale = (POOL_THUMB_W / tw).min(POOL_THUMB_H / th);
+                let dw = (tw * scale).round();
+                let dh = (th * scale).round();
+                let dx = (slot_x + (POOL_THUMB_W - dw) * 0.5).round();
+                let dy = (slot_y + (POOL_THUMB_H - dh) * 0.5).round();
+                self.quads
+                    .push_with(Quad::textured([dx, dy], [dw, dh]), Some(thumb));
+            } else if let Some(wf) = src.waveform.as_ref() {
+                draw_waveform_summary(
+                    &mut self.quads,
+                    wf,
+                    slot_x,
+                    slot_y,
+                    POOL_THUMB_W,
+                    POOL_THUMB_H,
+                );
+            }
 
             // Duration pill in the bottom-right of the thumb slot.
-            let dur_text = format_timecode(src.stream.duration());
+            let dur_text = format_timecode(self.media.duration(id));
             let dur_w = self.text.measure_width(&dur_text, POOL_ITEM_META_SIZE);
             let dur_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
             let pill_pad_x = 4.0;
@@ -332,12 +385,26 @@ impl State {
             // ASCII throughout: the UI font is a stock TTF rather than a subset
             // we control, so a '×' or '·' that turned out to be missing would
             // fail as a blank rather than as a build error.
-            let meta = format!(
-                "{}x{} @ {} fps",
-                src.stream.width(),
-                src.stream.height(),
-                fmt_fps(src.stream.frame_rate()),
-            );
+            let meta = match (src.stream.as_ref(), src.audio.as_ref()) {
+                (Some(v), _) => format!(
+                    "{}x{} @ {} fps",
+                    v.width(),
+                    v.height(),
+                    fmt_fps(v.frame_rate()),
+                ),
+                // The same question one line down for a source with no
+                // picture: not what canvas it would set, but what it is.
+                (None, Some(a)) => format!(
+                    "{} Hz {}",
+                    a.src_rate(),
+                    match a.src_channels() {
+                        1 => "mono".to_string(),
+                        2 => "stereo".to_string(),
+                        n => format!("{n} ch"),
+                    }
+                ),
+                (None, None) => String::new(),
+            };
             let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);
             self.text.draw(
                 &self.queue,

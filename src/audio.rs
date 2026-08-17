@@ -37,6 +37,31 @@ pub struct Waveform {
     pub bucket_seconds: f64,
 }
 
+/// Give a decoded frame the channel layout its decoder implies, when the codec
+/// did not state one.
+///
+/// PCM decoders leave a frame's layout unset, and `swr_convert_frame` compares
+/// the frame's own layout against the one its context was built with — so
+/// without this a WAV resamples to nothing and imports as silence, while an AAC
+/// track (which always carries a layout) works. It is the difference between
+/// importing a music bed and importing five seconds of nothing.
+fn ensure_frame_layout(frame: &mut ffmpeg::frame::Audio, layout: ffmpeg::ChannelLayout) {
+    if frame.channel_layout().bits() == 0 {
+        frame.set_channel_layout(layout);
+    }
+}
+
+/// The layout a decoder means when it reports none: the default arrangement for
+/// however many channels it has.
+fn decoder_layout(decoder: &ffmpeg::decoder::Audio) -> ffmpeg::ChannelLayout {
+    let l = decoder.channel_layout();
+    if l.bits() != 0 {
+        l
+    } else {
+        ffmpeg::ChannelLayout::default(decoder.channels() as i32)
+    }
+}
+
 /// Streaming audio decoder for one source file. Mirrors `VideoStream`: opens its
 /// own ffmpeg `Input` so seeks are independent of the video side, resamples into
 /// interleaved stereo f32 at `SAMPLE_RATE`, and keeps a small pending buffer so
@@ -45,6 +70,8 @@ pub struct AudioStream {
     ictx: ffmpeg::format::context::Input,
     decoder: ffmpeg::decoder::Audio,
     resampler: ffmpeg::software::resampling::Context,
+    /// What the decoder's frames are laid out as, for [`ensure_frame_layout`].
+    in_layout: ffmpeg::ChannelLayout,
     stream_index: usize,
     time_base_seconds: f64,
     duration_seconds: f64,
@@ -52,6 +79,11 @@ pub struct AudioStream {
     /// Timeline time of the next sample to be returned by `read`.
     position: f64,
     eof: bool,
+    /// The file's own rate and channel count, kept for the media pool to show.
+    /// Everything downstream of the resampler is [`SAMPLE_RATE`] stereo, so
+    /// these are the only place the source's real format survives.
+    src_rate: u32,
+    src_channels: u16,
 }
 
 impl AudioStream {
@@ -82,14 +114,7 @@ impl AudioStream {
         let ctx = ffmpeg::codec::context::Context::from_parameters(parameters)?;
         let decoder = ctx.decoder().audio()?;
 
-        let in_layout = {
-            let l = decoder.channel_layout();
-            if l.bits() != 0 {
-                l
-            } else {
-                ffmpeg::ChannelLayout::default(decoder.channels() as i32)
-            }
-        };
+        let in_layout = decoder_layout(&decoder);
 
         let resampler = ffmpeg::software::resampling::Context::get(
             decoder.format(),
@@ -101,9 +126,12 @@ impl AudioStream {
         )?;
 
         Ok(Some(Self {
+            src_rate: decoder.rate(),
+            src_channels: decoder.channels(),
             ictx,
             decoder,
             resampler,
+            in_layout,
             stream_index,
             time_base_seconds,
             duration_seconds,
@@ -115,6 +143,14 @@ impl AudioStream {
 
     pub fn duration(&self) -> f64 {
         self.duration_seconds
+    }
+
+    pub fn src_rate(&self) -> u32 {
+        self.src_rate
+    }
+
+    pub fn src_channels(&self) -> u16 {
+        self.src_channels
     }
 
     pub fn position(&self) -> f64 {
@@ -186,6 +222,7 @@ impl AudioStream {
         loop {
             match self.decoder.receive_frame(&mut frame) {
                 Ok(()) => {
+                    ensure_frame_layout(&mut frame, self.in_layout);
                     let pts = frame.pts().unwrap_or(0);
                     let pts_sec = pts as f64 * self.time_base_seconds;
                     let mut resampled = ffmpeg::frame::Audio::empty();
@@ -464,14 +501,7 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
     let ctx = ffmpeg::codec::context::Context::from_parameters(params)?;
     let mut decoder = ctx.decoder().audio()?;
     let rate = decoder.rate();
-    let in_layout = {
-        let l = decoder.channel_layout();
-        if l.bits() != 0 {
-            l
-        } else {
-            ffmpeg::ChannelLayout::default(decoder.channels() as i32)
-        }
-    };
+    let in_layout = decoder_layout(&decoder);
     let mut resampler = ffmpeg::software::resampling::Context::get(
         decoder.format(),
         in_layout,
@@ -532,6 +562,7 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
             }
             let mut frame = ffmpeg::frame::Audio::empty();
             while decoder.receive_frame(&mut frame).is_ok() {
+                ensure_frame_layout(&mut frame, in_layout);
                 absorb(
                     &frame,
                     &mut resampler,
@@ -546,6 +577,7 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
     let _ = decoder.send_eof();
     let mut frame = ffmpeg::frame::Audio::empty();
     while decoder.receive_frame(&mut frame).is_ok() {
+        ensure_frame_layout(&mut frame, in_layout);
         absorb(
             &frame,
             &mut resampler,
@@ -562,4 +594,47 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
         peaks,
         bucket_seconds,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decoding a real file is the only way to catch a source the pool accepts
+    /// but cannot actually play. Needs media, so it takes a path from
+    /// `RUVE_TEST_AUDIO` and skips when that is unset rather than carrying a
+    /// fixture in the repo.
+    #[test]
+    fn an_audio_file_opens_with_a_duration_and_samples_to_read() {
+        let Ok(path) = std::env::var("RUVE_TEST_AUDIO") else {
+            return;
+        };
+        let mut stream = AudioStream::open(&path)
+            .expect("open failed")
+            .expect("no audio stream found");
+        assert!(stream.duration() > 0.0, "duration came back as zero");
+
+        let mut buf = vec![0.0f32; 4096];
+        let n = stream.read(&mut buf);
+        assert!(n > 0, "read returned no samples");
+        assert!(
+            buf[..n].iter().any(|s| *s != 0.0),
+            "every sample read was silence"
+        );
+    }
+
+    /// The timeline draws a clip's waveform from this summary, so a source that
+    /// decodes but summarizes to nothing renders as a flat rect.
+    #[test]
+    fn an_audio_file_summarizes_to_a_waveform() {
+        let Ok(path) = std::env::var("RUVE_TEST_AUDIO") else {
+            return;
+        };
+        let wf = build_waveform(&path)
+            .expect("waveform build failed")
+            .expect("no audio stream found");
+        assert!(!wf.peaks.is_empty(), "no peaks");
+        assert!(wf.bucket_seconds > 0.0);
+        assert!(wf.peaks.iter().any(|p| *p > 0.0), "every peak was zero");
+    }
 }

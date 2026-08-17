@@ -277,6 +277,10 @@ impl State {
                 let drop_t = layout.cursor_to_t(cx).max(0.0);
                 let kind = self.timeline.tracks[track_idx].kind;
                 match kind {
+                    // Mirrors the audio lane's rule below: a source with no
+                    // picture has nothing to play on a video track, so the drop
+                    // is a no-op rather than a clip that renders as nothing.
+                    TrackKind::Video if !self.media.has_video(source) => {}
                     TrackKind::Video => {
                         let dur = self.media.duration(source);
                         // Decide up front whether we're auto-pairing audio —

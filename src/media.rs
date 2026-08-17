@@ -8,7 +8,11 @@ use crate::timeline::SourceId;
 use crate::video::VideoStream;
 
 pub struct Source {
-    pub stream: VideoStream,
+    /// `None` for a source with no picture — a music bed or a voiceover.
+    /// The pool holds those too: an edit needs them on its audio tracks, and
+    /// requiring a video stream to import meant a `.wav` could not be brought
+    /// in at all.
+    pub stream: Option<VideoStream>,
     pub audio: Option<AudioStream>,
     pub waveform: Option<Waveform>,
     pub name: String,
@@ -39,12 +43,26 @@ impl MediaPool {
         queue: &wgpu::Queue,
         quads: &QuadRenderer,
     ) -> Result<SourceId, ffmpeg::Error> {
-        let stream = VideoStream::open(path, device, queue, quads)?;
-        // Missing/undecodable audio shouldn't block importing a video-only file.
+        // Neither stream is required on its own — only that the file yields at
+        // least one of them. A video-only file imports without audio, an
+        // audio-only file imports without a picture, and a file that gives
+        // neither is the one that failed to open, so it reports the video
+        // error rather than a vaguer one of its own.
+        let video = VideoStream::open(path, device, queue, quads);
         let audio = match AudioStream::open(path) {
             Ok(a) => a,
             Err(e) => {
                 log::warn!("skipping audio for {path}: {e}");
+                None
+            }
+        };
+        let stream = match video {
+            Ok(v) => Some(v),
+            Err(e) => {
+                if audio.is_none() {
+                    return Err(e);
+                }
+                log::info!("{path} has no video stream; importing as audio only");
                 None
             }
         };
@@ -110,14 +128,28 @@ impl MediaPool {
         self.sources.get_mut(&id)
     }
 
+    /// Longest thing the source has to play. Video length where there is a
+    /// picture, the audio's otherwise — it is what a clip dropped from this
+    /// row is sized to, and an audio-only row that reported zero would drop as
+    /// a clip with no duration at all.
     pub fn duration(&self, id: SourceId) -> f64 {
-        self.sources.get(&id).map_or(0.0, |s| s.stream.duration())
+        self.sources.get(&id).map_or(0.0, |s| {
+            s.stream
+                .as_ref()
+                .map(|v| v.duration())
+                .or_else(|| s.audio.as_ref().map(|a| a.duration()))
+                .unwrap_or(0.0)
+        })
+    }
+
+    pub fn has_video(&self, id: SourceId) -> bool {
+        self.sources
+            .get(&id)
+            .is_some_and(|s| s.stream.is_some())
     }
 
     pub fn has_audio(&self, id: SourceId) -> bool {
-        self.sources
-            .get(&id)
-            .map_or(false, |s| s.audio.is_some())
+        self.sources.get(&id).is_some_and(|s| s.audio.is_some())
     }
 
     pub fn audio_duration(&self, id: SourceId) -> Option<f64> {

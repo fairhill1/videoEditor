@@ -332,8 +332,18 @@ impl State {
     pub(crate) fn open_file_picker(&mut self) {
         // Blocking dialog is fine here: a single-user editor pausing the event
         // loop while the OS picker is up is the expected behavior.
+        // "Media" first so the default selection accepts everything the pool
+        // can hold; the split filters are for narrowing a crowded folder. Audio
+        // belongs in both lists because a source needs only one of the two
+        // streams to import — a music bed has no picture and is still footage
+        // as far as the timeline is concerned.
+        const VIDEO_EXT: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v"];
+        const AUDIO_EXT: &[&str] = &["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus"];
+        let all: Vec<&str> = VIDEO_EXT.iter().chain(AUDIO_EXT).copied().collect();
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("video", &["mp4", "mov", "mkv", "webm", "avi", "m4v"])
+            .add_filter("media", &all)
+            .add_filter("video", VIDEO_EXT)
+            .add_filter("audio", AUDIO_EXT)
             .pick_files()
         else {
             return;

@@ -119,16 +119,17 @@ impl State {
     pub(crate) fn canvas(&self) -> Canvas {
         let reference = self
             .reference_video_source()
-            .and_then(|source| self.media.get(source));
+            .and_then(|source| self.media.get(source))
+            .and_then(|src| src.stream.as_ref());
         let (width, height) = match self.canvas_res {
             Setting::Fixed(size) => size,
             Setting::Auto => reference
-                .map(|src| (src.stream.width(), src.stream.height()))
+                .map(|v| (v.width(), v.height()))
                 .unwrap_or(EXPORT_FALLBACK_SIZE),
         };
         let fps = match self.canvas_fps {
             Setting::Fixed(fps) => fps,
-            Setting::Auto => reference.map(|src| src.stream.frame_rate()).unwrap_or(0.0),
+            Setting::Auto => reference.map(|v| v.frame_rate()).unwrap_or(0.0),
         };
         Canvas {
             // H.264 in YUV420P cannot represent an odd dimension, and a source
