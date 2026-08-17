@@ -161,6 +161,18 @@ impl TextRenderer {
         m.ascent / self.scale
     }
 
+    /// Descent (points below the baseline) at the given size, as a positive
+    /// number — `fontdue` reports it as a negative offset. Paired with
+    /// [`TextRenderer::ascent`] when something has to be drawn behind a line of
+    /// text rather than beside it.
+    pub fn descent(&self, size_px: f32) -> f32 {
+        let m = self
+            .font
+            .horizontal_line_metrics(size_px * self.scale)
+            .expect("font has no horizontal line metrics");
+        -m.descent / self.scale
+    }
+
     /// Visual bounds of a single glyph: `(height, ymin)`, where `height` is the
     /// rasterized bitmap height and `ymin` is the baseline offset such that the
     /// glyph's top sits at `baseline - (ymin + height)`. Use this — not

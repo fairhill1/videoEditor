@@ -148,10 +148,6 @@ impl MediaPool {
             .is_some_and(|s| s.stream.is_some())
     }
 
-    pub fn has_audio(&self, id: SourceId) -> bool {
-        self.sources.get(&id).is_some_and(|s| s.audio.is_some())
-    }
-
     pub fn audio_duration(&self, id: SourceId) -> Option<f64> {
         self.sources
             .get(&id)

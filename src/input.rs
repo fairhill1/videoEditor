@@ -20,6 +20,13 @@ pub(crate) enum DragMode {
     ClipTrimRight { track: usize, idx: usize },
     ClipFade { track: usize, idx: usize, side: FadeSide },
     ClipLevel { track: usize, idx: usize },
+    /// Dragging the timeline's scrollbar. `grab_dx` is how far along the thumb
+    /// the press landed, so the thumb keeps its position under the cursor
+    /// instead of jumping its own left edge there.
+    ///
+    /// Outside the undo system, like [`DragMode::Splitter`]: where you are
+    /// looking is not an edit.
+    Scrollbar { grab_dx: f32 },
     /// Dragging a panel divider. Deliberately outside the undo system: where
     /// the panels sit is a view preference, and burying a real edit one step
     /// further back in the history every time you resize would be maddening.
@@ -135,6 +142,19 @@ impl State {
         }
         if let Some(source) = self.pool_hit(cx, cy) {
             self.drag = DragMode::PoolDrag { source };
+            return;
+        }
+        // The strip along the bottom belongs to the scrollbar whether or not
+        // there is a thumb in it: a press there must not fall through to the
+        // lane above, which `track_at_y` would otherwise hand it to.
+        let layout = self.timeline_layout();
+        if layout.scrollbar_rect().contains([cx, cy]) {
+            if let Some(grab_dx) = layout.scroll_grab_offset(cx) {
+                self.drag = DragMode::Scrollbar { grab_dx };
+                // Applied straight away so a press beside the thumb jumps the
+                // view without waiting for the cursor to move.
+                self.update_drag();
+            }
             return;
         }
         // Clip drags mutate continuously; snapshot once here so the whole
@@ -259,6 +279,10 @@ impl State {
                 };
                 self.set_clip_fade(track, idx, side, len);
             }
+            DragMode::Scrollbar { grab_dx } => {
+                let layout = self.timeline_layout();
+                self.view_start = layout.scroll_x_to_view_start(self.cursor[0] - grab_dx);
+            }
             DragMode::ClipLevel { track, idx } => {
                 let layout = self.timeline_layout();
                 let lane_y = self.lane_top(track, &layout);
@@ -286,16 +310,19 @@ impl State {
                         // Decide up front whether we're auto-pairing audio —
                         // only then do we need a link id, and both sides must
                         // use the same one.
-                        let audio_target = self
-                            .media
-                            .has_audio(source)
-                            .then(|| {
-                                self.timeline
-                                    .tracks
-                                    .iter()
-                                    .position(|t| t.kind == TrackKind::Audio)
-                            })
-                            .flatten();
+                        //
+                        // The lane is chosen for the user rather than pointed
+                        // at, so it has to be one with room: dropping onto A1
+                        // whatever is already there would stack two clips over
+                        // the same instant, and the mixer plays whichever of
+                        // them it reaches first. A fresh track when every
+                        // existing one is busy — the alternative is silently
+                        // burying the audio the drop just asked for.
+                        let audio_target = self.media.audio_duration(source).map(|adur| {
+                            self.timeline
+                                .free_audio_track(drop_t, drop_t + adur)
+                                .unwrap_or_else(|| self.timeline.push_track(TrackKind::Audio))
+                        });
                         let link = audio_target.map(|_| self.timeline.new_link_id());
                         let id = self.timeline.new_clip_id();
                         self.timeline.tracks[track_idx].clips.push(Clip {
@@ -340,6 +367,43 @@ impl State {
         // gesture (click without move, drop that landed nowhere) discards it.
         self.commit_edit();
         self.drag = DragMode::None;
+    }
+
+    /// One wheel notch, or one flick of a touchpad, over the timeline.
+    ///
+    /// Zoom is the unmodified gesture because it is the one you reach for
+    /// constantly and panning has an alternative — the horizontal axis a
+    /// touchpad already reports, and Shift on a wheel that has no such axis.
+    /// Anywhere but the timeline it does nothing: no other panel scrolls yet,
+    /// and a wheel that silently zoomed the timeline from over the media pool
+    /// would read as a bug.
+    pub(crate) fn wheel(&mut self, dx: f32, dy: f32) {
+        if self.cursor[1] < self.timeline_top() {
+            return;
+        }
+        if dx != 0.0 {
+            self.pan_timeline(dx as f64);
+        }
+        if dy != 0.0 {
+            if self.modifiers.shift_key() {
+                // Down pans right, matching the direction the same gesture
+                // scrolls a page.
+                self.pan_timeline(-dy as f64);
+            } else {
+                self.zoom_timeline(dy as f64, self.cursor[0]);
+            }
+        }
+    }
+
+    /// Zoom about the playhead rather than the cursor, for the keyboard: the
+    /// hand on the keys has said nothing about where the pointer is, and the
+    /// playhead is the position the rest of the keymap works around.
+    pub(crate) fn zoom_at_playhead(&mut self, steps: f64) {
+        let layout = self.timeline_layout();
+        let x = layout
+            .t_to_x(self.audio.position())
+            .clamp(layout.clips_x, layout.clips_right());
+        self.zoom_timeline(steps, x);
     }
 
     fn apply_scrub(&mut self) {

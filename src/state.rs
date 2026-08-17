@@ -24,7 +24,7 @@ use crate::canvas::Setting;
 use crate::edit::EditSnapshot;
 use crate::export::{ExportJob, ExportRequest, Outcome, VideoSpec};
 use crate::input::DragMode;
-use crate::layout::Splitter;
+use crate::layout::{Splitter, TimelineHit};
 use crate::media::MediaPool;
 use crate::project;
 use crate::quad::QuadRenderer;
@@ -129,11 +129,20 @@ pub(crate) struct State {
     /// Outcome of the last thing worth reporting — a render, a save, a failed
     /// open — shown until it ages out.
     pub(crate) status: Option<(String, [f32; 4], Instant)>,
-    /// Magnetic snapping while dragging. Toggleable because there is no
-    /// timeline zoom yet: on a long timeline the pixel threshold covers a wide
-    /// time window, and without an escape hatch a clip could not be parked
-    /// near a neighbour without latching onto it.
+    /// Magnetic snapping while dragging. Toggleable because the pixel
+    /// threshold covers a wider stretch of time the further out the timeline
+    /// is zoomed, and without an escape hatch a clip could not be parked near
+    /// a neighbour without latching onto it.
     pub(crate) snap_enabled: bool,
+    /// The timeline's visible window: the time at the left edge of the clip
+    /// area, and the span it covers.
+    ///
+    /// Both are requests rather than results — they are resolved against the
+    /// content by [`crate::layout::resolve_view`] on every read, which is what
+    /// keeps a view that spans the whole timeline spanning it as clips are
+    /// added. `view_dur` starts at infinity, i.e. fit to whatever there is.
+    pub(crate) view_start: f64,
+    pub(crate) view_dur: f64,
     pub(crate) pool_open_btn: Rect,
     pub(crate) modifiers: ModifiersState,
     pub(crate) undo_stack: Vec<EditSnapshot>,
@@ -155,6 +164,13 @@ pub(crate) struct State {
     /// Last string handed to the window manager, so the title is only re-set
     /// when it actually changes rather than every frame.
     pub(crate) title_shown: String,
+}
+
+fn splitter_cursor(splitter: Splitter) -> CursorIcon {
+    match splitter {
+        Splitter::TopBottom => CursorIcon::RowResize,
+        Splitter::PoolPreview => CursorIcon::ColResize,
+    }
 }
 
 impl State {
@@ -241,6 +257,8 @@ impl State {
             export: None,
             status: None,
             snap_enabled: true,
+            view_start: 0.0,
+            view_dur: f64::INFINITY,
             pool_open_btn: Rect::default(),
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
@@ -298,21 +316,60 @@ impl State {
     /// takes priority: once a splitter has been grabbed the cursor keeps its
     /// resize shape even as it runs past the panel's minimum and off the line.
     pub(crate) fn update_cursor_icon(&mut self) {
-        let splitter = match self.drag {
-            DragMode::Splitter(s) => Some(s),
-            DragMode::None => self.splitter_at(self.cursor),
-            // Mid-gesture on something else: leave the pointer alone rather
-            // than flickering to a resize arrow while a clip is dragged past.
-            _ => None,
-        };
-        let icon = match splitter {
-            Some(Splitter::TopBottom) => CursorIcon::RowResize,
-            Some(Splitter::PoolPreview) => CursorIcon::ColResize,
-            None => CursorIcon::Default,
-        };
+        let icon = self.desired_cursor();
         if icon != self.cursor_icon {
             self.window.set_cursor(icon);
             self.cursor_icon = icon;
+        }
+    }
+
+    /// The pointer the gesture in flight owns, or the one whatever is under the
+    /// cursor advertises.
+    ///
+    /// A drag keeps its own pointer until it ends: passing over another handle
+    /// part-way through must not change it, or the pointer would read as the
+    /// drag having let go of one thing and taken hold of another.
+    fn desired_cursor(&self) -> CursorIcon {
+        match self.drag {
+            DragMode::Splitter(s) => splitter_cursor(s),
+            DragMode::ClipLevel { .. } => CursorIcon::RowResize,
+            DragMode::ClipTrimLeft { .. }
+            | DragMode::ClipTrimRight { .. }
+            | DragMode::ClipFade { .. } => CursorIcon::ColResize,
+            DragMode::Scrub
+            | DragMode::ClipMove { .. }
+            | DragMode::PoolDrag { .. }
+            | DragMode::Scrollbar { .. } => CursorIcon::Default,
+            DragMode::None => self.hover_cursor(),
+        }
+    }
+
+    /// What the thing under the cursor can be dragged along, said as a pointer.
+    ///
+    /// Only the handles say anything: a clip body can be dragged too, but it
+    /// covers most of the timeline, and a pointer that changed over all of it
+    /// would stop meaning "there is something small here to grab".
+    fn hover_cursor(&self) -> CursorIcon {
+        // The popup is drawn over the timeline and swallows the click, so it
+        // has to swallow the hover as well.
+        if self.project_menu_open {
+            return CursorIcon::Default;
+        }
+        if let Some(splitter) = self.splitter_at(self.cursor) {
+            return splitter_cursor(splitter);
+        }
+        // The scroll strip sits inside the lane hit test's reach, and a resize
+        // arrow over a scrollbar would be a promise it doesn't keep.
+        if self.timeline_layout().scrollbar_rect().contains(self.cursor) {
+            return CursorIcon::Default;
+        }
+        match self.timeline_hit(self.cursor[0], self.cursor[1]) {
+            // The level line is the one handle that travels vertically.
+            TimelineHit::ClipLevel { .. } => CursorIcon::RowResize,
+            TimelineHit::ClipTrimLeft { .. }
+            | TimelineHit::ClipTrimRight { .. }
+            | TimelineHit::ClipFade { .. } => CursorIcon::ColResize,
+            _ => CursorIcon::Default,
         }
     }
 

@@ -22,8 +22,14 @@ pub(crate) fn nice_tick_interval(pixels_per_sec: f32) -> f64 {
         return 60.0;
     }
     let raw_secs = (TARGET_PX / pixels_per_sec) as f64;
+    // Down to a hundredth of a second: zoomed in far enough to place a cut
+    // between two frames, a ruler whose finest mark is a tenth is one that has
+    // stopped answering the question being asked of it. `format_tick_label`
+    // labels anything under a second to centiseconds, which is exactly the
+    // resolution of the smallest step here.
     let nice = [
-        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+        0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+        600.0, 1800.0, 3600.0,
     ];
     for &v in &nice {
         if v >= raw_secs {

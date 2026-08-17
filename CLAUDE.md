@@ -4,11 +4,12 @@
 
 `src/main.rs` is module declarations and `fn main` only. The UI is one big
 `State` (`src/state.rs`) whose behaviour is split across modules by concern,
-each adding its own `impl State`: `layout` (geometry and hit testing), `input`
-(pointer gestures), `edit` (timeline mutations and undo), `session` (project
-files), `canvas` (project format and its popup), and `render` / `toolbar` /
-`timeline_view` (drawing). New behaviour joins the module that matches its
-concern rather than going back into `main.rs`.
+each adding its own `impl State`: `layout` (geometry, the timeline's visible
+window, and hit testing), `input` (pointer gestures), `edit` (timeline
+mutations and undo), `session` (project files), `canvas` (project format and
+its popup), and `render` / `toolbar` / `timeline_view` (drawing). New behaviour
+joins the module that matches its concern rather than going back into
+`main.rs`.
 
 ## Typography
 

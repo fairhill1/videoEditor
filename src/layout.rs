@@ -1,11 +1,12 @@
 //! Where things are, and what the cursor is over.
 //!
-//! Everything here is geometry: resolving the panel splits, mapping between
-//! time and x, finding the lane under a y, and hit-testing the media pool.
-//! Drawing lives elsewhere and asks these questions rather than answering them
-//! again, which is what keeps a rect you can click on and the rect you can see
-//! from drifting apart.
+//! Everything here is geometry: resolving the panel splits and the timeline's
+//! visible window, mapping between time and x, finding the lane under a y, and
+//! hit-testing the media pool. Drawing lives elsewhere and asks these questions
+//! rather than answering them again, which is what keeps a rect you can click
+//! on and the rect you can see from drifting apart.
 
+use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::*;
 use crate::timeline::{db_to_gain, gain_to_db, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MIN_GAIN_DB};
@@ -37,6 +38,44 @@ pub(crate) fn resolve_split(frac: f32, total: f32, min_before: f32, min_after: f
     (frac * total).round().clamp(min_before, total - min_after)
 }
 
+/// Shortest stretch of timeline the view can be zoomed down to. At a typical
+/// panel width that is a few hundred pixels per second — fine enough to place
+/// a cut between two frames at any sane frame rate, and a floor rather than
+/// nothing at all so a wheel spin can't divide the span to zero.
+pub(crate) const MIN_VIEW_SPAN: f64 = 0.1;
+
+/// How much timeline an empty project pretends to have, so that the mapping
+/// from time to x is finite before the first clip lands.
+pub(crate) const MIN_CONTENT_SPAN: f64 = 1.0;
+
+/// How much of a wheel notch is: one step multiplies or divides the visible
+/// span by this.
+const ZOOM_STEP: f64 = 1.2;
+
+/// How far one notch pans, as a fraction of the visible span. A fraction
+/// rather than a duration so the gesture covers the same visible distance at
+/// every zoom.
+const PAN_STEP_FRAC: f64 = 0.12;
+
+/// Where the playhead lands in the view when playback pages it forward, as a
+/// fraction of the visible span. A little in from the left edge, so the frame
+/// the page happened on is still visible next to what follows it.
+const VIEW_FOLLOW_LEAD: f64 = 0.1;
+
+/// Resolve a requested view window against the content there is to look at.
+///
+/// `want_dur` is what was asked for, not what is shown: any value at or above
+/// the content resolves to the whole of it, which is what makes fit-to-content
+/// both the state the editor opens in (`f64::INFINITY`) and the state zooming
+/// all the way out returns to. Storing the request rather than the result is
+/// what lets a clip added later widen a fitted view instead of scrolling off
+/// the end of it.
+pub(crate) fn resolve_view(want_start: f64, want_dur: f64, content: f64) -> (f64, f64) {
+    let content = content.max(MIN_CONTENT_SPAN);
+    let dur = want_dur.clamp(MIN_VIEW_SPAN, content);
+    (want_start.clamp(0.0, content - dur), dur)
+}
+
 pub(crate) enum TimelineHit {
     None,
     Ruler,
@@ -55,17 +94,103 @@ pub(crate) struct TimelineLayout {
     pub(crate) clips_w: f32,
     pub(crate) center_y: f32,
     pub(crate) lane_h: f32,
-    pub(crate) duration: f64,
+    /// Bottom edge of the panel, which is the window's.
+    pub(crate) bottom: f32,
+    /// The stretch of timeline the clip area shows, resolved by
+    /// [`resolve_view`]. Time maps to x through these two and nothing else, so
+    /// zooming is a change to them rather than to every site that draws.
+    pub(crate) view_start: f64,
+    pub(crate) view_dur: f64,
+    /// How much timeline there is in total — what the view is a window onto,
+    /// and so what the scrollbar measures itself against.
+    pub(crate) content: f64,
 }
 
 impl TimelineLayout {
+    /// Clamped to the clip area, so a drag that runs off either end of the
+    /// panel pins to the edge of what is visible rather than reading a time
+    /// from underneath the track headers.
     pub(crate) fn cursor_to_t(&self, cursor_x: f32) -> f64 {
         let ratio = ((cursor_x - self.clips_x) / self.clips_w).clamp(0.0, 1.0) as f64;
-        ratio * self.duration
+        self.view_start + ratio * self.view_dur
     }
 
     pub(crate) fn t_to_x(&self, t: f64) -> f32 {
-        self.clips_x + (t / self.duration) as f32 * self.clips_w
+        self.clips_x + ((t - self.view_start) / self.view_dur) as f32 * self.clips_w
+    }
+
+    /// Points per second at the current zoom. The one conversion for anything
+    /// authored in pixels that has to act on a duration — a snap threshold, the
+    /// width of a fade.
+    pub(crate) fn px_per_sec(&self) -> f64 {
+        self.clips_w as f64 / self.view_dur
+    }
+
+    pub(crate) fn clips_right(&self) -> f32 {
+        self.clips_x + self.clips_w
+    }
+
+    /// The strip along the bottom of the panel the scrollbar lives in. It
+    /// spans the clip area and nothing else: it measures the same axis those
+    /// clips are laid out on, and starting it under the track headers would
+    /// put its ends somewhere other than the timeline's.
+    pub(crate) fn scrollbar_rect(&self) -> Rect {
+        Rect {
+            x: self.clips_x,
+            y: self.bottom - TIMELINE_SCROLLBAR_H,
+            w: self.clips_w,
+            h: TIMELINE_SCROLLBAR_H,
+        }
+    }
+
+    /// The thumb, or `None` when the view already spans the whole timeline and
+    /// there is nothing to scroll.
+    pub(crate) fn scroll_thumb(&self) -> Option<Rect> {
+        if self.view_dur >= self.content {
+            return None;
+        }
+        let track = self.scrollbar_rect();
+        let w = (track.w * (self.view_dur / self.content) as f32).max(SCROLLBAR_MIN_THUMB_W);
+        let travel = (track.w - w).max(0.0);
+        let along = (self.view_start / (self.content - self.view_dur)).clamp(0.0, 1.0) as f32;
+        Some(Rect {
+            x: track.x + travel * along,
+            y: track.y + SCROLLBAR_THUMB_INSET,
+            w,
+            h: (track.h - SCROLLBAR_THUMB_INSET * 2.0).max(1.0),
+        })
+    }
+
+    /// Where along the thumb a press at `cursor_x` takes hold of it, or `None`
+    /// when there is no thumb to take.
+    ///
+    /// A press beside the thumb grabs it by the middle, which jumps the view to
+    /// the press and leaves the drag that follows tracking the cursor from
+    /// where it already is — one gesture rather than a jump you then have to
+    /// chase.
+    pub(crate) fn scroll_grab_offset(&self, cursor_x: f32) -> Option<f32> {
+        let thumb = self.scroll_thumb()?;
+        Some(if cursor_x >= thumb.x && cursor_x <= thumb.x + thumb.w {
+            cursor_x - thumb.x
+        } else {
+            thumb.w * 0.5
+        })
+    }
+
+    /// The view start a thumb whose left edge is at `thumb_x` means — the
+    /// inverse of [`TimelineLayout::scroll_thumb`], and the only place a drag
+    /// on the scrollbar turns back into a time.
+    pub(crate) fn scroll_x_to_view_start(&self, thumb_x: f32) -> f64 {
+        let Some(thumb) = self.scroll_thumb() else {
+            return 0.0;
+        };
+        let track = self.scrollbar_rect();
+        let travel = track.w - thumb.w;
+        if travel <= 0.0 {
+            return 0.0;
+        }
+        let along = ((thumb_x - track.x) / travel).clamp(0.0, 1.0) as f64;
+        along * (self.content - self.view_dur)
     }
 }
 
@@ -204,15 +329,87 @@ impl State {
         let [w, bottom] = self.logical_size();
         let top = self.timeline_top();
         let tracks_top = top + TIMELINE_TOP_PAD;
-        let tracks_area_h = (bottom - tracks_top).max(0.0);
+        // The scroll strip's height comes off the lanes' share, so the bottom
+        // lane has somewhere to end that isn't underneath the scrollbar.
+        let tracks_area_h = (bottom - tracks_top - TIMELINE_SCROLLBAR_H).max(0.0);
+        let (view_start, view_dur) = self.view_window();
         TimelineLayout {
             top,
+            bottom,
             clips_x: TRACK_HEADER_WIDTH,
             clips_w: (w - TRACK_HEADER_WIDTH).max(1.0),
+            // Snap the centre to a whole point so the lane edges derived from
+            // it don't land on halves, which render blurred.
             center_y: (tracks_top + tracks_area_h * 0.5).round(),
             lane_h: compute_lane_height(tracks_area_h, self.timeline.tracks.len()),
-            duration: self.timeline.duration().max(1.0),
+            view_start,
+            view_dur,
+            content: self.content_duration(),
         }
+    }
+
+    /// How much timeline there is to look at.
+    ///
+    /// A clip being dragged in from the pool counts towards it, so a fitted
+    /// view has already made room for the drop by the time the ghost is drawn:
+    /// without that, dragging a thirty-second clip onto an empty timeline would
+    /// preview it thirty times the width of the panel it is about to land in.
+    pub(crate) fn content_duration(&self) -> f64 {
+        let incoming = match self.drag {
+            DragMode::PoolDrag { source } => self.media.duration(source),
+            _ => 0.0,
+        };
+        self.timeline.duration().max(incoming).max(MIN_CONTENT_SPAN)
+    }
+
+    /// The stretch of timeline currently on screen, as `(start, duration)`.
+    pub(crate) fn view_window(&self) -> (f64, f64) {
+        resolve_view(self.view_start, self.view_dur, self.content_duration())
+    }
+
+    /// Zoom by `steps` wheel notches — positive in — keeping whatever time sits
+    /// under `anchor_x` under it afterwards.
+    pub(crate) fn zoom_timeline(&mut self, steps: f64, anchor_x: f32) {
+        let layout = self.timeline_layout();
+        let content = self.content_duration();
+        let anchor_t = layout.cursor_to_t(anchor_x);
+        let along = ((anchor_x - layout.clips_x) / layout.clips_w).clamp(0.0, 1.0) as f64;
+        let want = layout.view_dur / ZOOM_STEP.powf(steps);
+        // Past the whole timeline the request becomes "everything" rather than
+        // the length that happens to be everything right now — see
+        // [`resolve_view`].
+        self.view_dur = if want >= content { f64::INFINITY } else { want };
+        let (_, dur) = self.view_window();
+        self.view_start = anchor_t - along * dur;
+    }
+
+    /// Slide the view by `notches` of [`PAN_STEP_FRAC`], positive to the right.
+    pub(crate) fn pan_timeline(&mut self, notches: f64) {
+        let (start, dur) = self.view_window();
+        self.view_start = start + notches * PAN_STEP_FRAC * dur;
+    }
+
+    pub(crate) fn zoom_timeline_to_fit(&mut self) {
+        self.view_start = 0.0;
+        self.view_dur = f64::INFINITY;
+    }
+
+    /// Keep a playhead that is moving under its own power in view.
+    ///
+    /// Only while playing: a scrub is the user putting the playhead somewhere
+    /// themselves, and scrolling the picture out from under the hand doing it
+    /// would be a fight. The new page starts a little before the playhead
+    /// rather than centred on it, so the view moves once every screenful
+    /// instead of continuously — and so what just played stays on screen.
+    pub(crate) fn follow_playhead(&mut self, t: f64) {
+        if !self.audio.playing() {
+            return;
+        }
+        let (start, dur) = self.view_window();
+        if t >= start && t < start + dur {
+            return;
+        }
+        self.view_start = t - dur * VIEW_FOLLOW_LEAD;
     }
 
     /// Position of a track among the tracks of its own kind — the number in
@@ -441,6 +638,107 @@ mod tests {
         let (x0, x1) = (200.0, 204.0);
         let r = fade_handle_rect(x1, x0, x1, LANE_Y);
         assert_eq!(r.x, x0);
+    }
+
+    fn view(start: f64, dur: f64) -> TimelineLayout {
+        TimelineLayout {
+            top: 0.0,
+            clips_x: 48.0,
+            clips_w: 1000.0,
+            center_y: 400.0,
+            lane_h: LANE_H,
+            bottom: 800.0,
+            view_start: start,
+            view_dur: dur,
+            content: 100.0,
+        }
+    }
+
+    #[test]
+    fn a_time_maps_to_the_x_it_reads_back_from() {
+        let l = view(30.0, 20.0);
+        for t in [30.0, 35.0, 42.5, 50.0] {
+            let back = l.cursor_to_t(l.t_to_x(t));
+            assert!((back - t).abs() < 1e-6, "{t} came back as {back}");
+        }
+        // The window's ends are the panel's ends.
+        assert_eq!(l.t_to_x(30.0), l.clips_x);
+        assert_eq!(l.t_to_x(50.0), l.clips_right());
+    }
+
+    #[test]
+    fn a_cursor_off_the_panel_reads_as_the_edge_it_ran_off() {
+        let l = view(30.0, 20.0);
+        assert_eq!(l.cursor_to_t(0.0), 30.0);
+        assert_eq!(l.cursor_to_t(9_999.0), 50.0);
+    }
+
+    #[test]
+    fn zoom_is_what_the_pixel_threshold_converts_through() {
+        assert_eq!(view(0.0, 100.0).px_per_sec(), 10.0);
+        assert_eq!(view(0.0, 10.0).px_per_sec(), 100.0);
+    }
+
+    /// The default `view_dur` is infinity, and what makes it mean "fit" is
+    /// that it resolves to whatever content there is at the time.
+    #[test]
+    fn an_unzoomed_view_spans_the_content_however_long_it_grows() {
+        assert_eq!(resolve_view(0.0, f64::INFINITY, 12.0), (0.0, 12.0));
+        assert_eq!(resolve_view(0.0, f64::INFINITY, 3600.0), (0.0, 3600.0));
+        // And an empty timeline still has a finite mapping to divide by.
+        assert_eq!(resolve_view(0.0, f64::INFINITY, 0.0), (0.0, MIN_CONTENT_SPAN));
+    }
+
+    #[test]
+    fn a_view_cannot_be_zoomed_or_scrolled_off_the_content() {
+        assert_eq!(resolve_view(0.0, 1e-9, 60.0).1, MIN_VIEW_SPAN);
+        assert_eq!(resolve_view(0.0, 600.0, 60.0), (0.0, 60.0));
+        // Scrolled past the end, the last window of content is what's left.
+        assert_eq!(resolve_view(1000.0, 10.0, 60.0), (50.0, 10.0));
+        assert_eq!(resolve_view(-5.0, 10.0, 60.0), (0.0, 10.0));
+    }
+
+    #[test]
+    fn a_view_that_shows_everything_has_no_thumb_to_drag() {
+        assert!(view(0.0, 100.0).scroll_thumb().is_none());
+        assert!(view(0.0, 40.0).scroll_thumb().is_some());
+    }
+
+    #[test]
+    fn the_thumb_measures_the_view_against_the_whole_timeline() {
+        let l = view(0.0, 10.0);
+        let (track, thumb) = (l.scrollbar_rect(), l.scroll_thumb().unwrap());
+        // A tenth of the timeline is a tenth of the strip, parked at the start.
+        assert_eq!(thumb.w, track.w * 0.1);
+        assert_eq!(thumb.x, track.x);
+
+        // And at the end of the timeline it ends where the strip does, rather
+        // than running past it.
+        let end = view(90.0, 10.0).scroll_thumb().unwrap();
+        assert_eq!(end.x + end.w, track.x + track.w);
+    }
+
+    #[test]
+    fn dragging_the_thumb_reads_back_the_view_it_was_drawn_for() {
+        for start in [0.0, 12.5, 37.0, 90.0] {
+            let l = view(start, 10.0);
+            let thumb = l.scroll_thumb().unwrap();
+            let back = l.scroll_x_to_view_start(thumb.x);
+            assert!((back - start).abs() < 1e-6, "{start} came back as {back}");
+        }
+    }
+
+    /// Zoomed far enough in the thumb would be a fraction of a point wide, so
+    /// it stops shrinking — and its travel has to take up the difference, or
+    /// the far end of the strip would no longer mean the end of the timeline.
+    #[test]
+    fn a_thumb_pinned_to_its_minimum_still_reaches_both_ends() {
+        let l = view(0.0, MIN_VIEW_SPAN);
+        let (track, thumb) = (l.scrollbar_rect(), l.scroll_thumb().unwrap());
+        assert_eq!(thumb.w, SCROLLBAR_MIN_THUMB_W);
+        assert_eq!(l.scroll_x_to_view_start(track.x), 0.0);
+        let far = l.scroll_x_to_view_start(track.x + track.w - thumb.w);
+        assert!((far - (100.0 - MIN_VIEW_SPAN)).abs() < 1e-9, "{far}");
     }
 
     #[test]

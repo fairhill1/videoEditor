@@ -99,6 +99,8 @@ pub struct QuadRenderer {
 
     quads: Vec<Quad>,
     batches: Vec<Batch>,
+    /// The band [`QuadRenderer::set_clip_x`] is trimming to, if any.
+    clip_x: Option<[f32; 2]>,
 }
 
 impl QuadRenderer {
@@ -253,6 +255,7 @@ impl QuadRenderer {
             capacity: INITIAL_CAPACITY,
             quads: Vec::new(),
             batches: Vec::new(),
+            clip_x: None,
         }
     }
 
@@ -278,6 +281,49 @@ impl QuadRenderer {
     pub fn clear(&mut self) {
         self.quads.clear();
         self.batches.clear();
+        self.clip_x = None;
+    }
+
+    /// Trim everything pushed from here until [`QuadRenderer::clear_clip_x`]
+    /// to the horizontal band `[x0, x1)`.
+    ///
+    /// A panel that can be scrolled sets the band once and goes on drawing in
+    /// its own unclipped coordinates, rather than every rect, waveform column
+    /// and glyph inside it learning where the panel's edge is. The trim is
+    /// exact for textured quads too: uv interpolates linearly across a quad, so
+    /// cutting the same fraction off both shows the same fraction of the
+    /// bitmap — a glyph at the edge is half a letter, not a squashed one.
+    pub fn set_clip_x(&mut self, x0: f32, x1: f32) {
+        self.clip_x = Some([x0, x1]);
+    }
+
+    pub fn clear_clip_x(&mut self) {
+        self.clip_x = None;
+    }
+
+    /// `quad` cut down to the active band, or `None` if the band excludes it.
+    ///
+    /// Zero-width quads pass through untouched: they draw nothing either way,
+    /// and dividing by their width to rescale uv would not.
+    fn clipped(&self, mut quad: Quad) -> Option<Quad> {
+        let Some([x0, x1]) = self.clip_x else {
+            return Some(quad);
+        };
+        let (left, w) = (quad.pos[0], quad.size[0]);
+        if w <= 0.0 {
+            return Some(quad);
+        }
+        let right = left + w;
+        if right <= x0 || left >= x1 {
+            return None;
+        }
+        let (new_left, new_right) = (left.max(x0), right.min(x1));
+        let (u0, u1) = (quad.uv[0], quad.uv[2]);
+        quad.uv[0] = u0 + (u1 - u0) * (new_left - left) / w;
+        quad.uv[2] = u1 - (u1 - u0) * (right - new_right) / w;
+        quad.pos[0] = new_left;
+        quad.size[0] = new_right - new_left;
+        Some(quad)
     }
 
     pub fn push(&mut self, quad: Quad) {
@@ -285,6 +331,9 @@ impl QuadRenderer {
     }
 
     pub fn push_with(&mut self, quad: Quad, texture: Option<&Texture>) {
+        let Some(quad) = self.clipped(quad) else {
+            return;
+        };
         let target = match texture {
             Some(t) => &t.bind_group,
             None => &self.white.bind_group,

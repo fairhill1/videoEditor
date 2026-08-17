@@ -142,6 +142,9 @@ impl State {
         ));
 
         let canvas = self.draw_preview(media_w, preview_w, preview_h, t);
+        // Before the timeline is drawn, so a page forward lands in this frame
+        // rather than leaving the playhead off the edge for one.
+        self.follow_playhead(t);
         self.draw_timeline_panel(w, h, top_h, t);
         self.draw_media_pool_list(media_w, top_h);
         self.draw_panel_labels(w, media_w);

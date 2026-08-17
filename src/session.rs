@@ -262,6 +262,9 @@ impl State {
     /// restores clips referencing sources this one has never imported.
     fn reset_session_state(&mut self) {
         self.selected = None;
+        // Back to fit: a zoom into the middle of the old project would leave
+        // the new one showing an empty stretch of a timeline it doesn't have.
+        self.zoom_timeline_to_fit();
         self.drag = DragMode::None;
         self.last_playing_source = None;
         self.undo_stack.clear();

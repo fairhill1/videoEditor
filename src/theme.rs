@@ -58,7 +58,8 @@ pub(crate) const PREVIEW_MIN_W: f32 = 340.0;
 pub(crate) const TOP_MIN_H: f32 = TRANSPORT_BAR_H + 60.0;
 /// Toolbar, ruler and one lane at its minimum height — below this the timeline
 /// stops being a timeline.
-pub(crate) const TIMELINE_MIN_H: f32 = TIMELINE_TOP_PAD + TIMELINE_RULER_H + TRACK_LANE_MIN_H;
+pub(crate) const TIMELINE_MIN_H: f32 =
+    TIMELINE_TOP_PAD + TIMELINE_RULER_H + TRACK_LANE_MIN_H + TIMELINE_SCROLLBAR_H;
 
 // Surface elevation scale (sRGB), darkest first. Steps widen as they climb:
 // down near black a small numeric difference is imperceptible, so the low tiers
@@ -114,8 +115,25 @@ pub(crate) const CLIP_SELECTED_LIFT: f32 = 0.14;
 // How close a dragged edge must come to latch onto a snap target. In pixels
 // rather than seconds so the pull feels the same however long the timeline is.
 pub(crate) const SNAP_PX: f32 = 8.0;
+/// Floor on the width of the drag ghost, so a clip that is a sliver at the
+/// current zoom is still something you can see following the cursor.
+pub(crate) const GHOST_MIN_W: f32 = 40.0;
 pub(crate) const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
 pub(crate) const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+/// Plate laid under a label that sits over a clip's contents.
+///
+/// The clip fills are chosen so `CLIP_LABEL_COLOR` clears WCAG AA against
+/// them, but a waveform peak is lighter than any of them and a tall one puts
+/// near-white text on near-white peaks. Black at this alpha takes the
+/// brightest peak down to around 0.30 relative luminance, which holds the
+/// contrast the fills were picked for wherever the label lands.
+pub(crate) const CLIP_LABEL_PLATE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.66];
+/// Breathing room around the text inside its plate. The vertical pad is the
+/// smaller of the two because the plate's height already comes from the font's
+/// ascent and descent rather than from the glyphs the label happens to use, so
+/// it clears a lowercase word by that much on its own.
+pub(crate) const CLIP_LABEL_PLATE_PAD_X: f32 = 3.0;
+pub(crate) const CLIP_LABEL_PLATE_PAD_Y: f32 = 1.0;
 pub(crate) const LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 // Was dim enough that V1/A1 were a squint to read; a track's identity should be
 // legible at a glance, not decorative.
@@ -216,6 +234,28 @@ pub(crate) const TIMELINE_RULER_TICK_COLOR: [f32; 4] = [0.58, 0.58, 0.64, 1.0];
 pub(crate) const TIMELINE_RULER_LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 pub(crate) const TIMELINE_RULER_LABEL_SIZE: f32 = TYPE_SM;
 pub(crate) const TIMELINE_RULER_TICK_H: f32 = 6.0;
+
+// The scroll strip along the bottom of the timeline. Its height is reserved
+// whether or not there is anything to scroll: a strip that appeared on the
+// first zoom would shove every lane up a few points as it did.
+pub(crate) const TIMELINE_SCROLLBAR_H: f32 = 12.0;
+pub(crate) const SCROLLBAR_TRACK_COLOR: [f32; 4] = SURFACE_LANE;
+pub(crate) const SCROLLBAR_THUMB_COLOR: [f32; 4] = [0.38, 0.38, 0.44, 1.0];
+/// Lit on hover, because the thumb is small and its well is the same colour as
+/// the lanes above it: without this, the only way to find out it can be
+/// grabbed is to try.
+pub(crate) const SCROLLBAR_THUMB_HOVER_COLOR: [f32; 4] = [0.50, 0.50, 0.58, 1.0];
+/// Lit while it is being dragged, for the same reason the splitters are: past
+/// the end of its travel the thumb stops following the cursor, and this is what
+/// says the drag is still live rather than dropped.
+pub(crate) const SCROLLBAR_THUMB_ACTIVE_COLOR: [f32; 4] = [0.62, 0.62, 0.70, 1.0];
+/// Inset all round, so the thumb reads as sitting in the strip rather than
+/// being it.
+pub(crate) const SCROLLBAR_THUMB_INSET: f32 = 2.0;
+/// A thumb narrower than this is one you cannot catch. Past that point it stops
+/// shrinking and its travel takes up the difference instead, which costs a
+/// little precision at extreme zoom and keeps the control usable.
+pub(crate) const SCROLLBAR_MIN_THUMB_W: f32 = 24.0;
 
 // Media pool list layout.
 /// Below the MEDIA POOL label.

@@ -196,8 +196,9 @@ impl State {
         }
         let layout = self.timeline_layout();
         // The threshold is authored in pixels, so convert with the same
-        // seconds-per-pixel mapping the drag itself uses.
-        let px_per_sec = layout.clips_w as f64 / layout.duration;
+        // seconds-per-pixel mapping the drag itself uses — which means the pull
+        // tightens as you zoom in, exactly as the pixel threshold promises.
+        let px_per_sec = layout.px_per_sec();
         if !px_per_sec.is_finite() || px_per_sec <= 0.0 {
             return delta;
         }

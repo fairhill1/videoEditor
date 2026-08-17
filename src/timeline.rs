@@ -274,6 +274,33 @@ impl Timeline {
         self.next_link = clips().filter_map(|c| c.link.map(|l| l + 1)).max().unwrap_or(0);
     }
 
+    /// The first audio track with nothing occupying `[start, end)`, or `None`
+    /// when every one of them is busy there.
+    ///
+    /// Auto-pairing a video drop places the audio half for you, and placing it
+    /// on A1 regardless would bury it under whatever was already there: two
+    /// clips over the same instant on one track, of which the mixer plays
+    /// whichever it happens to find first.
+    pub fn free_audio_track(&self, start: f64, end: f64) -> Option<usize> {
+        self.tracks.iter().position(|track| {
+            track.kind == TrackKind::Audio
+                && !track
+                    .clips
+                    .iter()
+                    .any(|c| c.timeline_start < end && c.timeline_end() > start)
+        })
+    }
+
+    /// Append an empty track of `kind`, and return its index.
+    ///
+    /// Position in the vector is only an ordering within the kind — see
+    /// [`crate::State::visual_index`] — so a track added here becomes the
+    /// bottom lane of its half of the timeline.
+    pub fn push_track(&mut self, kind: TrackKind) -> usize {
+        self.tracks.push(Track::new(kind));
+        self.tracks.len() - 1
+    }
+
     pub fn remove_source(&mut self, source: SourceId) {
         for track in &mut self.tracks {
             track.clips.retain(|c| c.source != source);
@@ -711,6 +738,32 @@ mod tests {
         // Silence has no decibel value; the floor stands in for it so the
         // level line has somewhere to put a muted clip.
         assert_eq!(gain_to_db(0.0), MIN_GAIN_DB);
+    }
+
+    #[test]
+    fn a_paired_drop_looks_past_an_audio_track_that_is_busy() {
+        let mut tl = timeline_with(vec![]);
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        tl.tracks[1].clips = vec![clip(0.0, 10.0)];
+
+        // A1 is busy where the drop lands, so the audio goes to A2.
+        assert_eq!(tl.free_audio_track(4.0, 6.0), Some(2));
+        // Clear of it, A1 is free again — abutting doesn't count as overlap.
+        assert_eq!(tl.free_audio_track(10.0, 20.0), Some(1));
+    }
+
+    #[test]
+    fn every_audio_track_being_busy_is_answered_with_none() {
+        let mut tl = timeline_with(vec![]);
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        tl.tracks[1].clips = vec![clip(0.0, 10.0)];
+        assert_eq!(tl.free_audio_track(1.0, 2.0), None);
+
+        // Which is what a drop turns into a new lane at the bottom of the
+        // audio half.
+        assert_eq!(tl.push_track(TrackKind::Audio), 2);
+        assert_eq!(tl.free_audio_track(1.0, 2.0), Some(2));
     }
 
     #[test]
