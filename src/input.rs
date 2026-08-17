@@ -397,6 +397,21 @@ impl State {
     }
 
     pub(crate) fn toggle_playback(&mut self) {
+        // Starting from the end replays from the top rather than doing nothing.
+        // The render loop parks the playhead exactly on the duration when
+        // playback reaches it, so a bare toggle would set `playing` and be
+        // stopped again on the very next frame — a keypress that looks broken.
+        //
+        // Exact compare rather than a tolerance: that parking is the only thing
+        // that puts the playhead at the end, and it assigns the duration
+        // itself. A pause a hair short of the end is a real position, and
+        // resuming from it is what the user asked for.
+        if !self.audio.playing() {
+            let duration = self.timeline.duration();
+            if duration > 0.0 && self.audio.position() >= duration {
+                self.audio.set_position(0.0);
+            }
+        }
         self.audio.toggle();
     }
 }
