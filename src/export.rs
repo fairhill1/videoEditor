@@ -570,8 +570,11 @@ impl AudioRender {
         }
     }
 
-    /// Sum every audio clip live at `t` into `self.mixed`. Same rule as live
-    /// playback: tracks add together, so A1 and A2 both land in the render.
+    /// Sum every audio clip live at `t` into `self.mixed`, each at its own
+    /// level. Same rules as live playback: tracks add together so A1 and A2
+    /// both land in the render, and each clip's gain and fades ride on top —
+    /// the whole reason both mixers call [`Clip::level`] rather than each
+    /// deciding what a fade means.
     fn mix(&mut self, t: f64, frames: usize, tracks: &[(TrackKind, Vec<Clip>)]) {
         let wanted = frames * CHANNELS;
         self.mixed[..wanted].fill(0.0);
@@ -593,8 +596,10 @@ impl AudioRender {
             // `scratch` holding the previous block's samples.
             self.scratch[..wanted].fill(0.0);
             let n = stream.read(&mut self.scratch[..wanted]);
+            let dt = 1.0 / SAMPLE_RATE as f64;
             for i in 0..n {
-                self.mixed[i] += self.scratch[i];
+                let level = clip.level(t + (i / CHANNELS) as f64 * dt);
+                self.mixed[i] += self.scratch[i] * level;
             }
         }
     }
@@ -933,7 +938,7 @@ mod tests {
             source_in,
             source_out,
             timeline_start,
-            link: None,
+            ..Clip::default()
         };
         // Two clips butted together, the second starting part-way into its
         // source: that combination exercises the mid-clip seek and the

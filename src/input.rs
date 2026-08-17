@@ -5,10 +5,10 @@
 //! is over into a model change and hand it to `edit.rs`; the arithmetic of the
 //! change itself lives there.
 
-use crate::layout::{resolve_split, Splitter, TimelineHit};
+use crate::layout::{resolve_split, y_to_gain, Splitter, TimelineHit};
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{Clip, SourceId, TrackKind};
+use crate::timeline::{Clip, FadeSide, SourceId, TrackKind};
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum DragMode {
@@ -18,6 +18,8 @@ pub(crate) enum DragMode {
     ClipMove { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
+    ClipFade { track: usize, idx: usize, side: FadeSide },
+    ClipLevel { track: usize, idx: usize },
     /// Dragging a panel divider. Deliberately outside the undo system: where
     /// the panels sit is a view preference, and burying a real edit one step
     /// further back in the history every time you resize would be maddening.
@@ -158,6 +160,17 @@ impl State {
                 self.begin_edit();
                 self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
             }
+            TimelineHit::ClipFade { track, idx, side } => {
+                self.select_clip_at(track, idx);
+                self.begin_edit();
+                self.drag = DragMode::ClipFade { track, idx, side };
+            }
+            // Only reachable on a clip that is already selected — see the note
+            // in `timeline_hit` — so there is no selection to make here.
+            TimelineHit::ClipLevel { track, idx } => {
+                self.begin_edit();
+                self.drag = DragMode::ClipLevel { track, idx };
+            }
             TimelineHit::Lane | TimelineHit::Ruler => {
                 self.selected = None;
                 self.drag = DragMode::Scrub;
@@ -233,6 +246,25 @@ impl State {
                 let desired_delta = cursor_t - current_end;
                 self.apply_trim_right_delta(track, idx, desired_delta);
             }
+            // A fade is set by where its far end lands, not by how far the
+            // cursor has moved: grabbing the handle anywhere within its box and
+            // dragging puts the end of the ramp under the cursor.
+            DragMode::ClipFade { track, idx, side } => {
+                let layout = self.timeline_layout();
+                let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                let clip = self.timeline.tracks[track].clips[idx];
+                let len = match side {
+                    FadeSide::In => cursor_t - clip.timeline_start,
+                    FadeSide::Out => clip.timeline_end() - cursor_t,
+                };
+                self.set_clip_fade(track, idx, side, len);
+            }
+            DragMode::ClipLevel { track, idx } => {
+                let layout = self.timeline_layout();
+                let lane_y = self.lane_top(track, &layout);
+                let gain = y_to_gain(lane_y, layout.lane_h, self.cursor[1]);
+                self.set_clip_gain(track, idx, gain);
+            }
         }
     }
 
@@ -265,10 +297,10 @@ impl State {
                         self.timeline.tracks[track_idx].clips.push(Clip {
                             id,
                             source,
-                            source_in: 0.0,
                             source_out: dur,
                             timeline_start: drop_t,
                             link,
+                            ..Clip::default()
                         });
                         if let Some(audio_idx) = audio_target {
                             let adur = self.media.audio_duration(source).unwrap_or(dur);
@@ -276,10 +308,10 @@ impl State {
                             self.timeline.tracks[audio_idx].clips.push(Clip {
                                 id,
                                 source,
-                                source_in: 0.0,
                                 source_out: adur,
                                 timeline_start: drop_t,
                                 link,
+                                ..Clip::default()
                             });
                         }
                     }
@@ -289,10 +321,9 @@ impl State {
                             self.timeline.tracks[track_idx].clips.push(Clip {
                                 id,
                                 source,
-                                source_in: 0.0,
                                 source_out: adur,
                                 timeline_start: drop_t,
-                                link: None,
+                                ..Clip::default()
                             });
                         }
                         // Dropping a video-only source on an audio lane is a

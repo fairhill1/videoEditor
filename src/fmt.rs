@@ -2,6 +2,7 @@
 //! frame rates, and text clamped to the width it has to fit in.
 
 use crate::text::TextRenderer;
+use crate::timeline::MIN_GAIN_DB;
 
 pub(crate) fn format_timecode(t: f64) -> String {
     let total_ms = (t.max(0.0) * 1000.0) as u64;
@@ -63,6 +64,17 @@ pub(crate) fn fmt_fps(fps: f64) -> String {
         let s = format!("{fps:.3}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// A clip's level, the way a mixer writes it: signed, one decimal, and `-inf`
+/// at the bottom of the range rather than the finite floor the model actually
+/// stores — a level line pushed all the way down means "off", and printing
+/// `-40.0` there would read as a value you could still go under.
+pub(crate) fn fmt_db(db: f32) -> String {
+    if db <= MIN_GAIN_DB {
+        return "-\u{221e} dB".to_string();
+    }
+    format!("{db:+.1} dB")
 }
 
 /// Shorten `text` so it fits within `max_w` when rendered at `size_px`,

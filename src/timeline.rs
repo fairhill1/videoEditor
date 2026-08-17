@@ -6,6 +6,39 @@ use serde::{Deserialize, Serialize};
 /// the next jump.
 const EDIT_POINT_EPS: f64 = 1e-6;
 
+/// The level line's range, in decibels. The bottom is a floor rather than true
+/// silence: it keeps the dB mapping finite, and a clip you want actually silent
+/// is one you fade out or delete. The top is the usual +6 of headroom — enough
+/// to lift a quiet take, not enough to invite clipping the mix.
+pub const MIN_GAIN_DB: f32 = -40.0;
+pub const MAX_GAIN_DB: f32 = 6.0;
+
+pub fn db_to_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
+}
+
+/// Inverse of [`db_to_gain`], floored at [`MIN_GAIN_DB`] so a zero gain maps to
+/// the bottom of the line rather than to negative infinity.
+pub fn gain_to_db(gain: f32) -> f32 {
+    if gain <= 0.0 {
+        return MIN_GAIN_DB;
+    }
+    (20.0 * gain.log10()).max(MIN_GAIN_DB)
+}
+
+/// Which end of a clip a fade hangs off.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FadeSide {
+    In,
+    Out,
+}
+
+/// Serde's default for [`Clip::gain`]. A file written before clips had a level
+/// has to load at unity, not at silence.
+fn unity_gain() -> f32 {
+    1.0
+}
+
 /// `transparent` so a project file writes `source: 0` rather than
 /// `source: SourceId(0)` — the wrapper earns its keep in the type system, not
 /// on disk.
@@ -34,6 +67,40 @@ pub struct Clip {
     /// auto-pairing a video drop with its audio sibling; propagated across
     /// splits so each pair of halves stays linked to the correct counterpart.
     pub link: Option<u32>,
+    /// Linear level multiplier for this clip's audio; 1.0 is unity.
+    ///
+    /// Linear rather than decibels because that is what the mixer multiplies
+    /// by, and a value that has to be converted on every sample is the wrong
+    /// one to store. The UI converts the other way, once per drag.
+    #[serde(default = "unity_gain")]
+    pub gain: f32,
+    /// Fade lengths in seconds, measured inward from each end of the clip.
+    ///
+    /// Durations rather than absolute times, so trimming the head of a clip
+    /// leaves the fade on the head rather than stranding it mid-clip.
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+}
+
+/// The neutral clip: unity level, no fades. Construction sites spread `..` over
+/// this rather than restating three zeroes each, so a clip that gains another
+/// parameter later doesn't have to touch every site that makes one.
+impl Default for Clip {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            source: SourceId(0),
+            source_in: 0.0,
+            source_out: 0.0,
+            timeline_start: 0.0,
+            link: None,
+            gain: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        }
+    }
 }
 
 impl Clip {
@@ -51,6 +118,45 @@ impl Clip {
 
     pub fn source_time(&self, t: f64) -> f64 {
         self.source_in + (t - self.timeline_start).max(0.0)
+    }
+
+    /// Level multiplier at timeline time `t` — the clip's gain, tapered by
+    /// whichever fade `t` falls inside.
+    ///
+    /// The taper is linear in amplitude, which is what an editor's fade handle
+    /// has always meant; a curve would be a second decision on top of the
+    /// length and belongs to a fade that can be told which shape it is.
+    ///
+    /// Both fades multiply, so a clip short enough to hold overlapping ones
+    /// still reaches zero at each end instead of jumping. Progress is clamped
+    /// rather than windowed: the mixer resolves which clip is live once per
+    /// chunk and can run a few milliseconds past a boundary, and holding the
+    /// end level there beats letting the ramp carry on through zero.
+    pub fn level(&self, t: f64) -> f32 {
+        if self.fade_in <= 0.0 && self.fade_out <= 0.0 {
+            return self.gain;
+        }
+        let mut f = 1.0_f64;
+        if self.fade_in > 0.0 {
+            f *= ((t - self.timeline_start) / self.fade_in).clamp(0.0, 1.0);
+        }
+        if self.fade_out > 0.0 {
+            f *= ((self.timeline_end() - t) / self.fade_out).clamp(0.0, 1.0);
+        }
+        self.gain * f as f32
+    }
+
+    /// Pull the fades back inside the clip, and off each other.
+    ///
+    /// Called after anything that changes a clip's length. A trim that
+    /// shortens a clip past its own fade would otherwise leave a ramp that
+    /// never finishes — audible as a clip that plays entirely under its
+    /// intended level. The head is clamped first and the tail takes what is
+    /// left, so shrinking a clip eats the fade-out before the fade-in.
+    pub fn clamp_fades(&mut self) {
+        let dur = self.duration();
+        self.fade_in = self.fade_in.clamp(0.0, dur);
+        self.fade_out = self.fade_out.clamp(0.0, dur - self.fade_in);
     }
 }
 
@@ -268,22 +374,26 @@ impl Timeline {
                 if orig.contains(t) && t > orig.timeline_start {
                     let split_source_t = orig.source_time(t);
                     track.clips[i].source_out = split_source_t;
+                    // Each fade stays with the end it hangs off: the cut is a
+                    // hard one, and inventing a ramp at it would be a decision
+                    // the split never made.
+                    track.clips[i].fade_out = 0.0;
+                    track.clips[i].clamp_fades();
                     let right_link = orig.link.map(|old| relink[&old]);
                     // The left half keeps the original id, so a selection on
                     // the clip you split stays on the part before the cut.
                     let right_id = next_clip;
                     next_clip += 1;
-                    track.clips.insert(
-                        i + 1,
-                        Clip {
-                            id: right_id,
-                            source: orig.source,
-                            source_in: split_source_t,
-                            source_out: orig.source_out,
-                            timeline_start: t,
-                            link: right_link,
-                        },
-                    );
+                    let mut right = Clip {
+                        id: right_id,
+                        source_in: split_source_t,
+                        timeline_start: t,
+                        link: right_link,
+                        fade_in: 0.0,
+                        ..orig
+                    };
+                    right.clamp_fades();
+                    track.clips.insert(i + 1, right);
                     i += 2;
                 } else {
                     i += 1;
@@ -302,12 +412,9 @@ mod tests {
     /// `timeline_with` hands out distinct ones where it matters.
     fn clip(start: f64, dur: f64) -> Clip {
         Clip {
-            id: 0,
-            source: SourceId(0),
-            source_in: 0.0,
             source_out: dur,
             timeline_start: start,
-            link: None,
+            ..Clip::default()
         }
     }
 
@@ -501,6 +608,109 @@ mod tests {
         let mut tl = timeline_with(vec![clip(0.0, 10.0); 5]);
         tl.reseed_counters();
         assert_eq!(tl.new_link_id(), 0);
+    }
+
+    fn assert_level(clip: &Clip, t: f64, want: f32) {
+        let got = clip.level(t);
+        assert!((got - want).abs() < 1e-6, "level at {t}: got {got}, want {want}");
+    }
+
+    #[test]
+    fn a_clip_with_no_fades_plays_at_its_gain() {
+        let c = Clip { gain: 0.5, ..clip(0.0, 10.0) };
+        assert_level(&c, 0.0, 0.5);
+        assert_level(&c, 5.0, 0.5);
+    }
+
+    #[test]
+    fn a_fade_ramps_from_silence_to_the_clip_s_gain() {
+        let c = Clip { gain: 0.5, fade_in: 2.0, ..clip(0.0, 10.0) };
+        assert_level(&c, 0.0, 0.0);
+        assert_level(&c, 1.0, 0.25);
+        assert_level(&c, 2.0, 0.5);
+        // Past the ramp the gain holds rather than continuing to climb.
+        assert_level(&c, 6.0, 0.5);
+    }
+
+    #[test]
+    fn a_fade_out_is_measured_back_from_the_clip_s_end() {
+        // Starting at 5 rather than 0: the fade hangs off the end, so moving
+        // the clip must not move where the ramp begins relative to it.
+        let c = Clip { fade_out: 4.0, ..clip(5.0, 10.0) };
+        assert_level(&c, 10.0, 1.0);
+        assert_level(&c, 13.0, 0.5);
+        assert_level(&c, 15.0, 0.0);
+    }
+
+    /// The mixer resolves which clip is live once per chunk and can ask for a
+    /// level a few milliseconds past the boundary. That must hold the end
+    /// value, not carry the ramp on through zero into negative gain.
+    #[test]
+    fn a_level_asked_for_past_the_clip_holds_rather_than_inverting() {
+        let c = Clip { fade_out: 2.0, ..clip(0.0, 10.0) };
+        assert_level(&c, 10.5, 0.0);
+        assert_level(&c, -0.5, 1.0);
+    }
+
+    #[test]
+    fn overlapping_fades_still_reach_silence_at_both_ends() {
+        let mut c = Clip { fade_in: 8.0, fade_out: 8.0, ..clip(0.0, 10.0) };
+        // Clamping is what keeps them from overlapping in the first place; the
+        // head keeps its length and the tail takes what is left.
+        c.clamp_fades();
+        assert_eq!(c.fade_in, 8.0);
+        assert_eq!(c.fade_out, 2.0);
+        assert_level(&c, 0.0, 0.0);
+        assert_level(&c, 10.0, 0.0);
+    }
+
+    #[test]
+    fn trimming_a_clip_shorter_pulls_its_fades_in() {
+        let mut c = Clip { fade_in: 3.0, fade_out: 3.0, ..clip(0.0, 10.0) };
+        c.source_out = 4.0;
+        c.clamp_fades();
+        assert_eq!(c.fade_in, 3.0);
+        assert_eq!(c.fade_out, 1.0);
+        // A ramp that outlived its clip would leave the whole thing playing
+        // under its intended level; this one still reaches full gain.
+        assert_level(&c, 3.0, 1.0);
+    }
+
+    #[test]
+    fn a_split_leaves_each_fade_on_the_end_it_hangs_off() {
+        let mut tl = timeline_with(vec![Clip {
+            gain: 0.5,
+            fade_in: 1.0,
+            fade_out: 1.0,
+            ..clip(0.0, 10.0)
+        }]);
+        tl.split_at(4.0);
+        let (left, right) = (tl.tracks[0].clips[0], tl.tracks[0].clips[1]);
+        assert_eq!((left.fade_in, left.fade_out), (1.0, 0.0));
+        assert_eq!((right.fade_in, right.fade_out), (0.0, 1.0));
+        // The cut is hard, and both halves keep the level they were set to.
+        assert_eq!((left.gain, right.gain), (0.5, 0.5));
+    }
+
+    /// A fade longer than the half it lands in has to come back inside it, or
+    /// the shorter half plays entirely under level.
+    #[test]
+    fn a_split_pulls_a_fade_inside_the_half_that_keeps_it() {
+        let mut tl = timeline_with(vec![Clip { fade_out: 6.0, ..clip(0.0, 10.0) }]);
+        tl.split_at(8.0);
+        assert_eq!(tl.tracks[0].clips[1].fade_out, 2.0);
+    }
+
+    #[test]
+    fn decibels_round_trip_through_linear_gain() {
+        for db in [-40.0, -12.0, -6.0, 0.0, 6.0] {
+            let back = gain_to_db(db_to_gain(db));
+            assert!((back - db).abs() < 1e-4, "{db} came back as {back}");
+        }
+        assert!((db_to_gain(0.0) - 1.0).abs() < 1e-6);
+        // Silence has no decibel value; the floor stands in for it so the
+        // level line has somewhere to put a muted clip.
+        assert_eq!(gain_to_db(0.0), MIN_GAIN_DB);
     }
 
     #[test]

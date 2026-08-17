@@ -110,6 +110,14 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowRight if shift => state.goto_edit_point(true),
                     KeyCode::ArrowLeft => state.step_frame(-1.0),
                     KeyCode::ArrowRight => state.step_frame(1.0),
+                    // Level nudges repeat for the same reason the arrows do:
+                    // riding a clip down by 6dB should be a held key, not six
+                    // presses. Shift is the fine step, matching the way Shift
+                    // already qualifies the horizontal arrows.
+                    KeyCode::ArrowUp if shift => state.nudge_selected_gain(0.1),
+                    KeyCode::ArrowDown if shift => state.nudge_selected_gain(-0.1),
+                    KeyCode::ArrowUp => state.nudge_selected_gain(1.0),
+                    KeyCode::ArrowDown => state.nudge_selected_gain(-1.0),
                     // Undo/redo repeat too — holding Ctrl+Z to walk back
                     // through history is the expected feel.
                     KeyCode::KeyZ if ctrl && shift => state.redo(),

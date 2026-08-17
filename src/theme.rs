@@ -248,6 +248,34 @@ pub(crate) const POOL_CLOSE_BG_HOVER: [f32; 4] = [0.65, 0.25, 0.25, 0.95];
 pub(crate) const POOL_CLOSE_LABEL_SIZE: f32 = TYPE_LG;
 pub(crate) const POOL_CLOSE_GLYPH_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 
+// Audio clip level and fades.
+//
+// The level line is a rubber band drawn across the clip at the height of its
+// gain; the fade handles are the two boxes at its top corners. Both are drawn
+// over the waveform, so they are lighter than it rather than another shade of
+// the clip fill — a line the same weight as a peak would read as one.
+/// Kept off the clip's own border so the extremes of the range stay grabbable
+/// instead of merging with it.
+pub(crate) const CLIP_LEVEL_INSET: f32 = 5.0;
+pub(crate) const CLIP_LEVEL_LINE_H: f32 = 1.0;
+pub(crate) const CLIP_LEVEL_COLOR: [f32; 4] = [1.0, 0.88, 0.55, 0.55];
+/// The band is live only on the selected clip (see `State::timeline_hit`), so
+/// the selected line is the one drawn as a handle rather than as a readout.
+pub(crate) const CLIP_LEVEL_ACTIVE_COLOR: [f32; 4] = [1.0, 0.82, 0.35, 1.0];
+pub(crate) const CLIP_LEVEL_ACTIVE_H: f32 = 2.0;
+pub(crate) const CLIP_LEVEL_GRAB_PX: f32 = 5.0;
+pub(crate) const CLIP_LEVEL_LABEL_SIZE: f32 = TYPE_SM;
+pub(crate) const CLIP_LEVEL_LABEL_COLOR: [f32; 4] = [1.0, 0.90, 0.70, 1.0];
+pub(crate) const CLIP_LEVEL_LABEL_PAD: f32 = 5.0;
+/// A fade is drawn by shading away the part of the clip it attenuates, so the
+/// wedge grows out of the clip rather than being a line laid over it. Black at
+/// partial alpha, which darkens fill and waveform together.
+pub(crate) const CLIP_FADE_SHADE: [f32; 4] = [0.0, 0.0, 0.0, 0.62];
+pub(crate) const CLIP_FADE_EDGE_COLOR: [f32; 4] = [1.0, 0.88, 0.55, 0.85];
+pub(crate) const CLIP_FADE_EDGE_H: f32 = 1.0;
+pub(crate) const CLIP_FADE_HANDLE_BOX: f32 = 9.0;
+pub(crate) const CLIP_FADE_HANDLE_COLOR: [f32; 4] = [1.0, 0.82, 0.35, 0.85];
+
 // Clip interaction.
 pub(crate) const CLIP_EDGE_GRAB_PX: f32 = 6.0;
 /// The drag ghost is a clip's own fill at reduced alpha. Derived from that fill

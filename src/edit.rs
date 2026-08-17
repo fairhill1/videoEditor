@@ -8,7 +8,10 @@
 use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::SNAP_PX;
-use crate::timeline::{SourceId, TimelineSnapshot, TrackKind};
+use crate::timeline::{
+    db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, MAX_GAIN_DB,
+    MIN_GAIN_DB,
+};
 
 /// Keeps trim from zeroing a clip, in seconds.
 pub(crate) const MIN_CLIP_DURATION: f64 = 0.05;
@@ -245,6 +248,7 @@ impl State {
             let c = &mut self.timeline.tracks[ti].clips[ci];
             c.source_in += delta;
             c.timeline_start += delta;
+            c.clamp_fades();
         }
     }
 
@@ -268,7 +272,48 @@ impl State {
         for (ti, ci) in siblings {
             let c = &mut self.timeline.tracks[ti].clips[ci];
             c.source_out += delta;
+            c.clamp_fades();
         }
+    }
+
+    /// Set a clip's level.
+    ///
+    /// Deliberately not applied to linked siblings, unlike move and trim. A
+    /// link says two clips share a position in time, not a level: the video
+    /// half of a pair has no audio to turn down, and once it does have an
+    /// opacity, that is a different quantity that happens to share a slider
+    /// shape.
+    pub(crate) fn set_clip_gain(&mut self, track: usize, idx: usize, gain: f32) {
+        let clip = &mut self.timeline.tracks[track].clips[idx];
+        clip.gain = gain.clamp(db_to_gain(MIN_GAIN_DB), db_to_gain(MAX_GAIN_DB));
+    }
+
+    /// Set one of a clip's fades, in seconds. Clamped into the clip the same
+    /// way a trim's is — see [`crate::timeline::Clip::clamp_fades`].
+    pub(crate) fn set_clip_fade(&mut self, track: usize, idx: usize, side: FadeSide, len: f64) {
+        let clip = &mut self.timeline.tracks[track].clips[idx];
+        let len = len.max(0.0);
+        match side {
+            FadeSide::In => clip.fade_in = len.min(clip.duration() - clip.fade_out),
+            FadeSide::Out => clip.fade_out = len.min(clip.duration() - clip.fade_in),
+        }
+        clip.clamp_fades();
+    }
+
+    /// Nudge the selected clip's level by `db`, for the keyboard. Steps in
+    /// decibels rather than in the stored linear gain, so one press is the same
+    /// perceived step wherever the level already sits.
+    pub(crate) fn nudge_selected_gain(&mut self, db: f32) {
+        let Some((track, idx)) = self.selected.and_then(|id| self.timeline.find(id)) else {
+            return;
+        };
+        if self.timeline.tracks[track].kind != TrackKind::Audio {
+            return;
+        }
+        let current = gain_to_db(self.timeline.tracks[track].clips[idx].gain);
+        self.begin_edit();
+        self.set_clip_gain(track, idx, db_to_gain(current + db));
+        self.commit_edit();
     }
 
     pub(crate) fn split_at_playhead(&mut self) {

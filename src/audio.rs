@@ -410,7 +410,8 @@ impl AudioEngine {
                 let Some(clip) = track.active_clip(fill_t) else {
                     continue;
                 };
-                let src_t = clip.source_in + (fill_t - clip.timeline_start).max(0.0);
+                let src_t = clip.source_time(fill_t);
+                let clip = *clip;
                 let source_id = clip.source;
                 let Some(src) = media.get_mut(source_id) else {
                     continue;
@@ -426,8 +427,14 @@ impl AudioEngine {
                     *s = 0.0;
                 }
                 let n = astream.read(&mut scratch[..chunk]);
+                // Per sample rather than per chunk: a fade is a ramp, and
+                // holding one value for 21ms of it would step the level in
+                // audible stairs. `level` is a multiply and two clamps for a
+                // fading clip, and a field read for every other one.
+                let dt = 1.0 / SAMPLE_RATE as f64;
                 for i in 0..n {
-                    mix[cursor + i] += scratch[i];
+                    let level = clip.level(fill_t + (i / CHANNELS) as f64 * dt);
+                    mix[cursor + i] += scratch[i] * level;
                 }
             }
             cursor += chunk;

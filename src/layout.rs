@@ -8,7 +8,7 @@
 
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{SourceId, TrackKind};
+use crate::timeline::{db_to_gain, gain_to_db, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MIN_GAIN_DB};
 use crate::ui::Rect;
 
 /// The two panel dividers, each named for what it separates.
@@ -44,6 +44,8 @@ pub(crate) enum TimelineHit {
     ClipBody { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
+    ClipFade { track: usize, idx: usize, side: FadeSide },
+    ClipLevel { track: usize, idx: usize },
 }
 
 #[derive(Copy, Clone)]
@@ -67,14 +69,77 @@ impl TimelineLayout {
     }
 }
 
+/// Top edge of the lane `visual_i` places into, counting within its own kind.
+///
+/// Video stacks upward from the V/A divider and audio downward, each starting
+/// half a gap clear of it. Drawing and hit testing both come through here, so a
+/// lane you can click on is the lane you can see.
+pub(crate) fn lane_y(center_y: f32, lane_h: f32, visual_i: usize, kind: TrackKind) -> f32 {
+    let half_gap = TRACK_LANE_GAP * 0.5;
+    let stride = lane_h + TRACK_LANE_GAP;
+    match kind {
+        TrackKind::Video => center_y - half_gap - lane_h - visual_i as f32 * stride,
+        TrackKind::Audio => center_y + half_gap + visual_i as f32 * stride,
+    }
+}
+
+/// The stretch of a lane the level line travels, as (top, height).
+///
+/// Inset at both ends so the extremes of the range stay clear of the clip's own
+/// border — a line sitting exactly on it would be impossible to tell from it,
+/// and impossible to grab without catching the trim handle instead.
+fn level_band(lane_y: f32, lane_h: f32) -> (f32, f32) {
+    (
+        lane_y + CLIP_LEVEL_INSET,
+        (lane_h - CLIP_LEVEL_INSET * 2.0).max(1.0),
+    )
+}
+
+/// Where a clip's level line sits inside its lane.
+///
+/// Linear in decibels rather than in the stored linear gain, which is what puts
+/// unity near the top of the lane: the range runs from `MIN_GAIN_DB` to
+/// `MAX_GAIN_DB`, and only 6 of those 46 dB are above unity. That matches what
+/// the control is for — attenuating is the common move, and it gets the room.
+pub(crate) fn gain_to_y(lane_y: f32, lane_h: f32, gain: f32) -> f32 {
+    let (top, h) = level_band(lane_y, lane_h);
+    let db = gain_to_db(gain).clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+    top + h * (MAX_GAIN_DB - db) / (MAX_GAIN_DB - MIN_GAIN_DB)
+}
+
+/// Inverse of [`gain_to_y`]. Clamped, so a drag that runs off the lane pins to
+/// the end of the range rather than wrapping past it.
+pub(crate) fn y_to_gain(lane_y: f32, lane_h: f32, y: f32) -> f32 {
+    let (top, h) = level_band(lane_y, lane_h);
+    let frac = ((y - top) / h).clamp(0.0, 1.0);
+    db_to_gain(MAX_GAIN_DB - frac * (MAX_GAIN_DB - MIN_GAIN_DB))
+}
+
+/// The box you grab to drag a fade, given where the fade currently ends.
+///
+/// Centered on that point but never hanging outside the clip, so a fade of zero
+/// puts its handle just inside the clip's corner instead of half over the
+/// neighbour. It only claims the top of the lane: the rest of the clip edge
+/// stays a trim handle, which is the more common gesture and the worse one to
+/// lose.
+pub(crate) fn fade_handle_rect(handle_x: f32, x0: f32, x1: f32, lane_y: f32) -> Rect {
+    let box_w = CLIP_FADE_HANDLE_BOX;
+    let x = (handle_x - box_w * 0.5).clamp(x0, (x1 - box_w).max(x0));
+    Rect {
+        x,
+        y: lane_y,
+        w: box_w,
+        h: box_w,
+    }
+}
+
 /// Top edge of the highest video lane. Video stacks upward from the V/A
 /// divider, so this is where the ruler has to end.
 pub(crate) fn topmost_lane_top(center_y: f32, lane_h: f32, n_video: usize) -> f32 {
-    let half_gap = TRACK_LANE_GAP * 0.5;
     if n_video == 0 {
         center_y
     } else {
-        center_y - half_gap - lane_h * n_video as f32 - (n_video as f32 - 1.0) * TRACK_LANE_GAP
+        lane_y(center_y, lane_h, n_video - 1, TrackKind::Video)
     }
 }
 
@@ -150,6 +215,26 @@ impl State {
         }
     }
 
+    /// Position of a track among the tracks of its own kind — the number in
+    /// its V1/A2 label, and the argument [`lane_y`] wants.
+    pub(crate) fn visual_index(&self, track_idx: usize) -> usize {
+        let kind = self.timeline.tracks[track_idx].kind;
+        self.timeline.tracks[..track_idx]
+            .iter()
+            .filter(|t| t.kind == kind)
+            .count()
+    }
+
+    /// Top edge of a track's lane, in the layout `layout` describes.
+    pub(crate) fn lane_top(&self, track_idx: usize, layout: &TimelineLayout) -> f32 {
+        lane_y(
+            layout.center_y,
+            layout.lane_h,
+            self.visual_index(track_idx),
+            self.timeline.tracks[track_idx].kind,
+        )
+    }
+
     pub(crate) fn n_video_tracks(&self) -> usize {
         self.timeline
             .tracks
@@ -217,9 +302,31 @@ impl State {
         }
         let cursor_t = layout.cursor_to_t(cursor_x);
         let track = &self.timeline.tracks[track_idx];
+        let lane_y = self.lane_top(track_idx, &layout);
+        let has_level = track.kind == TrackKind::Audio;
         for (i, clip) in track.clips.iter().enumerate() {
             let x0 = layout.t_to_x(clip.timeline_start);
             let x1 = layout.t_to_x(clip.timeline_end());
+            // Fade handles beat the trim handles they sit on top of. Each is
+            // one small box in a corner, so a trim keeps the rest of the edge.
+            if has_level {
+                let fade_in_x = layout.t_to_x(clip.timeline_start + clip.fade_in);
+                if fade_handle_rect(fade_in_x, x0, x1, lane_y).contains([cursor_x, cursor_y]) {
+                    return TimelineHit::ClipFade {
+                        track: track_idx,
+                        idx: i,
+                        side: FadeSide::In,
+                    };
+                }
+                let fade_out_x = layout.t_to_x(clip.timeline_end() - clip.fade_out);
+                if fade_handle_rect(fade_out_x, x0, x1, lane_y).contains([cursor_x, cursor_y]) {
+                    return TimelineHit::ClipFade {
+                        track: track_idx,
+                        idx: i,
+                        side: FadeSide::Out,
+                    };
+                }
+            }
             if cursor_x >= x0 - CLIP_EDGE_GRAB_PX && cursor_x <= x0 + CLIP_EDGE_GRAB_PX {
                 return TimelineHit::ClipTrimLeft { track: track_idx, idx: i };
             }
@@ -227,6 +334,18 @@ impl State {
                 return TimelineHit::ClipTrimRight { track: track_idx, idx: i };
             }
             if cursor_x >= x0 && cursor_x <= x1 {
+                // The level line runs the whole width of the clip, so making it
+                // grabbable at rest would cost a band of the clip body on every
+                // clip on the timeline. It goes live once the clip is selected
+                // instead: the press that selects still moves the clip, and the
+                // one after it adjusts the level.
+                let level_y = gain_to_y(lane_y, layout.lane_h, clip.gain);
+                if has_level
+                    && self.selected == Some(clip.id)
+                    && (cursor_y - level_y).abs() <= CLIP_LEVEL_GRAB_PX
+                {
+                    return TimelineHit::ClipLevel { track: track_idx, idx: i };
+                }
                 return TimelineHit::ClipBody {
                     track: track_idx,
                     idx: i,
@@ -264,5 +383,76 @@ impl State {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LANE_Y: f32 = 100.0;
+    const LANE_H: f32 = 60.0;
+
+    #[test]
+    fn a_level_line_lands_where_the_gain_it_was_read_from_puts_it() {
+        for db in [MIN_GAIN_DB, -20.0, -6.0, 0.0, MAX_GAIN_DB] {
+            let gain = db_to_gain(db);
+            let back = y_to_gain(LANE_Y, LANE_H, gain_to_y(LANE_Y, LANE_H, gain));
+            assert!(
+                (gain_to_db(back) - db).abs() < 1e-3,
+                "{db} dB came back as {} dB",
+                gain_to_db(back)
+            );
+        }
+    }
+
+    /// Unity near the top and silence at the bottom, both clear of the clip's
+    /// own border — the inset is what keeps the ends of the range grabbable.
+    #[test]
+    fn the_level_line_runs_top_to_bottom_within_the_inset() {
+        let top = gain_to_y(LANE_Y, LANE_H, db_to_gain(MAX_GAIN_DB));
+        let bottom = gain_to_y(LANE_Y, LANE_H, db_to_gain(MIN_GAIN_DB));
+        assert_eq!(top, LANE_Y + CLIP_LEVEL_INSET);
+        assert_eq!(bottom, LANE_Y + LANE_H - CLIP_LEVEL_INSET);
+        assert!(gain_to_y(LANE_Y, LANE_H, 1.0) < LANE_Y + LANE_H * 0.5);
+    }
+
+    #[test]
+    fn a_drag_off_the_end_of_the_lane_pins_to_the_end_of_the_range() {
+        assert_eq!(y_to_gain(LANE_Y, LANE_H, 0.0), db_to_gain(MAX_GAIN_DB));
+        assert_eq!(y_to_gain(LANE_Y, LANE_H, 10_000.0), db_to_gain(MIN_GAIN_DB));
+    }
+
+    /// A fade of zero would otherwise centre its handle on the clip's edge and
+    /// hang half of it over the neighbour, where the neighbour's own handle is.
+    #[test]
+    fn a_fade_handle_stays_inside_the_clip_it_belongs_to() {
+        let (x0, x1) = (200.0, 300.0);
+        let head = fade_handle_rect(x0, x0, x1, LANE_Y);
+        assert_eq!(head.x, x0);
+        let tail = fade_handle_rect(x1, x0, x1, LANE_Y);
+        assert_eq!(tail.x + tail.w, x1);
+    }
+
+    /// A clip narrower than one handle still gets one, pinned to its start,
+    /// rather than a rect that starts to the right of where it ends.
+    #[test]
+    fn a_clip_narrower_than_a_handle_still_places_one() {
+        let (x0, x1) = (200.0, 204.0);
+        let r = fade_handle_rect(x1, x0, x1, LANE_Y);
+        assert_eq!(r.x, x0);
+    }
+
+    #[test]
+    fn lanes_stack_away_from_the_divider_they_share() {
+        let center = 500.0;
+        let h = 40.0;
+        let v1 = lane_y(center, h, 0, TrackKind::Video);
+        let v2 = lane_y(center, h, 1, TrackKind::Video);
+        let a1 = lane_y(center, h, 0, TrackKind::Audio);
+        assert!(v1 + h < center && a1 > center);
+        assert_eq!(v2 + h + TRACK_LANE_GAP, v1);
+        // The gap at the divider is shared, half to each side.
+        assert_eq!(center - (v1 + h), a1 - center);
     }
 }
