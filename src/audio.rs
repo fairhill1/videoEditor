@@ -62,6 +62,16 @@ fn decoder_layout(decoder: &ffmpeg::decoder::Audio) -> ffmpeg::ChannelLayout {
     }
 }
 
+/// Next stereo frame from the mix buffer, or silence once it has run dry.
+///
+/// A short read is an underrun, not an error: the render thread refills between
+/// frames, and a stall there should cost a gap rather than a stopped stream.
+fn pop_frame(buffer: &mut VecDeque<f32>) -> [f32; CHANNELS] {
+    let l = buffer.pop_front().unwrap_or(0.0);
+    let r = buffer.pop_front().unwrap_or(l);
+    [l, r]
+}
+
 /// Streaming audio decoder for one source file. Mirrors `VideoStream`: opens its
 /// own ffmpeg `Input` so seeks are independent of the video side, resamples into
 /// interleaved stereo f32 at `SAMPLE_RATE`, and keeps a small pending buffer so
@@ -308,26 +318,40 @@ impl AudioEngine {
         }
     }
 
+    /// Prefer a device configuration at our own mix rate.
+    ///
+    /// Everything upstream of the output — the mixer, the clip envelopes, the
+    /// exported file — runs at [`SAMPLE_RATE`], so a device willing to take
+    /// 48kHz needs no conversion at all. Many will even when their default
+    /// config says otherwise, which is why this asks rather than trusting the
+    /// default; the callback only resamples when nothing on offer fits.
+    fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+        let default = device.default_output_config().map_err(|e| e.to_string())?;
+        if default.sample_rate() == SAMPLE_RATE {
+            return Ok(default);
+        }
+        let matched = device
+            .supported_output_configs()
+            .map_err(|e| e.to_string())?
+            .find(|r| {
+                r.sample_format() == default.sample_format()
+                    && r.channels() == default.channels()
+                    && r.min_sample_rate() <= SAMPLE_RATE
+                    && r.max_sample_rate() >= SAMPLE_RATE
+            })
+            .map(|r| r.with_sample_rate(SAMPLE_RATE));
+        Ok(matched.unwrap_or(default))
+    }
+
     fn build_stream(shared: &Arc<Mutex<Shared>>) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| "no default output device".to_string())?;
-        let supported = device
-            .default_output_config()
-            .map_err(|e| e.to_string())?;
+        let supported = Self::pick_output_config(&device)?;
 
         let device_channels = supported.channels() as usize;
         let device_rate = supported.sample_rate();
-
-        // We mix at SAMPLE_RATE; if the device wants a different rate, sample
-        // rate conversion would belong here. For MVP rely on the OS accepting
-        // our rate — it almost always does for 48kHz on modern Linux/Mac/Win.
-        if device_rate != SAMPLE_RATE {
-            log::warn!(
-                "audio device rate {device_rate} != {SAMPLE_RATE}; playback may pitch-shift"
-            );
-        }
 
         if supported.sample_format() != cpal::SampleFormat::F32 {
             return Err(format!(
@@ -336,40 +360,67 @@ impl AudioEngine {
             ));
         }
 
+        // Mix frames consumed per output frame. Exactly 1.0 whenever the device
+        // took our rate, and the interpolation below is then a straight copy —
+        // so the common case pays nothing for the uncommon one being handled.
+        let step = SAMPLE_RATE as f64 / device_rate as f64;
+        if device_rate != SAMPLE_RATE {
+            log::info!(
+                "audio device runs at {device_rate} Hz; resampling the {SAMPLE_RATE} Hz mix into it"
+            );
+        }
+
         let config: cpal::StreamConfig = supported.into();
         let shared_cb = shared.clone();
+        // Resampler state, carried across callbacks: the two mix frames the next
+        // output frame falls between, and how far between them it is. Owned by
+        // the closure rather than by `Shared` because nothing else reads it —
+        // and a seek, which drops the buffer, is welcome to leave it stale: the
+        // cost is one frame of interpolation across the seam.
+        let mut cur = [0.0f32; CHANNELS];
+        let mut nxt = [0.0f32; CHANNELS];
+        let mut frac = 0.0f64;
+        let mut primed = false;
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     let mut shared = shared_cb.lock().unwrap();
-                    if shared.playing {
-                        for frame_slot in out.chunks_mut(device_channels) {
-                            let l = shared.buffer.pop_front().unwrap_or(0.0);
-                            let r = if CHANNELS > 1 {
-                                shared.buffer.pop_front().unwrap_or(l)
-                            } else {
-                                l
-                            };
-                            if !frame_slot.is_empty() {
-                                frame_slot[0] = l;
-                            }
-                            if frame_slot.len() >= 2 {
-                                frame_slot[1] = r;
-                            }
-                            for extra in frame_slot.iter_mut().skip(2) {
-                                *extra = 0.0;
-                            }
+                    if !shared.playing {
+                        out.fill(0.0);
+                        return;
+                    }
+                    for frame_slot in out.chunks_mut(device_channels) {
+                        if !primed {
+                            cur = pop_frame(&mut shared.buffer);
+                            nxt = pop_frame(&mut shared.buffer);
+                            primed = true;
                         }
-                        // Advance by the whole block duration — if we underran
-                        // and wrote silence, time still marched on.
-                        let frames = out.len() / device_channels.max(1);
-                        shared.consume_t += frames as f64 / device_rate as f64;
-                    } else {
-                        for s in out.iter_mut() {
-                            *s = 0.0;
+                        let t = frac as f32;
+                        let l = cur[0] + (nxt[0] - cur[0]) * t;
+                        let r = cur[1] + (nxt[1] - cur[1]) * t;
+                        frac += step;
+                        while frac >= 1.0 {
+                            cur = nxt;
+                            nxt = pop_frame(&mut shared.buffer);
+                            frac -= 1.0;
+                        }
+                        if !frame_slot.is_empty() {
+                            frame_slot[0] = l;
+                        }
+                        if frame_slot.len() >= 2 {
+                            frame_slot[1] = r;
+                        }
+                        for extra in frame_slot.iter_mut().skip(2) {
+                            *extra = 0.0;
                         }
                     }
+                    // Advance by the whole block duration — if we underran and
+                    // wrote silence, time still marched on. Counted in device
+                    // seconds, which is what the listener hears however many
+                    // mix frames went into producing them.
+                    let frames = out.len() / device_channels.max(1);
+                    shared.consume_t += frames as f64 / device_rate as f64;
                 },
                 |err| log::error!("audio stream error: {err}"),
                 None,
