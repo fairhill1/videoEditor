@@ -46,13 +46,6 @@ pub enum FadeSide {
     Out,
 }
 
-/// Serde's default for [`Clip::gain`] and [`Clip::opacity`]. A file written
-/// before clips had a level has to load at unity, not at silence — and one
-/// written before they had an opacity has to load opaque, not invisible.
-fn unity() -> f32 {
-    1.0
-}
-
 /// Where a clip's picture sits on the canvas, relative to the aspect-preserving
 /// fit that used to be the only option.
 ///
@@ -69,8 +62,8 @@ pub struct Transform {
     pub scale: f32,
 }
 
-/// Centred and filling the canvas — what every clip did before it could be
-/// placed, so a project that predates transforms opens unchanged.
+/// Centred and filling the canvas: the neutral placement a clip gets until it
+/// is moved or scaled.
 impl Default for Transform {
     fn default() -> Self {
         Self { x: 0.0, y: 0.0, scale: 1.0 }
@@ -110,15 +103,12 @@ pub struct Clip {
     /// Linear rather than decibels because that is what the mixer multiplies
     /// by, and a value that has to be converted on every sample is the wrong
     /// one to store. The UI converts the other way, once per drag.
-    #[serde(default = "unity")]
     pub gain: f32,
     /// Fade lengths in seconds, measured inward from each end of the clip.
     ///
     /// Durations rather than absolute times, so trimming the head of a clip
     /// leaves the fade on the head rather than stranding it mid-clip.
-    #[serde(default)]
     pub fade_in: f64,
-    #[serde(default)]
     pub fade_out: f64,
     /// How much of this clip's picture reaches the canvas; 1.0 is opaque.
     ///
@@ -129,10 +119,8 @@ pub struct Clip {
     /// not. A clip only ever lives on one kind of track, so only one of the
     /// pair is ever live; the other costs four bytes and keeps the meaning
     /// unambiguous.
-    #[serde(default = "unity")]
     pub opacity: f32,
     /// Where the picture lands on the canvas. See [`Transform`].
-    #[serde(default)]
     pub transform: Transform,
 }
 

@@ -59,7 +59,6 @@ pub struct SourceEntry {
     /// words — so unlike footage, it is carried in the project rather than
     /// referred to from it, and a project file with its titles inside opens the
     /// same wherever it is taken.
-    #[serde(default)]
     pub title: Option<Title>,
 }
 
@@ -212,41 +211,6 @@ mod tests {
         let back = round_trip(&project);
         assert_eq!(back.tracks[0].clips[0].source_in, 1.0 / 3.0);
         assert_eq!(back.tracks[0].clips[0].timeline_start, 0.1 + 0.2);
-    }
-
-    /// A project saved before clips carried a level has to open at unity, not
-    /// at silence — and one saved before they could be placed on the canvas has
-    /// to open filling it, not shrunk into a corner. This is what lets the
-    /// format version stay put: the new fields are additions with defaults, so
-    /// every file this build has ever written still reads.
-    #[test]
-    fn a_clip_saved_without_a_level_loads_at_unity() {
-        let text = r#"(
-            version: 1,
-            canvas: (resolution: Auto, fps: Auto),
-            sources: [(id: 0, path: "a.mp4")],
-            tracks: [(
-                kind: Video,
-                clips: [(
-                    id: 0,
-                    source: 0,
-                    source_in: 0.0,
-                    source_out: 3.0,
-                    timeline_start: 0.0,
-                    link: None,
-                )],
-            )],
-        )"#;
-        let project: Project = ron::from_str(text).unwrap();
-        // The source entry predates titles too, and has to read as footage.
-        assert_eq!(project.sources[0].title, None);
-        let clip = project.tracks[0].clips[0];
-        assert_eq!(clip.gain, 1.0);
-        assert_eq!((clip.fade_in, clip.fade_out), (0.0, 0.0));
-        assert_eq!(clip.level(1.5), 1.0);
-        assert_eq!(clip.opacity, 1.0);
-        assert_eq!(clip.transform, Transform::default());
-        assert_eq!(clip.alpha(1.5), 1.0);
     }
 
     /// The parser has to skip the header we prepend, or every file we write is
