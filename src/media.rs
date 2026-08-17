@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use ffmpeg_next as ffmpeg;
 
 use crate::audio::{self, AudioStream, Waveform};
-use crate::quad::QuadRenderer;
+use crate::quad::{QuadRenderer, Texture};
 use crate::timeline::SourceId;
+use crate::title::{self, Title};
 use crate::video::VideoStream;
 
 pub struct Source {
@@ -18,7 +19,29 @@ pub struct Source {
     pub name: String,
     /// Kept so an export can open its own decoders from the original file
     /// rather than borrowing the ones driving the preview.
+    ///
+    /// Empty for a generated source, which has no file to reopen.
     pub path: String,
+    /// `Some` for a title, whose picture is drawn rather than decoded.
+    pub title: Option<Title>,
+    /// The title's picture, baked for one canvas size and one state of the
+    /// text. Rebuilt when either changes and otherwise reused, so typing into
+    /// a title costs one rasterization per keystroke rather than one per frame.
+    title_texture: Option<Texture>,
+    title_baked: Option<(u64, u32, u32)>,
+    /// Bumped whenever the title changes. Comparing a counter beats comparing
+    /// the text itself, which would mean a string compare on every frame to
+    /// discover that nothing had happened.
+    revision: u64,
+}
+
+impl Source {
+    /// The title's baked picture, if one has been built for the size being
+    /// drawn. `None` for footage, and for a title whose bake has not run yet —
+    /// see [`MediaPool::bake_title`].
+    pub fn title_texture(&self) -> Option<&Texture> {
+        self.title_texture.as_ref()
+    }
 }
 
 pub struct MediaPool {
@@ -94,10 +117,137 @@ impl MediaPool {
                 waveform,
                 name,
                 path: path.to_string(),
+                title: None,
+                title_texture: None,
+                title_baked: None,
+                revision: 0,
             },
         );
         self.order.push(id);
         Ok(id)
+    }
+
+    /// Add a generated title to the pool. Cannot fail — there is no file to
+    /// open, which is rather the point of one.
+    pub fn add_title(&mut self, title: Title) -> SourceId {
+        let id = SourceId(self.next_id);
+        self.next_id += 1;
+        self.sources.insert(
+            id,
+            Source {
+                stream: None,
+                audio: None,
+                waveform: None,
+                name: title.pool_name().to_string(),
+                path: String::new(),
+                title: Some(title),
+                title_texture: None,
+                title_baked: None,
+                revision: 0,
+            },
+        );
+        self.order.push(id);
+        id
+    }
+
+    pub fn title(&self, id: SourceId) -> Option<&Title> {
+        self.sources.get(&id)?.title.as_ref()
+    }
+
+    /// Replace a title's contents, invalidating the picture baked from the old
+    /// ones. The only way to change a title, so a stale bake cannot outlive an
+    /// edit.
+    pub fn set_title(&mut self, id: SourceId, title: Title) {
+        let Some(src) = self.sources.get_mut(&id) else {
+            return;
+        };
+        if src.title.as_ref() == Some(&title) {
+            return;
+        }
+        src.name = title.pool_name().to_string();
+        src.title = Some(title);
+        src.revision += 1;
+    }
+
+    /// Every title in the pool, for the undo history — which has to be able to
+    /// put back what a title said as well as which clips referred to it.
+    pub fn title_snapshot(&self) -> Vec<(SourceId, Title)> {
+        let mut titles: Vec<(SourceId, Title)> = self
+            .sources
+            .iter()
+            .filter_map(|(id, src)| src.title.clone().map(|t| (*id, t)))
+            .collect();
+        // A `HashMap` hands them over in whatever order it likes, and two
+        // snapshots that differ only in that order would read as a real edit.
+        titles.sort_by_key(|(id, _)| id.0);
+        titles
+    }
+
+    pub fn restore_titles(&mut self, titles: &[(SourceId, Title)]) {
+        for (id, title) in titles {
+            self.set_title(*id, title.clone());
+        }
+    }
+
+    /// Make sure `id`'s title has a picture baked at `width x height`, ready
+    /// for the preview to draw.
+    ///
+    /// Split out from drawing because it needs the pool mutably and the GPU
+    /// immutably, which is the one combination the render pass cannot hold
+    /// while it is pushing quads.
+    /// `caret` adds a bar after the last character, for the title being typed
+    /// into. Part of the picture rather than something drawn over it, because
+    /// the text is centred: only the rasterizer knows where the last character
+    /// ended up, and it moves with every keystroke.
+    pub fn bake_title(
+        &mut self,
+        id: SourceId,
+        canvas: (u32, u32),
+        caret: bool,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: &QuadRenderer,
+    ) {
+        let (width, height) = canvas;
+        let Some(src) = self.sources.get_mut(&id) else {
+            return;
+        };
+        let Some(title) = src.title.as_ref() else {
+            return;
+        };
+        // The caret joins the key, so putting it up or taking it away rebakes
+        // exactly once rather than not at all.
+        let key = (src.revision * 2 + caret as u64, width, height);
+        if src.title_baked == Some(key) {
+            return;
+        }
+        let shown;
+        let title = if caret {
+            shown = Title {
+                text: format!("{}{}", title.text, title::CARET),
+                ..title.clone()
+            };
+            &shown
+        } else {
+            title
+        };
+        let mask = title::rasterize(title, width, height);
+        // White with the coverage in alpha, exactly as the glyph atlas stores
+        // its own bitmaps: the colour rides on the quad instead, so a title
+        // recoloured does not have to be rasterized again.
+        let mut rgba = vec![255u8; mask.coverage.len() * 4];
+        for (i, &c) in mask.coverage.iter().enumerate() {
+            rgba[i * 4 + 3] = c;
+        }
+        let texture = quads.create_empty_texture(
+            device,
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        texture.write_region(queue, 0, 0, width, height, &rgba);
+        src.title_texture = Some(texture);
+        src.title_baked = Some(key);
     }
 
     /// Drop `id` from the visible pool list. The decoded `Source` — GPU
@@ -128,12 +278,14 @@ impl MediaPool {
         self.sources.get_mut(&id)
     }
 
-    /// Longest thing the source has to play. Video length where there is a
-    /// picture, the audio's otherwise — it is what a clip dropped from this
-    /// row is sized to, and an audio-only row that reported zero would drop as
-    /// a clip with no duration at all.
+    /// Longest a clip of this source can be trimmed to. Video length where
+    /// there is a picture, the audio's otherwise — and for a title, which
+    /// nothing runs out of, a bound rather than a length.
     pub fn duration(&self, id: SourceId) -> f64 {
         self.sources.get(&id).map_or(0.0, |s| {
+            if s.title.is_some() {
+                return title::MAX_DURATION;
+            }
             s.stream
                 .as_ref()
                 .map(|v| v.duration())
@@ -142,10 +294,23 @@ impl MediaPool {
         })
     }
 
+    /// How long a clip dropped from this row starts out.
+    ///
+    /// The whole of a file, since that is what "this footage" means. A title
+    /// has no such length, so it gets a workable default to trim from — the
+    /// alternative is dropping an hour-long clip across the timeline.
+    pub fn drop_duration(&self, id: SourceId) -> f64 {
+        if self.sources.get(&id).is_some_and(|s| s.title.is_some()) {
+            return title::DEFAULT_DURATION;
+        }
+        self.duration(id)
+    }
+
+    /// Whether a clip of this source has anything to show on a video track.
     pub fn has_video(&self, id: SourceId) -> bool {
         self.sources
             .get(&id)
-            .is_some_and(|s| s.stream.is_some())
+            .is_some_and(|s| s.stream.is_some() || s.title.is_some())
     }
 
     pub fn audio_duration(&self, id: SourceId) -> Option<f64> {

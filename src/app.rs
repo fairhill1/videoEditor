@@ -111,17 +111,39 @@ impl ApplicationHandler for App {
                 state.modifiers = mods.state();
             }
             WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state: ElementState::Pressed,
-                        repeat,
-                        ..
-                    },
+                event: KeyEvent { physical_key, state: ElementState::Pressed, repeat, text, .. },
                 ..
             } => {
+                let PhysicalKey::Code(code) = physical_key else {
+                    return;
+                };
                 let ctrl = state.modifiers.control_key();
                 let shift = state.modifiers.shift_key();
+                // Typing into a title takes the whole keyboard. Every bare
+                // letter below is a verb that edits, and they cannot both have
+                // the key — so while a title has the caret, nothing else does.
+                if state.typing_title() {
+                    match code {
+                        KeyCode::Escape => state.cancel_title_edit(),
+                        KeyCode::Backspace => state.backspace_title(),
+                        // Shift is what puts a line break in rather than
+                        // finishing, the same as any other single-line field
+                        // that can hold more than one.
+                        KeyCode::Enter | KeyCode::NumpadEnter if shift => {
+                            state.type_into_title("\n")
+                        }
+                        KeyCode::Enter | KeyCode::NumpadEnter => state.finish_title_edit(),
+                        // Whatever the layout says this key produces — which is
+                        // the only thing that gets accents and other keyboards
+                        // right.
+                        _ => {
+                            if let Some(text) = text.as_deref() {
+                                state.type_into_title(text);
+                            }
+                        }
+                    }
+                    return;
+                }
                 match code {
                     // Arrows repeat so holding steps through frames, or walks
                     // through edit points with Shift.
@@ -130,13 +152,12 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowLeft => state.step_frame(-1.0),
                     KeyCode::ArrowRight => state.step_frame(1.0),
                     // Level nudges repeat for the same reason the arrows do:
-                    // riding a clip down by 6dB should be a held key, not six
-                    // presses. Shift is the fine step, matching the way Shift
-                    // already qualifies the horizontal arrows.
-                    KeyCode::ArrowUp if shift => state.nudge_selected_gain(0.1),
-                    KeyCode::ArrowDown if shift => state.nudge_selected_gain(-0.1),
-                    KeyCode::ArrowUp => state.nudge_selected_gain(1.0),
-                    KeyCode::ArrowDown => state.nudge_selected_gain(-1.0),
+                    // riding a clip down by 6dB, or a title's opacity down to
+                    // a ghost, should be a held key rather than six presses.
+                    // Shift is the fine step, matching the way Shift already
+                    // qualifies the horizontal arrows.
+                    KeyCode::ArrowUp => state.nudge_selected_level(1.0, shift),
+                    KeyCode::ArrowDown => state.nudge_selected_level(-1.0, shift),
                     // Undo/redo repeat too — holding Ctrl+Z to walk back
                     // through history is the expected feel.
                     KeyCode::KeyZ if ctrl && shift => state.redo(),
@@ -170,6 +191,10 @@ impl ApplicationHandler for App {
                     KeyCode::KeyN if !ctrl => {
                         state.snap_enabled = !state.snap_enabled;
                     }
+                    KeyCode::KeyT if !ctrl => state.add_title(),
+                    // Enter opens the selected clip's text for editing, which
+                    // is what Enter does to a name everywhere else.
+                    KeyCode::Enter | KeyCode::NumpadEnter => state.edit_selected_title(),
                     _ => {}
                 }
             }

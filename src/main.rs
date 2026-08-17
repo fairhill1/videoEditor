@@ -2,8 +2,9 @@
 //!
 //! The modules divide along two axes. Down one are the media layers, each
 //! owning a resource and knowing nothing of the UI: `video` and `audio` decode,
-//! `media` pools what they produce, `timeline` is the edit model, `project`
-//! is its file format, and `export` renders it out.
+//! `media` pools what they produce, `timeline` is the edit model, `compose`
+//! resolves it into the pictures one frame is made of, `project` is its file
+//! format, and `export` renders it out.
 //!
 //! Along the other is the UI, which is one big [`state::State`] with its
 //! behaviour split by concern rather than by data. `theme` holds the constants
@@ -16,6 +17,7 @@
 mod app;
 mod audio;
 mod canvas;
+mod compose;
 mod edit;
 mod export;
 mod fmt;
@@ -31,6 +33,7 @@ mod text;
 mod theme;
 mod timeline;
 mod timeline_view;
+mod title;
 mod toolbar;
 mod ui;
 mod video;

@@ -83,6 +83,13 @@ pub(crate) fn fmt_db(db: f32) -> String {
     format!("{db:+.1} dB")
 }
 
+/// A clip's opacity as a percentage. The picture's counterpart to
+/// [`fmt_db`], and whole percent because that is finer than the eye can
+/// separate on a blend and finer than the 8-bit output can hold anyway.
+pub(crate) fn fmt_opacity(opacity: f32) -> String {
+    format!("{:.0}%", (opacity.clamp(0.0, 1.0) * 100.0).round())
+}
+
 /// Shorten `text` so it fits within `max_w` when rendered at `size_px`,
 /// appending an ellipsis if truncation happened. Returns the original string
 /// when it already fits, so the common case stays zero-allocation at the call

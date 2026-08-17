@@ -6,13 +6,15 @@
 //! the splitter handle and the popup over everything.
 
 use crate::canvas::Canvas;
+use crate::compose::Layer;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{pool_row_close_rect, Splitter};
+use crate::layout::{pool_row_close_rect, transform_handle_rects, Splitter};
 use crate::audio::Waveform;
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::theme::*;
+use crate::ui::Rect;
 
 /// Draw a whole source's waveform into a box, one column per pixel of width.
 ///
@@ -48,6 +50,45 @@ fn draw_waveform_summary(
             AUDIO_WAVE_COLOR,
         ));
     }
+}
+
+/// One composed layer as a textured quad in the preview panel.
+///
+/// Two jobs at once, because they are the same arithmetic: mapping canvas
+/// pixels into panel points, and trimming a layer that hangs off the canvas.
+/// The trim is done here rather than by a scissor rect because the quad
+/// renderer has no vertical clip — and because cutting the uv by the same
+/// fraction as the rect is exact for an axis-aligned quad, so a layer half off
+/// the edge shows half its picture rather than all of it squeezed.
+///
+/// `None` when the layer is entirely off canvas.
+fn canvas_quad(
+    layer: &Layer,
+    canvas: Canvas,
+    canvas_x: f32,
+    canvas_y: f32,
+    canvas_scale: f32,
+) -> Option<Quad> {
+    let [x, y, w, h] = layer.rect;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let [vx, vy, vw, vh] = layer.visible_rect(canvas.width, canvas.height)?;
+    let mut quad = Quad::textured(
+        [canvas_x + vx * canvas_scale, canvas_y + vy * canvas_scale],
+        [vw * canvas_scale, vh * canvas_scale],
+    );
+    quad.uv = [
+        (vx - x) / w,
+        (vy - y) / h,
+        (vx + vw - x) / w,
+        (vy + vh - y) / h,
+    ];
+    // White, so the texture passes through untouched, and the alpha channel
+    // carries the layer's opacity — the blend the pipeline already does for
+    // every other translucent thing on screen.
+    quad.color = [1.0, 1.0, 1.0, layer.alpha];
+    Some(quad)
 }
 
 impl State {
@@ -208,14 +249,18 @@ impl State {
         surface_texture.present();
     }
 
-    /// The canvas, and the topmost active clip composed onto it. Returns the
+    /// The canvas, with every layer live at `t` composed onto it. Returns the
     /// resolved canvas, which the toolbar's gear tooltip also reports.
     ///
-    /// The canvas is fitted into the panel first, then the clip is fitted into
-    /// the canvas — two stages, not one. Fitting the clip straight to the panel
+    /// The canvas is fitted into the panel first, then the layers are placed on
+    /// the canvas — two stages, not one. Placing a clip straight into the panel
     /// is what used to hide format mismatches: a 4:3 clip filled a 16:9 preview
     /// edge to edge and then exported pillarboxed, with nothing on screen to
     /// warn you.
+    ///
+    /// Layers come from [`crate::compose::layers_at`], the same call the export
+    /// makes, so what this panel shows is a scale model of the file rather than
+    /// a second opinion about it.
     fn draw_preview(
         &mut self,
         media_w: f32,
@@ -231,54 +276,131 @@ impl State {
         let canvas_h = (canvas.height as f32 * canvas_scale).round();
         let canvas_x = (media_w + (preview_w - canvas_w) * 0.5).round();
         let canvas_y = ((preview_h - canvas_h) * 0.5).round();
-        // Black, unlike the near-black panel around it, so the frame is visible
-        // as a frame even with nothing playing — that outline is the only thing
-        // showing what shape the project is.
+        self.preview_canvas = Rect { x: canvas_x, y: canvas_y, w: canvas_w, h: canvas_h };
+        self.preview_canvas_scale = canvas_scale;
+        // True black, against a well light enough to read as a surround, so the
+        // frame is visible as a frame even with nothing playing — that
+        // rectangle is the only thing showing what shape the project is.
         self.quads.push(Quad::colored(
             [canvas_x, canvas_y],
             [canvas_w, canvas_h],
             CANVAS_COLOR,
         ));
 
+        // Resolved before the loop below, which needs the pool mutably to
+        // advance decoders — and cannot hold the immutable borrow this walk of
+        // the timeline takes.
+        let layers = self.frame_layers(t, canvas);
+        // Titles are drawn rather than decoded, so their picture has to exist
+        // before the pass that paints it. Baking is a no-op for anything whose
+        // text and canvas have not moved since last frame.
+        let typing = self.editing_title.as_ref().map(|(id, _)| *id);
+        for layer in &layers {
+            let caret = typing == Some(layer.source);
+            let Self { media, device, queue, quads, .. } = self;
+            media.bake_title(
+                layer.source,
+                (canvas.width, canvas.height),
+                caret,
+                device,
+                queue,
+                quads,
+            );
+        }
+        // The pool row that lights up follows the top of the stack, which is
+        // what "what you are looking at" means once there is more than one
+        // picture on the canvas.
+        self.last_playing_source = layers.last().map(|l| l.source);
+
         // Scoped disjoint borrows so the decoder advance + textured-quad push can
         // share this block without leaking borrows past it.
         {
-            let Self {
-                media,
-                timeline,
-                quads,
-                queue,
-                last_playing_source,
-                ..
-            } = self;
-
-            let active_info = timeline
-                .topmost_video_clip(t)
-                .map(|(_, c)| (c.source, c.source_time(t)));
-            if let Some((source_id, source_t)) = active_info {
-                *last_playing_source = Some(source_id);
-                if let Some(stream) = media.get_mut(source_id).and_then(|s| s.stream.as_mut()) {
-                    stream.goto(queue, source_t);
-
-                    // Placement is computed in canvas pixels and then scaled to
-                    // the panel, rather than fitted to the panel directly, so
-                    // the preview is a faithful scale model of the export.
-                    let (cx, cy, cw, ch) =
-                        canvas.fit(stream.width() as f32, stream.height() as f32);
-                    quads.push_with(
-                        Quad::textured(
-                            [canvas_x + cx * canvas_scale, canvas_y + cy * canvas_scale],
-                            [cw * canvas_scale, ch * canvas_scale],
-                        ),
-                        Some(stream.texture()),
-                    );
+            let Self { media, quads, queue, .. } = self;
+            for layer in &layers {
+                let Some(mut quad) = canvas_quad(layer, canvas, canvas_x, canvas_y, canvas_scale)
+                else {
+                    continue;
+                };
+                // A title's colour rides on the quad and its shape on the
+                // texture's alpha, so one baked picture serves any colour —
+                // and the layer's own opacity multiplies straight into it.
+                if let Some(title) = media.get(layer.source).and_then(|s| s.title.as_ref()) {
+                    let [r, g, b, a] = title.color;
+                    quad.color = [r, g, b, a * layer.alpha];
+                    let Some(texture) = media.get(layer.source).and_then(|s| s.title_texture())
+                    else {
+                        continue;
+                    };
+                    quads.push_with(quad, Some(texture));
+                    continue;
                 }
-            } else {
-                *last_playing_source = None;
+                let Some(stream) = media.get_mut(layer.source).and_then(|s| s.stream.as_mut())
+                else {
+                    continue;
+                };
+                stream.goto(queue, layer.source_time);
+                quads.push_with(quad, Some(stream.texture()));
             }
         }
 
+        self.draw_transform_handles();
+        self.draw_title_edit_hint(canvas_y + canvas_h, media_w, preview_w);
+
         canvas
+    }
+
+    /// What the keyboard does while a title has the caret.
+    ///
+    /// Worth the line of chrome because typing takes the whole keyboard: every
+    /// bare letter that normally edits the timeline is going into the text
+    /// instead, and nothing else on screen would say why.
+    fn draw_title_edit_hint(&mut self, below_y: f32, media_w: f32, preview_w: f32) {
+        if !self.typing_title() {
+            return;
+        }
+        // ASCII throughout, for the reason the media pool's format line is:
+        // the UI font is a stock face rather than a subset we control.
+        const HINT: &str = "Typing title - Enter to finish, Shift+Enter for a line, Esc to cancel";
+        let w = self.text.measure_width(HINT, STATUS_SIZE);
+        let x = (media_w + (preview_w - w) * 0.5).round();
+        let baseline = (below_y + LABEL_PAD + self.text.ascent(STATUS_SIZE)).round();
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [x, baseline],
+            HINT,
+            STATUS_SIZE,
+            STATUS_INFO,
+        );
+    }
+
+    /// The frame and corner boxes around the selected clip's picture.
+    ///
+    /// Drawn from the same rect the press is tested against, so what you can
+    /// grab is what you can see — and only when there is something to grab: a
+    /// clip that is selected but not live at the playhead has no picture on the
+    /// canvas to put a frame around.
+    fn draw_transform_handles(&mut self) {
+        let Some((_, _, rect)) = self.preview_transform_target() else {
+            return;
+        };
+        let b = TRANSFORM_OUTLINE_PX;
+        for (pos, size) in [
+            ([rect.x, rect.y], [rect.w, b]),
+            ([rect.x, rect.y + rect.h - b], [rect.w, b]),
+            ([rect.x, rect.y], [b, rect.h]),
+            ([rect.x + rect.w - b, rect.y], [b, rect.h]),
+        ] {
+            self.quads
+                .push(Quad::colored(pos, size, TRANSFORM_OUTLINE_COLOR));
+        }
+        for handle in transform_handle_rects(rect) {
+            self.quads.push(Quad::colored(
+                [handle.x, handle.y],
+                [handle.w, handle.h],
+                TRANSFORM_OUTLINE_COLOR,
+            ));
+        }
     }
 
     fn draw_media_pool_list(&mut self, pool_w: f32, pool_h: f32) {
@@ -335,10 +457,39 @@ impl State {
                     POOL_THUMB_W,
                     POOL_THUMB_H,
                 );
+            } else if let Some(title) = src.title.as_ref() {
+                // A title's own words, in its own colour, standing in for the
+                // frame a decoded source has — the same reasoning as the
+                // waveform above: it is the one picture this source actually
+                // has of itself.
+                let [r, g, b, _] = title.color;
+                let text = truncate_to_width(
+                    &self.text,
+                    title.pool_name(),
+                    POOL_ITEM_META_SIZE,
+                    POOL_THUMB_W - 4.0,
+                );
+                let tw = self.text.measure_width(&text, POOL_ITEM_META_SIZE);
+                let ascent = self.text.ascent(POOL_ITEM_META_SIZE);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [
+                        (slot_x + (POOL_THUMB_W - tw) * 0.5).round(),
+                        (slot_y + (POOL_THUMB_H + ascent) * 0.5).round(),
+                    ],
+                    &text,
+                    POOL_ITEM_META_SIZE,
+                    [r, g, b, 1.0],
+                );
             }
 
-            // Duration pill in the bottom-right of the thumb slot.
-            let dur_text = format_timecode(self.media.duration(id));
+            // Duration pill in the bottom-right of the thumb slot. A title has
+            // no length of its own to report, so it says what it is instead.
+            let dur_text = match src.title {
+                Some(_) => "TITLE".to_string(),
+                None => format_timecode(self.media.duration(id)),
+            };
             let dur_w = self.text.measure_width(&dur_text, POOL_ITEM_META_SIZE);
             let dur_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
             let pill_pad_x = 4.0;
@@ -406,7 +557,14 @@ impl State {
                         n => format!("{n} ch"),
                     }
                 ),
-                (None, None) => String::new(),
+                (None, None) => match src.title.as_ref() {
+                    // What a title will be drawn at, which is the same question
+                    // the format line answers for footage: whether it matches
+                    // the canvas. A title always does — it is drawn at whatever
+                    // the canvas turns out to be — so it says its size instead.
+                    Some(t) => format!("title, {}% of frame", (t.size * 100.0).round()),
+                    None => String::new(),
+                },
             };
             let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);
             self.text.draw(

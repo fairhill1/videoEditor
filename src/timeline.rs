@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 /// the next jump.
 const EDIT_POINT_EPS: f64 = 1e-6;
 
+/// A video clip's opacity range. The top is fully opaque; there is nothing
+/// above it, unlike audio's +6dB of headroom — a picture cannot be more than
+/// itself.
+pub const MIN_OPACITY: f32 = 0.0;
+pub const MAX_OPACITY: f32 = 1.0;
+
+/// How far a clip's picture may be scaled off its default fit. The floor keeps
+/// a clip that has been shrunk to nothing still grabbable; the ceiling is what
+/// bounds the intermediate the export scales through, which is why it is a
+/// constant here rather than a number the drag happens to stop at.
+pub const MIN_SCALE: f32 = 0.05;
+pub const MAX_SCALE: f32 = 4.0;
+
 /// The level line's range, in decibels. The bottom is a floor rather than true
 /// silence: it keeps the dB mapping finite, and a clip you want actually silent
 /// is one you fade out or delete. The top is the usual +6 of headroom — enough
@@ -33,10 +46,35 @@ pub enum FadeSide {
     Out,
 }
 
-/// Serde's default for [`Clip::gain`]. A file written before clips had a level
-/// has to load at unity, not at silence.
-fn unity_gain() -> f32 {
+/// Serde's default for [`Clip::gain`] and [`Clip::opacity`]. A file written
+/// before clips had a level has to load at unity, not at silence — and one
+/// written before they had an opacity has to load opaque, not invisible.
+fn unity() -> f32 {
     1.0
+}
+
+/// Where a clip's picture sits on the canvas, relative to the aspect-preserving
+/// fit that used to be the only option.
+///
+/// Deliberately not in canvas pixels. An offset in pixels would mean a project
+/// re-mastered from 1080p to 4K moved every overlay to a quarter of the way in;
+/// as a fraction of the canvas it lands in the same place on any canvas. Scale
+/// is a multiplier on the fit for the same reason: `1.0` is "as large as it
+/// goes without cropping", whatever the two formats are.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    /// Offset from centred, in canvas widths and canvas heights.
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+}
+
+/// Centred and filling the canvas — what every clip did before it could be
+/// placed, so a project that predates transforms opens unchanged.
+impl Default for Transform {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, scale: 1.0 }
+    }
 }
 
 /// `transparent` so a project file writes `source: 0` rather than
@@ -72,7 +110,7 @@ pub struct Clip {
     /// Linear rather than decibels because that is what the mixer multiplies
     /// by, and a value that has to be converted on every sample is the wrong
     /// one to store. The UI converts the other way, once per drag.
-    #[serde(default = "unity_gain")]
+    #[serde(default = "unity")]
     pub gain: f32,
     /// Fade lengths in seconds, measured inward from each end of the clip.
     ///
@@ -82,6 +120,20 @@ pub struct Clip {
     pub fade_in: f64,
     #[serde(default)]
     pub fade_out: f64,
+    /// How much of this clip's picture reaches the canvas; 1.0 is opaque.
+    ///
+    /// The picture's counterpart to [`Clip::gain`], and deliberately a separate
+    /// field rather than the same one read two ways: a link says two clips
+    /// share a position in time, not a level, and the two quantities have
+    /// different ranges — audio has headroom above unity and a picture does
+    /// not. A clip only ever lives on one kind of track, so only one of the
+    /// pair is ever live; the other costs four bytes and keeps the meaning
+    /// unambiguous.
+    #[serde(default = "unity")]
+    pub opacity: f32,
+    /// Where the picture lands on the canvas. See [`Transform`].
+    #[serde(default)]
+    pub transform: Transform,
 }
 
 /// The neutral clip: unity level, no fades. Construction sites spread `..` over
@@ -99,6 +151,8 @@ impl Default for Clip {
             gain: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
+            opacity: 1.0,
+            transform: Transform::default(),
         }
     }
 }
@@ -120,21 +174,26 @@ impl Clip {
         self.source_in + (t - self.timeline_start).max(0.0)
     }
 
-    /// Level multiplier at timeline time `t` — the clip's gain, tapered by
-    /// whichever fade `t` falls inside.
+    /// How much of the clip's fades have opened at timeline time `t`, from 0
+    /// (shut) to 1 (fully open).
     ///
-    /// The taper is linear in amplitude, which is what an editor's fade handle
-    /// has always meant; a curve would be a second decision on top of the
-    /// length and belongs to a fade that can be told which shape it is.
+    /// The taper is linear, which is what an editor's fade handle has always
+    /// meant; a curve would be a second decision on top of the length and
+    /// belongs to a fade that can be told which shape it is.
     ///
     /// Both fades multiply, so a clip short enough to hold overlapping ones
     /// still reaches zero at each end instead of jumping. Progress is clamped
     /// rather than windowed: the mixer resolves which clip is live once per
     /// chunk and can run a few milliseconds past a boundary, and holding the
     /// end level there beats letting the ramp carry on through zero.
-    pub fn level(&self, t: f64) -> f32 {
+    ///
+    /// One ramp shared by the sound and the picture, so the two halves of a
+    /// linked pair fade over exactly the same span — and so a dissolve between
+    /// two overlapping video clips is the same gesture as an audio crossfade
+    /// rather than a second concept that happens to look like one.
+    pub fn fade_factor(&self, t: f64) -> f64 {
         if self.fade_in <= 0.0 && self.fade_out <= 0.0 {
-            return self.gain;
+            return 1.0;
         }
         let mut f = 1.0_f64;
         if self.fade_in > 0.0 {
@@ -143,7 +202,19 @@ impl Clip {
         if self.fade_out > 0.0 {
             f *= ((self.timeline_end() - t) / self.fade_out).clamp(0.0, 1.0);
         }
-        self.gain * f as f32
+        f
+    }
+
+    /// Level multiplier at timeline time `t` — the clip's gain, tapered by
+    /// whichever fade `t` falls inside.
+    pub fn level(&self, t: f64) -> f32 {
+        self.gain * self.fade_factor(t) as f32
+    }
+
+    /// The picture's counterpart to [`Clip::level`]: how much of this clip
+    /// reaches the canvas at `t`, its opacity tapered by the same fades.
+    pub fn alpha(&self, t: f64) -> f32 {
+        (self.opacity * self.fade_factor(t) as f32).clamp(0.0, 1.0)
     }
 
     /// Pull the fades back inside the clip, and off each other.
@@ -349,16 +420,6 @@ impl Timeline {
             }
         }
         pts
-    }
-
-    /// Topmost active video clip at `t`. Higher track index = on top.
-    pub fn topmost_video_clip(&self, t: f64) -> Option<(usize, &Clip)> {
-        self.tracks
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|(_, tr)| tr.kind == TrackKind::Video)
-            .find_map(|(i, tr)| tr.active_clip(t).map(|c| (i, c)))
     }
 
     /// Split every clip containing `t` into two clips meeting at `t`. Clips whose

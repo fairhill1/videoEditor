@@ -66,7 +66,12 @@ pub(crate) const TIMELINE_MIN_H: f32 =
 // need real distance between them or the whole window reads as one flat mass.
 // Every panel picks a tier rather than its own value, so surfaces at the same
 // conceptual depth actually match.
-pub(crate) const SURFACE_WELL: [f32; 4] = [0.03, 0.03, 0.04, 1.0]; // content the app displays into
+// The mat the picture sits on. Deliberately well clear of the canvas's true
+// black: at near-black the two ran together and there was no seeing where the
+// frame ended, and the boundary is what says what shape the project is. Kept
+// to a dark grey all the same, the way a grading suite does — a bright surround
+// changes how the picture in the middle of it reads.
+pub(crate) const SURFACE_WELL: [f32; 4] = [0.11, 0.11, 0.13, 1.0]; // content the app displays into
 pub(crate) const SURFACE_LANE: [f32; 4] = [0.05, 0.05, 0.06, 1.0]; // wells that hold clips
 pub(crate) const SURFACE_BASE: [f32; 4] = [0.09, 0.09, 0.11, 1.0]; // body behind the wells
 pub(crate) const SURFACE_PANEL: [f32; 4] = [0.15, 0.15, 0.18, 1.0]; // chrome that holds controls
@@ -78,6 +83,13 @@ pub(crate) const PREVIEW_COLOR: [f32; 4] = SURFACE_WELL;
 /// the well's near-black: it's picture area, and it has to read as distinct
 /// from the panel it floats in even when no clip is playing.
 pub(crate) const CANVAS_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// The frame around the selected clip's picture on the canvas, and the corner
+/// boxes that scale it. The same amber the timeline marks a selection with, so
+/// the outline on the canvas and the outline on the clip read as one selection
+/// in two places rather than two things that happen to be highlighted.
+pub(crate) const TRANSFORM_OUTLINE_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
+pub(crate) const TRANSFORM_OUTLINE_PX: f32 = 1.0;
+pub(crate) const TRANSFORM_HANDLE_BOX: f32 = 10.0;
 pub(crate) const TIMELINE_COLOR: [f32; 4] = SURFACE_BASE;
 pub(crate) const LANE_COLOR: [f32; 4] = SURFACE_LANE;
 // Edge between two panels, lighter than both — the flat-UI way to define a

@@ -60,6 +60,39 @@ impl State {
                 w,
             );
         }
+
+        // Beside the import button, because both answer "put something new in
+        // the pool" — one from disk and one out of nothing.
+        self.pool_title_btn = Rect {
+            x: (self.pool_open_btn.x + TRANSPORT_BTN_W + TRANSPORT_GAP).round(),
+            ..self.pool_open_btn
+        };
+        let pool_title_hovered = self.pool_title_btn.contains(self.cursor);
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            self.pool_title_btn,
+            // A letter from the text face rather than a pictogram: the icon
+            // font is a subset built for this UI, and a 'T' says "text" more
+            // plainly than anything that would have to be added to it.
+            'T',
+            TRANSPORT_ICON_SIZE,
+            pool_title_hovered,
+            BtnState::Normal,
+        );
+        if pool_title_hovered {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.pool_title_btn,
+                "New title (T)",
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+                w,
+            );
+        }
         self.text.draw(
             &self.queue,
             &mut self.quads,

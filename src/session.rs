@@ -89,6 +89,7 @@ impl State {
                     self.media.get(id).map(|src| project::SourceEntry {
                         id,
                         path: project::Project::store_path(Path::new(&src.path), dir),
+                        title: src.title.clone(),
                     })
                 })
                 .collect(),
@@ -182,6 +183,12 @@ impl State {
         let mut imported: HashMap<SourceId, SourceId> = HashMap::new();
         let mut missing = 0;
         for entry in &loaded.sources {
+            // A title carries its own picture in the file, so there is nothing
+            // to reopen and nothing that can be missing.
+            if let Some(title) = entry.title.clone() {
+                imported.insert(entry.id, media.add_title(title));
+                continue;
+            }
             let resolved = project::Project::resolve_path(&entry.path, &dir);
             match resolved
                 .to_str()
@@ -271,5 +278,7 @@ impl State {
         self.redo_stack.clear();
         self.pending_edit = None;
         self.edit_depth = 0;
+        // The title that had the caret belongs to the pool being replaced.
+        self.editing_title = None;
     }
 }

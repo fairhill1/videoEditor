@@ -7,9 +7,9 @@
 //! zooming is a change to the view window alone rather than to every site that
 //! draws.
 
-use crate::fmt::{fmt_db, format_tick_label, nice_tick_interval, truncate_to_width};
+use crate::fmt::{fmt_db, fmt_opacity, format_tick_label, nice_tick_interval, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{fade_handle_rect, gain_to_y, lane_y, topmost_lane_top, TimelineLayout};
+use crate::layout::{fade_handle_rect, lane_y, level_line_y, topmost_lane_top, TimelineLayout};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::text::TextRenderer;
@@ -404,8 +404,9 @@ impl State {
 
             // Fades, between the waveform and the outline: the wedge darkens
             // the peaks it is quietening, and the outline still closes over the
-            // top of it.
-            if track.kind == TrackKind::Audio && cw > 1.0 {
+            // top of it. Drawn on video clips too — the same ramp attenuates
+            // the picture there, and an overlapping pair of them is a dissolve.
+            if cw > 1.0 {
                 let px_per_sec = layout.px_per_sec() as f32;
                 if clip.fade_in > 0.0 {
                     let fw = clip.fade_in as f32 * px_per_sec;
@@ -454,8 +455,8 @@ impl State {
             // Level line and fade handles, over the outline: they are controls
             // rather than part of the clip's body, and one hidden under an edge
             // is one you cannot find.
-            if track.kind == TrackKind::Audio && cw > 1.0 {
-                let level_y = gain_to_y(lane_y, lane_h, clip.gain);
+            if cw > 1.0 {
+                let level_y = level_line_y(track.kind, lane_y, lane_h, clip);
                 let (line_color, line_h) = if selected {
                     (CLIP_LEVEL_ACTIVE_COLOR, CLIP_LEVEL_ACTIVE_H)
                 } else {
@@ -469,9 +470,16 @@ impl State {
 
                 // The number only earns its space once the level has been
                 // moved, or while the clip is selected and you are moving it.
-                let db = gain_to_db(clip.gain);
-                if selected || db.abs() > 0.05 {
-                    let text = fmt_db(db);
+                let (text, moved) = match track.kind {
+                    TrackKind::Audio => {
+                        let db = gain_to_db(clip.gain);
+                        (fmt_db(db), db.abs() > 0.05)
+                    }
+                    TrackKind::Video => {
+                        (fmt_opacity(clip.opacity), clip.opacity < 0.995)
+                    }
+                };
+                if selected || moved {
                     let tw = self.text.measure_width(&text, CLIP_LEVEL_LABEL_SIZE);
                     if tw + CLIP_LEVEL_LABEL_PAD * 2.0 <= vis_w {
                         // Below the line, and pulled back inside the lane when
@@ -514,7 +522,7 @@ impl State {
             //
             // Drawn through the same rect the hit test uses, so the box you can
             // see is the box you can grab.
-            if track.kind == TrackKind::Audio && cw > 1.0 {
+            if cw > 1.0 {
                 let px_per_sec = layout.px_per_sec() as f32;
                 for at in [
                     clip.fade_in as f32 * px_per_sec,

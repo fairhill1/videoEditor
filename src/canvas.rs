@@ -11,7 +11,7 @@ use crate::fmt::fmt_fps;
 use crate::quad::Quad;
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{SourceId, TrackKind};
+use crate::timeline::{SourceId, TrackKind, Transform};
 use crate::ui::{draw_menu_row, Rect};
 
 /// Canvas format used when nothing better is known: an empty timeline, or a
@@ -45,13 +45,31 @@ pub(crate) struct Canvas {
 }
 
 impl Canvas {
-    /// Where a `sw x sh` source lands on the canvas, in canvas pixels.
+    /// Where a `sw x sh` source lands on the canvas under `transform`, in
+    /// canvas pixels.
     ///
-    /// Currently always an aspect-preserving fit, centered. This is the seam a
-    /// per-clip transform replaces: once clips carry their own position, scale
-    /// and crop, this becomes "apply that clip's transform" and both the
-    /// preview and the export follow automatically, because both compose
-    /// through here rather than each doing their own arithmetic.
+    /// The seam every placement goes through. The preview and the export each
+    /// draw layers their own way — textured quads on the GPU, scaled planes on
+    /// the CPU — but neither works out *where* a picture goes, so the two
+    /// cannot drift about it.
+    ///
+    /// Scaling happens about the fitted rect's own centre, not the canvas's, so
+    /// a clip that has been moved into a corner grows in place instead of
+    /// crawling back towards the middle as you scale it up.
+    pub(crate) fn place(&self, sw: f32, sh: f32, transform: Transform) -> [f32; 4] {
+        let (fx, fy, fw, fh) = self.fit(sw, sh);
+        let w = fw * transform.scale;
+        let h = fh * transform.scale;
+        [
+            fx + (fw - w) * 0.5 + transform.x * self.width as f32,
+            fy + (fh - h) * 0.5 + transform.y * self.height as f32,
+            w,
+            h,
+        ]
+    }
+
+    /// Where a `sw x sh` source lands on the canvas with no transform applied:
+    /// an aspect-preserving fit, centred.
     pub(crate) fn fit(&self, sw: f32, sh: f32) -> (f32, f32, f32, f32) {
         let (cw, ch) = (self.width as f32, self.height as f32);
         if sw <= 0.0 || sh <= 0.0 {
@@ -92,6 +110,11 @@ impl State {
     /// Matching one clip rather than, say, the largest source keeps the common
     /// single-camera timeline a straight passthrough; anything else letterboxes
     /// into it.
+    ///
+    /// Titles are passed over. A generated source has no format of its own —
+    /// it is drawn at whatever the canvas turns out to be — so following one
+    /// would mean the canvas following itself, and a project that opened with a
+    /// title first would drop to the fallback format instead of the footage's.
     pub(crate) fn reference_video_source(&self) -> Option<SourceId> {
         let mut reference: Option<(f64, usize, SourceId)> = None;
         for (track_idx, track) in self.timeline.tracks.iter().enumerate() {
@@ -99,6 +122,9 @@ impl State {
                 continue;
             }
             for clip in &track.clips {
+                if self.media.get(clip.source).is_none_or(|s| s.stream.is_none()) {
+                    continue;
+                }
                 let better = reference
                     .is_none_or(|(start, ti, _)| (clip.timeline_start, track_idx) < (start, ti));
                 if better {

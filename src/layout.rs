@@ -9,7 +9,10 @@
 use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{db_to_gain, gain_to_db, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MIN_GAIN_DB};
+use crate::timeline::{
+    db_to_gain, gain_to_db, Clip, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MAX_OPACITY,
+    MIN_GAIN_DB, MIN_OPACITY,
+};
 use crate::ui::Rect;
 
 /// The two panel dividers, each named for what it separates.
@@ -232,6 +235,38 @@ pub(crate) fn gain_to_y(lane_y: f32, lane_h: f32, gain: f32) -> f32 {
     top + h * (MAX_GAIN_DB - db) / (MAX_GAIN_DB - MIN_GAIN_DB)
 }
 
+/// Where a video clip's opacity line sits inside its lane.
+///
+/// Linear, unlike the audio line's decibels. Opacity has no headroom above
+/// unity and no floor to compress towards, so half way down the lane is half
+/// the picture — a scale nobody has to learn, and one that puts the fully
+/// transparent end where the fully silent end already is.
+pub(crate) fn opacity_to_y(lane_y: f32, lane_h: f32, opacity: f32) -> f32 {
+    let (top, h) = level_band(lane_y, lane_h);
+    let o = opacity.clamp(MIN_OPACITY, MAX_OPACITY);
+    top + h * (MAX_OPACITY - o) / (MAX_OPACITY - MIN_OPACITY)
+}
+
+/// Inverse of [`opacity_to_y`], clamped like [`y_to_gain`].
+pub(crate) fn y_to_opacity(lane_y: f32, lane_h: f32, y: f32) -> f32 {
+    let (top, h) = level_band(lane_y, lane_h);
+    let frac = ((y - top) / h).clamp(0.0, 1.0);
+    MAX_OPACITY - frac * (MAX_OPACITY - MIN_OPACITY)
+}
+
+/// Where a clip's level line sits, whichever quantity its track puts on it —
+/// the sound's level on an audio lane, the picture's opacity on a video one.
+///
+/// Both lines are the same control and the same gesture, so drawing and hit
+/// testing come through one function rather than each deciding for itself which
+/// of the two a lane carries.
+pub(crate) fn level_line_y(kind: TrackKind, lane_y: f32, lane_h: f32, clip: &Clip) -> f32 {
+    match kind {
+        TrackKind::Audio => gain_to_y(lane_y, lane_h, clip.gain),
+        TrackKind::Video => opacity_to_y(lane_y, lane_h, clip.opacity),
+    }
+}
+
 /// Inverse of [`gain_to_y`]. Clamped, so a drag that runs off the lane pins to
 /// the end of the range rather than wrapping past it.
 pub(crate) fn y_to_gain(lane_y: f32, lane_h: f32, y: f32) -> f32 {
@@ -256,6 +291,40 @@ pub(crate) fn fade_handle_rect(handle_x: f32, x0: f32, x1: f32, lane_y: f32) -> 
         w: box_w,
         h: box_w,
     }
+}
+
+/// The four corner boxes that scale a clip's picture on the canvas.
+///
+/// Pulled inside the frame rather than centred on its corners: a picture placed
+/// flush against an edge of the canvas would otherwise put half of each handle
+/// outside the preview, and the half that is left is the half nobody aims at.
+pub(crate) fn transform_handle_rects(rect: Rect) -> [Rect; 4] {
+    let b = TRANSFORM_HANDLE_BOX.min(rect.w).min(rect.h);
+    HANDLE_CORNERS.map(|[cx, cy]| Rect {
+        x: rect.x + cx * (rect.w - b),
+        y: rect.y + cy * (rect.h - b),
+        w: b,
+        h: b,
+    })
+}
+
+/// The corners a picture can be scaled by, as fractions of its own rect: `0.0`
+/// for the left or top edge and `1.0` for the right or bottom.
+///
+/// Kept as fractions rather than as a named enum because that is the form the
+/// arithmetic wants — the corner held still is `1.0 - corner`, and where each
+/// edge lands falls straight out of the pair.
+const HANDLE_CORNERS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+
+/// What a press on the preview canvas has taken hold of.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum PreviewHit {
+    /// A corner box, named by which corner it is. Dragging it scales the
+    /// picture with the opposite corner pinned, the way a corner handle behaves
+    /// anywhere else — the edge under the hand is the edge that moves.
+    Scale { corner: [f32; 2] },
+    /// The picture itself: move it around the canvas.
+    Move,
 }
 
 /// Top edge of the highest video lane. Video stacks upward from the V/A
@@ -500,13 +569,12 @@ impl State {
         let cursor_t = layout.cursor_to_t(cursor_x);
         let track = &self.timeline.tracks[track_idx];
         let lane_y = self.lane_top(track_idx, &layout);
-        let has_level = track.kind == TrackKind::Audio;
         for (i, clip) in track.clips.iter().enumerate() {
             let x0 = layout.t_to_x(clip.timeline_start);
             let x1 = layout.t_to_x(clip.timeline_end());
             // Fade handles beat the trim handles they sit on top of. Each is
             // one small box in a corner, so a trim keeps the rest of the edge.
-            if has_level {
+            {
                 let fade_in_x = layout.t_to_x(clip.timeline_start + clip.fade_in);
                 if fade_handle_rect(fade_in_x, x0, x1, lane_y).contains([cursor_x, cursor_y]) {
                     return TimelineHit::ClipFade {
@@ -536,9 +604,8 @@ impl State {
                 // clip on the timeline. It goes live once the clip is selected
                 // instead: the press that selects still moves the clip, and the
                 // one after it adjusts the level.
-                let level_y = gain_to_y(lane_y, layout.lane_h, clip.gain);
-                if has_level
-                    && self.selected == Some(clip.id)
+                let level_y = level_line_y(track.kind, lane_y, layout.lane_h, clip);
+                if self.selected == Some(clip.id)
                     && (cursor_y - level_y).abs() <= CLIP_LEVEL_GRAB_PX
                 {
                     return TimelineHit::ClipLevel { track: track_idx, idx: i };
@@ -551,6 +618,74 @@ impl State {
             }
         }
         TimelineHit::Lane
+    }
+
+    /// The selected clip's picture on the canvas: which clip it is, and where
+    /// it was drawn in the preview panel, in points.
+    ///
+    /// `None` unless there is a video clip selected *and* it is live at the
+    /// playhead — a clip you cannot see is one there is nothing to place.
+    pub(crate) fn preview_transform_target(&self) -> Option<(usize, usize, Rect)> {
+        let (track, idx) = self.selected.and_then(|id| self.timeline.find(id))?;
+        if self.timeline.tracks[track].kind != TrackKind::Video {
+            return None;
+        }
+        let clip = self.timeline.tracks[track].clips[idx];
+        if !clip.contains(self.audio.position()) {
+            return None;
+        }
+        let canvas = self.canvas();
+        let (sw, sh) = self.source_size(clip.source, canvas)?;
+        let [x, y, w, h] = canvas.place(sw as f32, sh as f32, clip.transform);
+        let s = self.preview_canvas_scale;
+        Some((
+            track,
+            idx,
+            Rect {
+                x: self.preview_canvas.x + x * s,
+                y: self.preview_canvas.y + y * s,
+                w: w * s,
+                h: h * s,
+            },
+        ))
+    }
+
+    /// What the cursor is over on the preview canvas, and which clip it would
+    /// act on.
+    ///
+    /// Corner boxes beat the body they sit inside, the same precedence the
+    /// timeline's fade handles have over the trim edges under them.
+    pub(crate) fn preview_hit(&self, cursor: [f32; 2]) -> Option<(usize, usize, PreviewHit)> {
+        let (track, idx, rect) = self.preview_transform_target()?;
+        let corner = transform_handle_rects(rect)
+            .iter()
+            .position(|r| r.contains(cursor))
+            .map(|i| HANDLE_CORNERS[i]);
+        if let Some(corner) = corner {
+            return Some((track, idx, PreviewHit::Scale { corner }));
+        }
+        // Clipped to the canvas, not just to the picture: the part of a clip
+        // hanging off the edge is not on screen, and a drag started out there
+        // would be a grab on empty panel.
+        if rect.contains(cursor) && self.preview_canvas.contains(cursor) {
+            return Some((track, idx, PreviewHit::Move));
+        }
+        None
+    }
+
+    /// The cursor in canvas pixels, which is the space every placement is
+    /// expressed in. `None` before the preview has been drawn at a real size.
+    pub(crate) fn cursor_on_canvas(&self) -> Option<[f32; 2]> {
+        // See the note in `canvas_snap_threshold`: a zero-sized window can
+        // leave a NaN here, which no bound would catch on its own.
+        let s = self.preview_canvas_scale;
+        if !s.is_finite() || s <= 0.0 {
+            return None;
+        }
+        Some([
+            (self.cursor[0] - self.preview_canvas.x) / s,
+            (self.cursor[1] - self.preview_canvas.y) / s,
+        ])
     }
 
     pub(crate) fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {

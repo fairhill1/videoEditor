@@ -15,7 +15,10 @@ use ffmpeg::software::scaling;
 use ffmpeg::{codec, encoder, format, frame, picture, ChannelLayout, Dictionary, Packet, Rational};
 
 use crate::audio::{AudioStream, CHANNELS, SAMPLE_RATE};
+use crate::canvas::Canvas;
+use crate::compose::{layers_at, Layer};
 use crate::timeline::{Clip, SourceId, TrackKind};
+use crate::title::{self, Title};
 
 /// x264 knobs. `medium` is the usual speed/size compromise, and crf 20 is
 /// visually near-transparent on edited footage without producing huge files.
@@ -56,6 +59,10 @@ pub struct ExportRequest {
     /// Source id to file path. Resolved by the caller so the worker never
     /// touches the media pool.
     pub paths: HashMap<SourceId, String>,
+    /// The generated sources, which have no file to open and travel by value
+    /// instead. Same bargain as `paths`: the worker renders what the timeline
+    /// said when the button was pressed, and the session stays editable.
+    pub titles: HashMap<SourceId, Title>,
 }
 
 pub enum Outcome {
@@ -207,7 +214,8 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
                 stream.set_time_base(enc_tb);
                 stream.index()
             };
-            let takes = open_video_takes(req, spec)?;
+            let takes = open_video_takes(req)?;
+            let titles = bake_titles(req, spec);
             Some(VideoRender {
                 enc,
                 enc_tb,
@@ -215,6 +223,7 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
                 stream_tb: enc_tb,
                 spec,
                 takes,
+                titles,
             })
         }
         None => None,
@@ -404,6 +413,9 @@ fn source_ids(req: &ExportRequest, kind: TrackKind) -> HashSet<SourceId> {
         .iter()
         .filter(|(k, _)| *k == kind)
         .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
+        // Generated sources have no file behind them, so every path this feeds
+        // would come back missing.
+        .filter(|id| !req.titles.contains_key(id))
         .collect()
 }
 
@@ -414,19 +426,35 @@ fn path_for(req: &ExportRequest, source: SourceId) -> Result<&str, String> {
         .ok_or_else(|| "a clip refers to media that is no longer loaded".to_string())
 }
 
-fn open_video_takes(
-    req: &ExportRequest,
-    spec: VideoSpec,
-) -> Result<HashMap<SourceId, VideoTake>, String> {
+fn open_video_takes(req: &ExportRequest) -> Result<HashMap<SourceId, VideoTake>, String> {
     let mut takes = HashMap::new();
     for source in source_ids(req, TrackKind::Video) {
         let path = path_for(req, source)?;
         // Fail the whole export rather than substituting black: silently
         // dropping footage is the one outcome nobody wants to discover later.
-        let take = VideoTake::open(path, spec).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let take = VideoTake::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         takes.insert(source, take);
     }
     Ok(takes)
+}
+
+/// Rasterize every title the timeline refers to, once, at the output size.
+///
+/// Up front rather than on demand because a title's picture never changes
+/// during a render — the text is fixed the moment the export starts — so the
+/// only thing lazy baking would buy is a branch inside the per-frame loop.
+fn bake_titles(req: &ExportRequest, spec: VideoSpec) -> HashMap<SourceId, TitleTake> {
+    let used: HashSet<SourceId> = req
+        .tracks
+        .iter()
+        .filter(|(kind, _)| *kind == TrackKind::Video)
+        .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
+        .collect();
+    req.titles
+        .iter()
+        .filter(|(id, _)| used.contains(id))
+        .map(|(id, title)| (*id, TitleTake::bake(title, spec.width, spec.height)))
+        .collect()
 }
 
 fn open_audio_takes(req: &ExportRequest) -> Result<HashMap<SourceId, AudioStream>, String> {
@@ -441,16 +469,6 @@ fn open_audio_takes(req: &ExportRequest) -> Result<HashMap<SourceId, AudioStream
     Ok(takes)
 }
 
-/// Topmost video clip live at `t`. Higher track index wins, matching what the
-/// preview shows.
-fn topmost_video_clip(tracks: &[(TrackKind, Vec<Clip>)], t: f64) -> Option<&Clip> {
-    tracks
-        .iter()
-        .rev()
-        .filter(|(kind, _)| *kind == TrackKind::Video)
-        .find_map(|(_, clips)| clips.iter().find(|c| c.contains(t)))
-}
-
 // ---------------------------------------------------------------------------
 
 struct VideoRender {
@@ -460,9 +478,21 @@ struct VideoRender {
     stream_tb: Rational,
     spec: VideoSpec,
     takes: HashMap<SourceId, VideoTake>,
+    titles: HashMap<SourceId, TitleTake>,
 }
 
 impl VideoRender {
+    /// The project canvas this render is filling. Built from the spec rather
+    /// than carried alongside it so there is one description of the output
+    /// format, not two that could disagree.
+    fn canvas(&self) -> Canvas {
+        Canvas {
+            width: self.spec.width,
+            height: self.spec.height,
+            fps: self.spec.fps,
+        }
+    }
+
     fn encode(
         &mut self,
         n: u64,
@@ -479,13 +509,52 @@ impl VideoRender {
             self.spec.height,
         );
         fill_black(&mut canvas);
-        if let Some(clip) = topmost_video_clip(tracks, t) {
-            if let Some(take) = self.takes.get_mut(&clip.source) {
-                if take.stage(clip.source_time(t)) {
-                    blit(&mut canvas, &take.staged, take.fit.x, take.fit.y);
+
+        // Which pictures, where, and how much of each — decided by the same
+        // code the preview asks, so the file is the frame that was approved on
+        // screen rather than a second interpretation of the timeline.
+        let (takes, titles) = (&self.takes, &self.titles);
+        let layers = layers_at(
+            tracks.iter().map(|(kind, clips)| (*kind, clips.as_slice())),
+            t,
+            self.canvas(),
+            |source| {
+                takes
+                    .get(&source)
+                    .map(VideoTake::size)
+                    .or_else(|| titles.get(&source).map(TitleTake::size))
+            },
+        );
+        for layer in &layers {
+            let Some(placement) = place_even(layer, self.spec.width, self.spec.height) else {
+                continue;
+            };
+            if let Some(title) = self.titles.get_mut(&layer.source) {
+                let (color, color_alpha) = (title.color, title.alpha);
+                if let Some(mask) = title.stage(placement) {
+                    compose_color(
+                        &mut canvas,
+                        mask,
+                        placement.x,
+                        placement.y,
+                        color,
+                        color_alpha * layer.alpha,
+                    );
                 }
+                continue;
             }
+            let Some(take) = self.takes.get_mut(&layer.source) else {
+                continue;
+            };
+            if !take.stage(layer.source_time) {
+                continue;
+            }
+            let Some(picture) = take.render(placement) else {
+                continue;
+            };
+            compose(&mut canvas, picture, placement.x, placement.y, layer.alpha);
         }
+
         canvas.set_pts(Some(n as i64));
         canvas.set_kind(picture::Type::None);
 
@@ -607,31 +676,68 @@ impl AudioRender {
 
 // ---------------------------------------------------------------------------
 
-/// Where a source's picture lands inside the output canvas, preserving its
-/// aspect ratio. Everything is even-aligned so the chroma planes, which are
-/// half resolution, land on exact sample boundaries.
-#[derive(Clone, Copy)]
-struct FitRect {
+/// A layer's landing place in the output frame, in whole samples, together
+/// with the part of the layer's own picture that fills it.
+///
+/// Everything is even-aligned because the chroma planes are stored at half
+/// resolution: an odd offset has no chroma sample to copy from, and an odd size
+/// has half of one to copy into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placement {
     x: u32,
     y: u32,
     w: u32,
     h: u32,
+    /// `[u0, v0, u1, v1]`, each 0..1 across the layer's picture. The whole of
+    /// it unless the layer runs off an edge of the canvas, in which case this
+    /// is the part still on it — which is what keeps a half-off overlay showing
+    /// half its picture rather than all of it squeezed into the strip that fits.
+    src: [f32; 4],
 }
 
-fn fit(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> FitRect {
-    let scale = (out_w as f64 / src_w.max(1) as f64).min(out_h as f64 / src_h.max(1) as f64);
-    let w = even(((src_w as f64 * scale).round() as u32).clamp(2, out_w));
-    let h = even(((src_h as f64 * scale).round() as u32).clamp(2, out_h));
-    FitRect {
-        x: even((out_w - w) / 2),
-        y: even((out_h - h) / 2),
-        w,
-        h,
-    }
-}
-
-fn even(v: u32) -> u32 {
+fn even_down(v: u32) -> u32 {
     v & !1
+}
+
+fn even_up(v: u32) -> u32 {
+    v.saturating_add(1) & !1
+}
+
+/// Snap `layer` onto the output's sample grid, or `None` if nothing of it
+/// survives — off the canvas, or squeezed below the 2x2 a chroma sample needs.
+///
+/// Each edge goes to the nearest even sample rather than outward to the next
+/// one. Outward never loses a column of picture, but it can claim up to two
+/// that the layer does not cover, and the crop below has nothing to put there
+/// but a stretched edge. Half a pixel of placement is the cheaper error.
+fn place_even(layer: &Layer, out_w: u32, out_h: u32) -> Option<Placement> {
+    let [lx, ly, lw, lh] = layer.rect;
+    if lw <= 0.0 || lh <= 0.0 {
+        return None;
+    }
+    let [vx, vy, vw, vh] = layer.visible_rect(out_w, out_h)?;
+    let x0 = even_down(vx.round() as u32);
+    let y0 = even_down(vy.round() as u32);
+    let x1 = even_up((vx + vw).round() as u32).min(even_down(out_w));
+    let y1 = even_up((vy + vh).round() as u32).min(even_down(out_h));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    // Re-derived from the snapped rect rather than from the unsnapped one, so
+    // the picture stays registered with the box it is being scaled into.
+    let frac = |edge: f32, origin: f32, extent: f32| ((edge - origin) / extent).clamp(0.0, 1.0);
+    Some(Placement {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+        src: [
+            frac(x0 as f32, lx, lw),
+            frac(y0 as f32, ly, lh),
+            frac(x1 as f32, lx, lw),
+            frac(y1 as f32, ly, lh),
+        ],
+    })
 }
 
 fn fill_black(f: &mut frame::Video) {
@@ -645,9 +751,59 @@ fn fill_black(f: &mut frame::Video) {
     }
 }
 
+/// Paint `src` onto `dst` at `(x, y)`, letting `alpha` of it through.
+///
+/// Mixing straight in YUV rather than converting out to light and back is what
+/// a dissolve has always been in an editor, and it is what the preview's own
+/// blend does to the decoded frames it stacks — the two have to agree more than
+/// either has to be photometrically exact.
+///
+/// Fully opaque is by far the common case (every cut, every clip not currently
+/// in a fade), so it drops to a straight copy rather than paying for a
+/// per-sample mix that cannot change anything.
+fn compose(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32, alpha: f32) {
+    // 0..=256 rather than 0..=255: a whole power of two makes the mix below a
+    // shift, and 256 is exactly opaque instead of one part in 255 short of it.
+    let a = (alpha.clamp(0.0, 1.0) * 256.0).round() as i32;
+    if a >= 256 {
+        blit(dst, src, x, y);
+        return;
+    }
+    if a <= 0 {
+        return;
+    }
+    for_each_plane(dst, src, x, y, |dst_row, src_row| {
+        for i in 0..dst_row.len() {
+            let (d, s) = (dst_row[i] as i32, src_row[i] as i32);
+            // Rounded rather than truncated: at low alpha a truncating mix
+            // never quite reaches the source, so a fade-in would sit a level
+            // short of the picture it is bringing up.
+            dst_row[i] = (d + (((s - d) * a + 128) >> 8)) as u8;
+        }
+    });
+}
+
 /// Copy `src` into `dst` at `(x, y)`. Both are YUV420P, and `x`/`y` are even,
 /// so the chroma planes copy at exactly half the offset.
 fn blit(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32) {
+    for_each_plane(dst, src, x, y, |dst_row, src_row| {
+        dst_row.copy_from_slice(src_row);
+    });
+}
+
+/// Walk the overlapping rows of `src` placed at `(x, y)` in `dst`, plane by
+/// plane, handing each pair to `f` already trimmed to the samples they share.
+///
+/// The one place that knows YUV420P's shape — that plane 0 is full resolution
+/// and planes 1 and 2 are half in both directions — so a copy and a mix cannot
+/// disagree about where a row of chroma begins.
+fn for_each_plane(
+    dst: &mut frame::Video,
+    src: &frame::Video,
+    x: u32,
+    y: u32,
+    mut f: impl FnMut(&mut [u8], &[u8]),
+) {
     for plane in 0..3 {
         let (dx, dy) = if plane == 0 { (x, y) } else { (x / 2, y / 2) };
         let width = src.plane_width(plane) as usize;
@@ -655,9 +811,9 @@ fn blit(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32) {
         let src_stride = src.stride(plane);
         let dst_stride = dst.stride(plane);
         let dst_rows = dst.plane_height(plane) as usize;
-        // The fit rect is derived from these same dimensions, but clamp anyway:
-        // a source whose frame size changes mid-stream would otherwise index
-        // past the canvas.
+        // The placement is derived from these same dimensions, but clamp
+        // anyway: a source whose frame size changes mid-stream would otherwise
+        // index past the canvas.
         let rows = rows.min(dst_rows.saturating_sub(dy as usize));
         let width = width.min(dst_stride.saturating_sub(dx as usize));
         let src_data = src.data(plane);
@@ -665,7 +821,7 @@ fn blit(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32) {
         for row in 0..rows {
             let from = row * src_stride;
             let to = (dy as usize + row) * dst_stride + dx as usize;
-            dst_data[to..to + width].copy_from_slice(&src_data[from..from + width]);
+            f(&mut dst_data[to..to + width], &src_data[from..from + width]);
         }
     }
 }
@@ -679,17 +835,35 @@ struct VideoTake {
     decoder: codec::decoder::Video,
     stream_index: usize,
     time_base_seconds: f64,
+    width: u32,
+    height: u32,
+    /// Whatever the last picture was scaled into place with. Rebuilt through
+    /// `cached` whenever the placement changes, which it does the moment two
+    /// clips of one source sit at different sizes.
     scaler: Option<scaling::Context>,
+    /// Source pixel format to YUV420P at the source's own size, for the crop
+    /// path below. Only built when a layer actually runs off the canvas.
+    native_scaler: Option<scaling::Context>,
     /// Decoded but not yet due: the frame after whatever is staged.
     pending: Option<(frame::Video, f64)>,
-    /// The staged picture, scaled to `fit` and ready to blit.
+    /// The decoded frame covering the requested time, kept unscaled.
+    ///
+    /// It used to be scaled the moment it fell due, because there was one place
+    /// it could ever land. Now the same frame can be asked for at two sizes —
+    /// two clips of one source on two tracks — so the source picture is what is
+    /// held and the scaling happens per request.
+    due: Option<(frame::Video, f64)>,
+    /// The picture as last scaled into place, and the request it answers.
     staged: frame::Video,
-    staged_pts: Option<f64>,
-    fit: FitRect,
+    staged_for: Option<(f64, Placement)>,
+    /// Scratch for the crop path: the source converted to YUV420P at its own
+    /// size, and the sub-rectangle of it that is still on canvas.
+    native: frame::Video,
+    cropped: frame::Video,
 }
 
 impl VideoTake {
-    fn open(path: &str, spec: VideoSpec) -> Result<Self, ffmpeg::Error> {
+    fn open(path: &str) -> Result<Self, ffmpeg::Error> {
         let ictx = format::input(&path)?;
         let (stream_index, time_base_seconds, parameters) = {
             let stream = ictx
@@ -706,29 +880,118 @@ impl VideoTake {
         let decoder = codec::context::Context::from_parameters(parameters)?
             .decoder()
             .video()?;
-        let fit = fit(decoder.width(), decoder.height(), spec.width, spec.height);
         Ok(Self {
+            width: decoder.width(),
+            height: decoder.height(),
             ictx,
             decoder,
             stream_index,
             time_base_seconds,
             scaler: None,
+            native_scaler: None,
             pending: None,
+            due: None,
             staged: frame::Video::empty(),
-            staged_pts: None,
-            fit,
+            staged_for: None,
+            native: frame::Video::empty(),
+            cropped: frame::Video::empty(),
         })
     }
 
-    /// Make the frame covering source time `t` the staged one. Returns false
-    /// only when the source yielded nothing at all, in which case the caller
-    /// leaves the canvas black.
+    /// The source's picture size, which is what decides where a clip of it
+    /// lands on the canvas.
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Make the frame covering source time `t` the due one. Returns false only
+    /// when the source yielded nothing at all, in which case the caller leaves
+    /// this layer off the canvas.
     fn stage(&mut self, t: f64) -> bool {
-        match self.staged_pts {
+        match self.due_pts() {
             Some(p) if t >= p && t <= p + FORWARD_DECODE_BUDGET => self.advance_to(t),
             _ => self.seek(t),
         }
-        self.staged_pts.is_some()
+        self.due.is_some()
+    }
+
+    fn due_pts(&self) -> Option<f64> {
+        self.due.as_ref().map(|(_, pts)| *pts)
+    }
+
+    /// The due frame scaled into `placement`, ready to compose.
+    ///
+    /// Cached on the pair of frame and placement, so a source held on screen —
+    /// a still, or a clip running slower than the output rate — is scaled once
+    /// rather than once per output frame.
+    fn render(&mut self, placement: Placement) -> Option<&frame::Video> {
+        let pts = self.due_pts()?;
+        if self.staged_for != Some((pts, placement)) {
+            let ok = if placement.src == [0.0, 0.0, 1.0, 1.0] {
+                // The whole picture is on canvas, which is every clip that has
+                // not been pushed past an edge: straight from the decoder's
+                // format into the output rect in one pass, exactly as it went
+                // before there were layers.
+                let (due, _) = self.due.take()?;
+                let ok = scale_into(
+                    &mut self.scaler,
+                    &due,
+                    &mut self.staged,
+                    placement.w,
+                    placement.h,
+                );
+                self.due = Some((due, pts));
+                ok
+            } else {
+                self.render_cropped(placement)
+            };
+            if !ok {
+                self.staged_for = None;
+                return None;
+            }
+            self.staged_for = Some((pts, placement));
+        }
+        Some(&self.staged)
+    }
+
+    /// The part-of-a-picture path: convert to YUV420P at the source's own size,
+    /// cut out the piece that is still on canvas, and scale only that.
+    ///
+    /// Scaling the whole layer and then copying the visible corner of it would
+    /// be one pass fewer, but a clip scaled up and pushed off an edge would
+    /// have the editor allocating a picture many times the canvas to throw
+    /// nearly all of it away.
+    fn render_cropped(&mut self, placement: Placement) -> bool {
+        let Some((due, pts)) = self.due.take() else {
+            return false;
+        };
+        let ok = self.crop_and_scale(&due, placement);
+        self.due = Some((due, pts));
+        ok
+    }
+
+    fn crop_and_scale(&mut self, due: &frame::Video, placement: Placement) -> bool {
+        let (sw, sh) = (due.width(), due.height());
+        let [u0, v0, u1, v1] = placement.src;
+        let x0 = even_down((u0 * sw as f32).round() as u32);
+        let y0 = even_down((v0 * sh as f32).round() as u32);
+        let x1 = even_up((u1 * sw as f32).round() as u32).min(even_down(sw));
+        let y1 = even_up((v1 * sh as f32).round() as u32).min(even_down(sh));
+        if x1 <= x0 || y1 <= y0 {
+            return false;
+        }
+        if !scale_into(&mut self.native_scaler, due, &mut self.native, sw, sh) {
+            return false;
+        }
+        alloc_yuv(&mut self.cropped, x1 - x0, y1 - y0);
+        crop_yuv420p(&mut self.cropped, &self.native, x0, y0);
+        scale_into(
+            &mut self.scaler,
+            &self.cropped,
+            &mut self.staged,
+            placement.w,
+            placement.h,
+        )
     }
 
     fn advance_to(&mut self, t: f64) {
@@ -748,20 +1011,18 @@ impl VideoTake {
                 Some((next, next_pts)) => {
                     if next_pts <= t {
                         // The frame we were holding is already superseded, so
-                        // it never needs scaling.
+                        // it never needs to be looked at again.
                         self.pending = Some((next, next_pts));
                     } else {
-                        let (due, due_pts) = self.pending.take().unwrap();
-                        self.scale(&due);
-                        self.staged_pts = Some(due_pts);
+                        let due = self.pending.take().unwrap();
+                        self.set_due(due);
                         self.pending = Some((next, next_pts));
                         return;
                     }
                 }
                 None => {
-                    if let Some((due, due_pts)) = self.pending.take() {
-                        self.scale(&due);
-                        self.staged_pts = Some(due_pts);
+                    if let Some(due) = self.pending.take() {
+                        self.set_due(due);
                     }
                     return;
                 }
@@ -774,30 +1035,37 @@ impl VideoTake {
         let _ = self.ictx.seek(ts, ..);
         self.decoder.flush();
         self.pending = None;
-        self.staged_pts = None;
+        self.due = None;
+        self.staged_for = None;
 
         let mut last: Option<(frame::Video, f64)> = None;
         loop {
             match self.decode_next() {
                 Some((frame, pts)) => {
                     if pts > t {
-                        let (due, due_pts) = last.take().unwrap_or_else(|| (frame.clone(), pts));
-                        self.scale(&due);
-                        self.staged_pts = Some(due_pts);
+                        self.set_due(last.take().unwrap_or_else(|| (frame.clone(), pts)));
                         self.pending = Some((frame, pts));
                         return;
                     }
                     last = Some((frame, pts));
                 }
                 None => {
-                    if let Some((due, due_pts)) = last.take() {
-                        self.scale(&due);
-                        self.staged_pts = Some(due_pts);
+                    if let Some(due) = last.take() {
+                        self.set_due(due);
                     }
                     return;
                 }
             }
         }
+    }
+
+    /// Adopt a newly-due source frame, retiring whatever was scaled from the
+    /// last one — the staged picture is only ever an answer about a particular
+    /// frame, and holding it past that frame is how a render starts showing a
+    /// picture one frame stale.
+    fn set_due(&mut self, due: (frame::Video, f64)) {
+        self.due = Some(due);
+        self.staged_for = None;
     }
 
     fn decode_next(&mut self) -> Option<(frame::Video, f64)> {
@@ -828,42 +1096,354 @@ impl VideoTake {
         }
     }
 
-    /// Built from the frame rather than the decoder because the decoder's
-    /// format is not settled until something has actually come out of it.
-    fn scale(&mut self, src: &frame::Video) {
-        let scaler = match self.scaler.as_mut() {
-            Some(s) => s,
-            None => {
-                match scaling::Context::get(
-                    src.format(),
-                    src.width(),
-                    src.height(),
-                    format::Pixel::YUV420P,
-                    self.fit.w,
-                    self.fit.h,
-                    scaling::Flags::BILINEAR,
-                ) {
-                    Ok(s) => self.scaler.insert(s),
-                    Err(e) => {
-                        log::error!("export scaler setup failed: {e}");
-                        return;
-                    }
-                }
+}
+
+/// A title, rasterized once for the whole render.
+///
+/// Nothing here decodes. What varies across a title's frame is only how much of
+/// one colour is present, so what is carried is a coverage mask and three
+/// numbers — not a picture. That is also why it scales in one plane rather than
+/// three: a title moved and shrunk on the canvas resamples a quarter of the
+/// data a clip of footage would.
+struct TitleTake {
+    /// Coverage at canvas size, held as a frame so the scaler can take it.
+    mask: frame::Video,
+    cropped: frame::Video,
+    scaled: frame::Video,
+    scaler: Option<scaling::Context>,
+    /// The title's colour, already in the output's own YUV.
+    color: (u8, u8, u8),
+    /// The colour's own alpha, before the clip's opacity and fades multiply in.
+    alpha: f32,
+    width: u32,
+    height: u32,
+}
+
+impl TitleTake {
+    fn bake(title: &Title, width: u32, height: u32) -> Self {
+        let mask = title::rasterize(title, width, height);
+        let mut frame = frame::Video::new(format::Pixel::GRAY8, width, height);
+        let stride = frame.stride(0);
+        let data = frame.data_mut(0);
+        for row in 0..height as usize {
+            let from = row * width as usize;
+            data[row * stride..row * stride + width as usize]
+                .copy_from_slice(&mask.coverage[from..from + width as usize]);
+        }
+        Self {
+            mask: frame,
+            cropped: frame::Video::empty(),
+            scaled: frame::Video::empty(),
+            scaler: None,
+            color: color_to_yuv(title.color),
+            alpha: title.color[3],
+            width,
+            height,
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// The coverage this placement needs: the part of the mask still on canvas,
+    /// at the size it is being drawn.
+    ///
+    /// The common case — a title left where it was made — is the mask itself,
+    /// untouched: it was rasterized at canvas size, so filling the canvas asks
+    /// for no crop and no resample.
+    fn stage(&mut self, placement: Placement) -> Option<&frame::Video> {
+        let full = placement.src == [0.0, 0.0, 1.0, 1.0];
+        if full && placement.w == self.width && placement.h == self.height {
+            return Some(&self.mask);
+        }
+        let source = if full {
+            &self.mask
+        } else {
+            let [u0, v0, u1, v1] = placement.src;
+            let x0 = (u0 * self.width as f32).round() as u32;
+            let y0 = (v0 * self.height as f32).round() as u32;
+            let x1 = (u1 * self.width as f32).round().min(self.width as f32) as u32;
+            let y1 = (v1 * self.height as f32).round().min(self.height as f32) as u32;
+            if x1 <= x0 || y1 <= y0 {
+                return None;
             }
+            alloc_gray(&mut self.cropped, x1 - x0, y1 - y0);
+            crop_gray8(&mut self.cropped, &self.mask, x0, y0);
+            &self.cropped
         };
-        // Re-derive on every frame so a source that changes resolution
-        // mid-stream keeps landing in the same output rect.
-        scaler.cached(
+        // Already exactly the rect it is drawn at, which is what a full-size
+        // title pushed off an edge crops down to. Nothing left to resample.
+        if source.width() == placement.w && source.height() == placement.h {
+            return Some(source);
+        }
+        if !scale_gray_into(
+            &mut self.scaler,
+            source,
+            &mut self.scaled,
+            placement.w,
+            placement.h,
+        ) {
+            return None;
+        }
+        Some(&self.scaled)
+    }
+}
+
+/// A colour in the output's YUV, obtained the same way every picture in the
+/// render gets there: by handing it to the scaler.
+///
+/// Two by two because that is the smallest frame YUV420P can represent — one
+/// chroma sample needs a full quad of luma. Doing the matrix by hand would be
+/// six lines shorter and would quietly disagree with the footage the title sits
+/// over the first time either side changed its coefficients.
+fn color_to_yuv(color: [f32; 4]) -> (u8, u8, u8) {
+    let mut rgb = frame::Video::new(format::Pixel::RGBA, 2, 2);
+    let stride = rgb.stride(0);
+    let bytes = [
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        255,
+    ];
+    let data = rgb.data_mut(0);
+    for row in 0..2 {
+        for col in 0..2 {
+            let at = row * stride + col * 4;
+            data[at..at + 4].copy_from_slice(&bytes);
+        }
+    }
+    let mut scaler = None;
+    let mut yuv = frame::Video::empty();
+    if !scale_into(&mut scaler, &rgb, &mut yuv, 2, 2) {
+        // The scaler refusing a 2x2 conversion would be remarkable; mid grey
+        // is at least a colour rather than a panic in a background worker.
+        return (128, 128, 128);
+    }
+    (yuv.data(0)[0], yuv.data(1)[0], yuv.data(2)[0])
+}
+
+/// Paint a flat `color` onto `dst` at `(x, y)`, as much of it at each pixel as
+/// `mask` says and `alpha` allows.
+///
+/// The picture counterpart of a fader: the title never varies in colour, only
+/// in how much of it is there, so this is a mix towards a constant rather than
+/// towards another picture.
+fn compose_color(
+    dst: &mut frame::Video,
+    mask: &frame::Video,
+    x: u32,
+    y: u32,
+    color: (u8, u8, u8),
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+    let w = mask.width() as usize;
+    let h = mask.height() as usize;
+    let mask_stride = mask.stride(0);
+    let mask_data = mask.data(0);
+    let cov = |row: usize, col: usize| mask_data[row * mask_stride + col] as i32;
+    // Folded in once here rather than per sample: coverage is already the
+    // per-pixel part, and the clip's opacity is the same number everywhere.
+    let scale = |c: i32| ((c as f32) * alpha) as i32;
+
+    // Luma, one sample per pixel.
+    let stride = dst.stride(0);
+    let rows = h.min((dst.plane_height(0) as usize).saturating_sub(y as usize));
+    let cols = w.min((dst.plane_width(0) as usize).saturating_sub(x as usize));
+    let data = dst.data_mut(0);
+    for row in 0..rows {
+        let at = (y as usize + row) * stride + x as usize;
+        for col in 0..cols {
+            data[at + col] = mix(data[at + col], color.0, scale(cov(row, col)));
+        }
+    }
+
+    // Chroma, one sample per 2x2 block. The block's coverage is the mean of
+    // its four, so a diagonal edge fades its colour off at the same rate its
+    // luma does instead of stepping a whole sample at a time.
+    for (plane, value) in [(1usize, color.1), (2, color.2)] {
+        let stride = dst.stride(plane);
+        let rows = (h / 2).min((dst.plane_height(plane) as usize).saturating_sub(y as usize / 2));
+        let cols = (w / 2).min((dst.plane_width(plane) as usize).saturating_sub(x as usize / 2));
+        let data = dst.data_mut(plane);
+        for row in 0..rows {
+            let at = (y as usize / 2 + row) * stride + x as usize / 2;
+            for col in 0..cols {
+                let mean = (cov(row * 2, col * 2)
+                    + cov(row * 2, col * 2 + 1)
+                    + cov(row * 2 + 1, col * 2)
+                    + cov(row * 2 + 1, col * 2 + 1))
+                    / 4;
+                data[at + col] = mix(data[at + col], value, scale(mean));
+            }
+        }
+    }
+}
+
+/// `d` moved `a` of the way to `s`, where `a` is 0..=255.
+fn mix(d: u8, s: u8, a: i32) -> u8 {
+    let (d, s) = (d as i32, s as i32);
+    // Over 255 rather than 256 so full coverage reaches the source exactly; the
+    // rounding term keeps a low-coverage edge from sitting a level short.
+    (d + ((s - d) * a + 127) / 255) as u8
+}
+
+/// Make `f` a GRAY8 frame of exactly `w x h`.
+fn alloc_gray(f: &mut frame::Video, w: u32, h: u32) {
+    if f.width() != w || f.height() != h || f.format() != format::Pixel::GRAY8 {
+        *f = frame::Video::new(format::Pixel::GRAY8, w, h);
+    }
+}
+
+/// [`crop_yuv420p`] for a single 8-bit plane, which has no chroma to keep in
+/// step and so no alignment to respect.
+fn crop_gray8(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32) {
+    let width = (dst.width() as usize).min((src.stride(0)).saturating_sub(x as usize));
+    let rows = (dst.height() as usize).min((src.height() as usize).saturating_sub(y as usize));
+    let src_stride = src.stride(0);
+    let dst_stride = dst.stride(0);
+    let src_data = src.data(0);
+    let dst_data = dst.data_mut(0);
+    for row in 0..rows {
+        let from = (y as usize + row) * src_stride + x as usize;
+        let to = row * dst_stride;
+        dst_data[to..to + width].copy_from_slice(&src_data[from..from + width]);
+    }
+}
+
+/// [`scale_into`] for coverage: one plane in, one plane out, no colour
+/// conversion in between.
+fn scale_gray_into(
+    scaler: &mut Option<scaling::Context>,
+    src: &frame::Video,
+    dst: &mut frame::Video,
+    w: u32,
+    h: u32,
+) -> bool {
+    if dst.width() != w || dst.height() != h || dst.format() != format::Pixel::GRAY8 {
+        *dst = frame::Video::empty();
+    }
+    let ctx = match scaler.as_mut() {
+        Some(s) => s,
+        None => match scaling::Context::get(
+            format::Pixel::GRAY8,
+            src.width(),
+            src.height(),
+            format::Pixel::GRAY8,
+            w,
+            h,
+            scaling::Flags::BILINEAR,
+        ) {
+            Ok(s) => scaler.insert(s),
+            Err(e) => {
+                log::error!("title scaler setup failed: {e}");
+                return false;
+            }
+        },
+    };
+    ctx.cached(
+        format::Pixel::GRAY8,
+        src.width(),
+        src.height(),
+        format::Pixel::GRAY8,
+        w,
+        h,
+        scaling::Flags::BILINEAR,
+    );
+    if let Err(e) = ctx.run(src, dst) {
+        log::error!("title scale failed: {e}");
+        return false;
+    }
+    true
+}
+
+/// Scale `src` into `dst` as YUV420P at `w x h`, building or re-deriving
+/// `scaler` to suit. Reports whether `dst` came out usable.
+///
+/// The scaler is built from the frame rather than from the decoder because a
+/// decoder's format is not settled until something has actually come out of it,
+/// and re-derived on every call because both ends move now: a source can change
+/// resolution mid-stream, and a layer's placement changes the moment its clip
+/// is scaled or dragged.
+fn scale_into(
+    scaler: &mut Option<scaling::Context>,
+    src: &frame::Video,
+    dst: &mut frame::Video,
+    w: u32,
+    h: u32,
+) -> bool {
+    // `run` allocates only into an empty frame and refuses one already sized
+    // for a different rect, so a changed target means starting the buffer over
+    // rather than handing it a picture it has no room for. An unallocated frame
+    // reports a zero size, so it takes this branch harmlessly on the first call.
+    if dst.width() != w || dst.height() != h {
+        *dst = frame::Video::empty();
+    }
+    let ctx = match scaler.as_mut() {
+        Some(s) => s,
+        None => match scaling::Context::get(
             src.format(),
             src.width(),
             src.height(),
             format::Pixel::YUV420P,
-            self.fit.w,
-            self.fit.h,
+            w,
+            h,
             scaling::Flags::BILINEAR,
-        );
-        if let Err(e) = scaler.run(src, &mut self.staged) {
-            log::error!("export scale failed: {e}");
+        ) {
+            Ok(s) => scaler.insert(s),
+            Err(e) => {
+                log::error!("export scaler setup failed: {e}");
+                return false;
+            }
+        },
+    };
+    ctx.cached(
+        src.format(),
+        src.width(),
+        src.height(),
+        format::Pixel::YUV420P,
+        w,
+        h,
+        scaling::Flags::BILINEAR,
+    );
+    if let Err(e) = ctx.run(src, dst) {
+        log::error!("export scale failed: {e}");
+        return false;
+    }
+    true
+}
+
+/// Make `f` a YUV420P frame of exactly `w x h`, reusing its buffer when it
+/// already is one.
+fn alloc_yuv(f: &mut frame::Video, w: u32, h: u32) {
+    if f.width() != w || f.height() != h || f.format() != format::Pixel::YUV420P {
+        *f = frame::Video::new(format::Pixel::YUV420P, w, h);
+    }
+}
+
+/// Copy the sub-rectangle of `src` starting at `(x, y)` and the size of `dst`
+/// into `dst`. Both are YUV420P and `x`/`y` are even, so chroma copies at
+/// exactly half the offset — the same rule [`blit`] follows in the other
+/// direction.
+fn crop_yuv420p(dst: &mut frame::Video, src: &frame::Video, x: u32, y: u32) {
+    for plane in 0..3 {
+        let (sx, sy) = if plane == 0 { (x, y) } else { (x / 2, y / 2) };
+        let width = dst.plane_width(plane) as usize;
+        let rows = dst.plane_height(plane) as usize;
+        let src_stride = src.stride(plane);
+        let dst_stride = dst.stride(plane);
+        let rows = rows.min((src.plane_height(plane) as usize).saturating_sub(sy as usize));
+        let width = width.min(src_stride.saturating_sub(sx as usize));
+        let src_data = src.data(plane);
+        let dst_data = dst.data_mut(plane);
+        for row in 0..rows {
+            let from = (sy as usize + row) * src_stride + sx as usize;
+            let to = row * dst_stride;
+            dst_data[to..to + width].copy_from_slice(&src_data[from..from + width]);
         }
     }
 }
@@ -871,45 +1451,112 @@ impl VideoTake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::Transform;
 
-    #[test]
-    fn a_matching_aspect_ratio_fills_the_canvas() {
-        let r = fit(1920, 1080, 1280, 720);
-        assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 1280, 720));
+    fn layer(rect: [f32; 4]) -> Layer {
+        Layer {
+            source: SourceId(0),
+            source_time: 0.0,
+            rect,
+            alpha: 1.0,
+        }
     }
 
+    /// The ordinary case, and the one that has to stay a single scaling pass:
+    /// a clip filling the canvas takes all of its own picture.
     #[test]
-    fn a_taller_source_gets_pillarboxed() {
-        // 1:1 into 16:9 fits by height, leaving equal bars left and right.
-        let r = fit(1000, 1000, 1920, 1080);
-        assert_eq!((r.w, r.h), (1080, 1080));
-        assert_eq!(r.y, 0);
-        assert_eq!(r.x, 420);
-    }
-
-    #[test]
-    fn a_wider_source_gets_letterboxed() {
-        let r = fit(1920, 800, 1920, 1080);
-        assert_eq!((r.w, r.h), (1920, 800));
-        assert_eq!(r.x, 0);
-        assert_eq!(r.y, 140);
+    fn a_layer_filling_the_canvas_asks_for_all_of_its_picture() {
+        let p = place_even(&layer([0.0, 0.0, 1920.0, 1080.0]), 1920, 1080).unwrap();
+        assert_eq!((p.x, p.y, p.w, p.h), (0, 0, 1920, 1080));
+        assert_eq!(p.src, [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
     fn every_edge_lands_on_an_even_sample() {
-        // Odd dimensions all round: chroma is half resolution, so an odd
-        // offset or size would put the planes half a sample out of step.
-        let r = fit(1001, 667, 1281, 721);
-        for v in [r.x, r.y, r.w, r.h] {
+        // Odd numbers all round: chroma is half resolution, so an odd offset or
+        // size would put the planes half a sample out of step.
+        let p = place_even(&layer([13.5, 7.25, 401.0, 333.0]), 1280, 720).unwrap();
+        for v in [p.x, p.y, p.w, p.h] {
             assert_eq!(v % 2, 0, "{v} is odd");
         }
-        assert!(r.x + r.w <= 1281 && r.y + r.h <= 721);
+        assert!(p.x + p.w <= 1280 && p.y + p.h <= 720);
+    }
+
+    /// A layer pushed off the left edge keeps the part still on canvas, and
+    /// says which part of its picture that is — without this the visible strip
+    /// would show the whole frame squeezed into it.
+    #[test]
+    fn a_layer_off_an_edge_is_cut_rather_than_squeezed() {
+        let p = place_even(&layer([-200.0, 0.0, 400.0, 1080.0]), 1920, 1080).unwrap();
+        assert_eq!((p.x, p.y, p.w, p.h), (0, 0, 200, 1080));
+        assert_eq!(p.src, [0.5, 0.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn the_source_never_overflows_the_canvas() {
-        let r = fit(4000, 3000, 640, 480);
-        assert!(r.w <= 640 && r.h <= 480);
+    fn a_layer_scaled_past_the_canvas_is_cropped_to_it() {
+        let p = place_even(&layer([-1920.0, -1080.0, 5760.0, 3240.0]), 1920, 1080).unwrap();
+        assert_eq!((p.x, p.y, p.w, p.h), (0, 0, 1920, 1080));
+        assert_eq!(p.src, [1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0]);
+    }
+
+    #[test]
+    fn a_layer_entirely_off_canvas_places_nowhere() {
+        assert!(place_even(&layer([1920.0, 0.0, 400.0, 200.0]), 1920, 1080).is_none());
+        assert!(place_even(&layer([0.0, 0.0, 0.0, 0.0]), 1920, 1080).is_none());
+    }
+
+    /// Below a 2x2 there is no chroma sample to write, so a layer squeezed to
+    /// a sliver drops out rather than producing a half-written plane.
+    #[test]
+    fn a_sliver_thinner_than_a_chroma_sample_places_nowhere() {
+        assert!(place_even(&layer([1919.5, 0.0, 1.0, 200.0]), 1920, 1080).is_none());
+    }
+
+    fn flat_frame(w: u32, h: u32, y: u8, uv: u8) -> frame::Video {
+        let mut f = frame::Video::new(format::Pixel::YUV420P, w, h);
+        for (plane, value) in [(0usize, y), (1, uv), (2, uv)] {
+            let stride = f.stride(plane);
+            let rows = f.plane_height(plane) as usize;
+            let data = f.data_mut(plane);
+            for row in 0..rows {
+                data[row * stride..row * stride + stride].fill(value);
+            }
+        }
+        f
+    }
+
+    /// Half opacity lands half way, which is the whole of what a dissolve is.
+    /// The rounded mix is what keeps this exact rather than a level short.
+    #[test]
+    fn composing_at_half_alpha_lands_between_the_two_pictures() {
+        let mut canvas = flat_frame(4, 4, 0, 0);
+        let over = flat_frame(2, 2, 200, 100);
+        compose(&mut canvas, &over, 0, 0, 0.5);
+        assert_eq!(canvas.data(0)[0], 100);
+        assert_eq!(canvas.data(1)[0], 50);
+        // Outside the composed rect the canvas is untouched.
+        assert_eq!(canvas.data(0)[2], 0);
+    }
+
+    #[test]
+    fn composing_at_full_alpha_replaces_the_canvas_exactly() {
+        let mut canvas = flat_frame(4, 4, 16, 128);
+        let over = flat_frame(2, 2, 235, 64);
+        compose(&mut canvas, &over, 2, 2, 1.0);
+        let stride = canvas.stride(0);
+        assert_eq!(canvas.data(0)[2 * stride + 2], 235);
+        assert_eq!(canvas.data(0)[0], 16);
+    }
+
+    /// A layer faded to nothing must leave no mark at all — a single level of
+    /// leakage across a whole frame is a visible haze on a dark picture.
+    #[test]
+    fn composing_at_zero_alpha_leaves_the_canvas_alone() {
+        let mut canvas = flat_frame(4, 4, 16, 128);
+        let over = flat_frame(4, 4, 235, 64);
+        compose(&mut canvas, &over, 0, 0, 0.0);
+        assert_eq!(canvas.data(0)[0], 16);
+        assert_eq!(canvas.data(1)[0], 128);
     }
 
     /// End-to-end render, which is the only way to catch a mistake in the
@@ -944,11 +1591,22 @@ mod tests {
         // source: that combination exercises the mid-clip seek and the
         // backwards jump at the boundary, which is where a decoder that only
         // walked forward would fall apart.
+        //
+        // Over them, on V2, a title that fades in and out and sits off-centre
+        // at half size. That covers the other half of the compositor in the
+        // same pass: a second layer, a generated source, a placement that both
+        // crops and resamples, and an alpha that is neither 0 nor 1.
+        let overlay = SourceId(2);
+        let mut title_clip = clip(overlay, 0.0, 3.0, 0.5);
+        title_clip.fade_in = 0.5;
+        title_clip.fade_out = 0.5;
+        title_clip.transform = Transform { x: 0.3, y: -0.25, scale: 0.5 };
         let tracks = vec![
             (
                 TrackKind::Video,
                 vec![clip(a, 0.0, 2.0, 0.0), clip(b, 1.0, 3.0, 2.0)],
             ),
+            (TrackKind::Video, vec![title_clip]),
             (
                 TrackKind::Audio,
                 vec![clip(a, 0.0, 2.0, 0.0), clip(b, 1.0, 3.0, 2.0)],
@@ -958,6 +1616,13 @@ mod tests {
             (a, sources[0].to_string()),
             (b, sources[1].to_string()),
         ]);
+        let titles = HashMap::from([(
+            overlay,
+            Title {
+                text: "Two\nLines".to_string(),
+                ..Title::default()
+            },
+        )]);
         let output = std::env::temp_dir().join("ruve-export-roundtrip.mp4");
         let spec = VideoSpec {
             width: 640,
@@ -969,6 +1634,7 @@ mod tests {
             video: Some(spec),
             tracks,
             paths,
+            titles,
         };
 
         let shared = Mutex::new(Shared {
@@ -1023,6 +1689,70 @@ mod tests {
         assert_eq!(decoded, 100, "every submitted frame should come back out");
 
         std::fs::remove_file(&output).ok();
+    }
+
+    /// A timeline of nothing but titles is still a picture, and renders as
+    /// one. Needs no fixture — there is no file to decode — so unlike the test
+    /// above this runs everywhere, and it is the one that covers the generated
+    /// path end to end: rasterize, place, blend, encode, and decode back.
+    #[test]
+    fn renders_a_title_only_timeline() {
+        let overlay = SourceId(0);
+        let tracks = vec![(
+            TrackKind::Video,
+            vec![Clip {
+                id: 0,
+                source: overlay,
+                source_out: 2.0,
+                fade_in: 0.4,
+                fade_out: 0.4,
+                ..Clip::default()
+            }],
+        )];
+        let output = std::env::temp_dir().join("ruve-export-title-only.mp4");
+        let req = ExportRequest {
+            output: output.clone(),
+            video: Some(VideoSpec { width: 320, height: 240, fps: 25.0 }),
+            tracks,
+            paths: HashMap::new(),
+            titles: HashMap::from([(overlay, Title::default())]),
+        };
+
+        let shared = Mutex::new(Shared {
+            progress: Progress::default(),
+            outcome: None,
+        });
+        let completed =
+            run(&req, &shared, &AtomicBool::new(false)).expect("title-only export failed");
+        assert!(completed, "export reported itself cancelled");
+
+        let mut ictx = format::input(&output).expect("output is not a readable container");
+        let stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .expect("no video stream in a title-only render");
+        let index = stream.index();
+        let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        let mut frame = frame::Video::empty();
+        // The title is white on black and half way through its hold, so the
+        // middle of the render has to carry real ink. A render that placed the
+        // mask wrong, or blended it at zero, would decode as an empty frame.
+        let mut brightest = 0u8;
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != index {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                brightest = brightest.max(frame.data(0).iter().copied().max().unwrap_or(0));
+            }
+        }
+        std::fs::remove_file(&output).ok();
+        assert!(brightest > 128, "the title never reached the picture ({brightest})");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use fontdue::{Font, FontSettings};
 
 use crate::quad::{Quad, QuadRenderer, Texture};
 
-const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ShareTechMono-Regular.ttf");
+pub(crate) const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ShareTechMono-Regular.ttf");
 /// Lucide, subset to the icons the UI actually draws — see
 /// `tools/build-icon-font.sh`. An icon font rather than SVGs or PNGs because
 /// everything below already rasterizes glyph outlines into an atlas at whatever

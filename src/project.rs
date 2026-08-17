@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::Setting;
 use crate::timeline::{Clip, SourceId, TrackKind};
+use crate::title::Title;
 
 /// Written into every file and checked on the way back in.
 ///
@@ -52,7 +53,14 @@ pub struct SourceEntry {
     /// clips below point at, so it has to survive the round trip to be
     /// remapped.
     pub id: SourceId,
+    /// Empty for a generated source, which has nothing on disk to point at.
     pub path: String,
+    /// `Some` for a title, whose picture is not in a file but in these few
+    /// words — so unlike footage, it is carried in the project rather than
+    /// referred to from it, and a project file with its titles inside opens the
+    /// same wherever it is taken.
+    #[serde(default)]
+    pub title: Option<Title>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +143,7 @@ pub fn read(path: &Path) -> Result<Project, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::Transform;
 
     fn sample() -> Project {
         Project {
@@ -143,10 +152,22 @@ mod tests {
                 resolution: Setting::Fixed((1920, 1080)),
                 fps: Setting::Auto,
             },
-            sources: vec![SourceEntry {
-                id: SourceId(0),
-                path: "a.mp4".into(),
-            }],
+            sources: vec![
+                SourceEntry {
+                    id: SourceId(0),
+                    path: "a.mp4".into(),
+                    title: None,
+                },
+                SourceEntry {
+                    id: SourceId(1),
+                    path: String::new(),
+                    title: Some(Title {
+                        text: "Chapter\nOne".into(),
+                        size: 0.2,
+                        color: [1.0, 0.5, 0.25, 0.8],
+                    }),
+                },
+            ],
             tracks: vec![TrackEntry {
                 kind: TrackKind::Video,
                 clips: vec![Clip {
@@ -156,6 +177,8 @@ mod tests {
                     gain: 0.5,
                     fade_in: 0.25,
                     fade_out: 0.5,
+                    opacity: 0.75,
+                    transform: Transform { x: -0.1, y: 0.2, scale: 0.5 },
                     ..Clip::default()
                 }],
             }],
@@ -173,6 +196,8 @@ mod tests {
         assert_eq!(back.canvas.resolution, Setting::Fixed((1920, 1080)));
         assert_eq!(back.canvas.fps, Setting::Auto);
         assert_eq!(back.sources[0].path, "a.mp4");
+        assert_eq!(back.sources[0].title, None);
+        assert_eq!(back.sources[1].title, sample().sources[1].title);
         assert_eq!(back.tracks[0].kind, TrackKind::Video);
         assert_eq!(back.tracks[0].clips[0], sample().tracks[0].clips[0]);
     }
@@ -190,9 +215,10 @@ mod tests {
     }
 
     /// A project saved before clips carried a level has to open at unity, not
-    /// at silence. This is what lets the format version stay put: the new
-    /// fields are additions with defaults, so every file this build has ever
-    /// written still reads.
+    /// at silence — and one saved before they could be placed on the canvas has
+    /// to open filling it, not shrunk into a corner. This is what lets the
+    /// format version stay put: the new fields are additions with defaults, so
+    /// every file this build has ever written still reads.
     #[test]
     fn a_clip_saved_without_a_level_loads_at_unity() {
         let text = r#"(
@@ -212,10 +238,15 @@ mod tests {
             )],
         )"#;
         let project: Project = ron::from_str(text).unwrap();
+        // The source entry predates titles too, and has to read as footage.
+        assert_eq!(project.sources[0].title, None);
         let clip = project.tracks[0].clips[0];
         assert_eq!(clip.gain, 1.0);
         assert_eq!((clip.fade_in, clip.fade_out), (0.0, 0.0));
         assert_eq!(clip.level(1.5), 1.0);
+        assert_eq!(clip.opacity, 1.0);
+        assert_eq!(clip.transform, Transform::default());
+        assert_eq!(clip.alpha(1.5), 1.0);
     }
 
     /// The parser has to skip the header we prepend, or every file we write is

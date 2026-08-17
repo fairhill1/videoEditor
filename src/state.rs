@@ -24,13 +24,14 @@ use crate::canvas::Setting;
 use crate::edit::EditSnapshot;
 use crate::export::{ExportJob, ExportRequest, Outcome, VideoSpec};
 use crate::input::DragMode;
-use crate::layout::{Splitter, TimelineHit};
+use crate::layout::{PreviewHit, Splitter, TimelineHit};
 use crate::media::MediaPool;
 use crate::project;
 use crate::quad::QuadRenderer;
 use crate::text::TextRenderer;
 use crate::theme::*;
 use crate::timeline::{SourceId, Timeline, Track, TrackKind};
+use crate::title::Title;
 use crate::ui::Rect;
 
 /// V1, V2, A1, A2 — the model supports arbitrary mixes; this is just a sensible
@@ -91,6 +92,14 @@ pub(crate) struct State {
     /// Read together through [`State::canvas`].
     pub(crate) canvas_res: Setting<(u32, u32)>,
     pub(crate) canvas_fps: Setting<f64>,
+    /// Where the canvas was last drawn inside the preview panel, in points,
+    /// and how many points one canvas pixel came out as.
+    ///
+    /// Recorded while drawing and consumed by the next press, the same bargain
+    /// the settings popup makes: the box you can grab is the box that was
+    /// painted, rather than a second derivation of it that could disagree.
+    pub(crate) preview_canvas: Rect,
+    pub(crate) preview_canvas_scale: f32,
     pub(crate) project_menu_open: bool,
     /// Popup geometry, filled in while drawing and consumed by the next click.
     /// Storing what was drawn — rather than recomputing the layout to hit-test
@@ -144,6 +153,14 @@ pub(crate) struct State {
     pub(crate) view_start: f64,
     pub(crate) view_dur: f64,
     pub(crate) pool_open_btn: Rect,
+    pub(crate) pool_title_btn: Rect,
+    /// The title being typed into, and what it said when typing started, so
+    /// Escape can put it back.
+    ///
+    /// Holding the original here rather than leaning on the undo stack is what
+    /// lets a cancelled edit leave no step behind at all: the text goes back
+    /// and the open edit closes having changed nothing.
+    pub(crate) editing_title: Option<(SourceId, Title)>,
     pub(crate) modifiers: ModifiersState,
     pub(crate) undo_stack: Vec<EditSnapshot>,
     pub(crate) redo_stack: Vec<EditSnapshot>,
@@ -237,6 +254,8 @@ impl State {
             split_pool_preview: MEDIA_PREVIEW_SPLIT,
             canvas_res: Setting::Auto,
             canvas_fps: Setting::Auto,
+            preview_canvas: Rect::default(),
+            preview_canvas_scale: 1.0,
             project_menu_open: false,
             project_menu_rect: Rect::default(),
             project_menu_items: Vec::new(),
@@ -260,6 +279,8 @@ impl State {
             view_start: 0.0,
             view_dur: f64::INFINITY,
             pool_open_btn: Rect::default(),
+            pool_title_btn: Rect::default(),
+            editing_title: None,
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -336,6 +357,14 @@ impl State {
             DragMode::ClipTrimLeft { .. }
             | DragMode::ClipTrimRight { .. }
             | DragMode::ClipFade { .. } => CursorIcon::ColResize,
+            DragMode::ClipMoveOnCanvas { .. } => CursorIcon::Grabbing,
+            DragMode::ClipScaleOnCanvas { corner, .. } => {
+                if corner[0] == corner[1] {
+                    CursorIcon::NwseResize
+                } else {
+                    CursorIcon::NeswResize
+                }
+            }
             DragMode::Scrub
             | DragMode::ClipMove { .. }
             | DragMode::PoolDrag { .. }
@@ -357,6 +386,22 @@ impl State {
         }
         if let Some(splitter) = self.splitter_at(self.cursor) {
             return splitter_cursor(splitter);
+        }
+        // Unlike a clip body in the timeline, a picture on the canvas is worth
+        // advertising: it is the one thing up there that can be dragged at all,
+        // and nothing about it says so on its own.
+        match self.preview_hit(self.cursor) {
+            // Pointed along the diagonal the corner actually travels, so the
+            // arrow says which way the picture will grow.
+            Some((_, _, PreviewHit::Scale { corner })) => {
+                return if corner[0] == corner[1] {
+                    CursorIcon::NwseResize
+                } else {
+                    CursorIcon::NeswResize
+                };
+            }
+            Some((_, _, PreviewHit::Move)) => return CursorIcon::Grab,
+            None => {}
         }
         // The scroll strip sits inside the lane hit test's reach, and a resize
         // arrow over a scrollbar would be a promise it doesn't keep.
@@ -423,8 +468,19 @@ impl State {
     /// `None` renders audio-only. A canvas exists either way, but with no video
     /// on the timeline there is nothing to draw on it, and encoding a silent
     /// black picture is not what "export" means here.
+    ///
+    /// "Video" means any clip on a video track, not one with a file behind it.
+    /// A sequence of titles over black is a picture, and asking whether some
+    /// footage set the canvas format would render that edit as audio.
     fn export_video_spec(&self) -> Option<VideoSpec> {
-        self.reference_video_source()?;
+        let has_picture = self
+            .timeline
+            .tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Video && !t.clips.is_empty());
+        if !has_picture {
+            return None;
+        }
         let canvas = self.canvas();
         Some(VideoSpec {
             width: canvas.width,
@@ -463,10 +519,21 @@ impl State {
             .map(|t| (t.kind, t.clips.clone()))
             .collect::<Vec<_>>();
         let mut paths = HashMap::new();
+        let mut titles = HashMap::new();
         for (_, clips) in &tracks {
             for clip in clips {
-                if let Some(src) = self.media.get(clip.source) {
-                    paths.insert(clip.source, src.path.clone());
+                let Some(src) = self.media.get(clip.source) else {
+                    continue;
+                };
+                // One or the other: a title has no file to reopen, and footage
+                // has nothing to draw.
+                match src.title.as_ref() {
+                    Some(title) => {
+                        titles.insert(clip.source, title.clone());
+                    }
+                    None => {
+                        paths.insert(clip.source, src.path.clone());
+                    }
                 }
             }
         }
@@ -476,6 +543,7 @@ impl State {
             video: self.export_video_spec(),
             tracks,
             paths,
+            titles,
         };
         self.export = Some(ExportJob::start(request));
         self.set_status("Starting…".into(), STATUS_INFO);

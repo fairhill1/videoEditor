@@ -5,10 +5,10 @@
 //! is over into a model change and hand it to `edit.rs`; the arithmetic of the
 //! change itself lives there.
 
-use crate::layout::{resolve_split, y_to_gain, Splitter, TimelineHit};
+use crate::layout::{resolve_split, y_to_gain, y_to_opacity, PreviewHit, Splitter, TimelineHit};
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{Clip, FadeSide, SourceId, TrackKind};
+use crate::timeline::{Clip, FadeSide, SourceId, TrackKind, Transform};
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum DragMode {
@@ -20,6 +20,25 @@ pub(crate) enum DragMode {
     ClipTrimRight { track: usize, idx: usize },
     ClipFade { track: usize, idx: usize, side: FadeSide },
     ClipLevel { track: usize, idx: usize },
+    /// Placing a clip's picture on the preview canvas. Both arms carry the
+    /// transform as it stood when the press landed and where the cursor was,
+    /// so the drag is always measured from the grab rather than accumulated
+    /// frame by frame — an accumulating drag drifts, and a clamped one drifts
+    /// permanently once it has run into a limit.
+    ClipMoveOnCanvas { track: usize, idx: usize, start: Transform, grab: [f32; 2] },
+    /// Scaling by a corner. `anchor` is the opposite corner in canvas pixels,
+    /// which stays put for the whole drag, and `corner` says which corner is
+    /// being pulled. `grab` is where the press landed, also in canvas pixels,
+    /// so the picture starts at exactly the size it already was however far off
+    /// the corner the cursor was.
+    ClipScaleOnCanvas {
+        track: usize,
+        idx: usize,
+        start: Transform,
+        grab: [f32; 2],
+        anchor: [f32; 2],
+        corner: [f32; 2],
+    },
     /// Dragging the timeline's scrollbar. `grab_dx` is how far along the thumb
     /// the press landed, so the thumb keeps its position under the cursor
     /// instead of jumping its own left edge there.
@@ -35,6 +54,11 @@ pub(crate) enum DragMode {
 
 impl State {
     pub(crate) fn begin_drag(&mut self) {
+        // A press anywhere is the end of typing into a title. Committed rather
+        // than cancelled — the click is about doing something else next, not
+        // about taking the words back — and before the guard below, so the
+        // typing session closes as itself rather than as a leaked drag.
+        self.finish_title_edit();
         // A press with an edit still open means the matching release never
         // arrived (focus lost mid-drag). Close it here — otherwise the depth
         // counter leaks and every later edit nests inside it, silently
@@ -132,8 +156,49 @@ impl State {
             }
             return;
         }
+        // Before the panels below, and after the toolbar above: the canvas is
+        // an island inside the preview well, and nothing else is drawn over it.
+        if let Some((track, idx, hit)) = self.preview_hit([cx, cy]) {
+            let start = self.timeline.tracks[track].clips[idx].transform;
+            self.begin_edit();
+            self.drag = match hit {
+                PreviewHit::Move => DragMode::ClipMoveOnCanvas {
+                    track,
+                    idx,
+                    start,
+                    grab: [cx, cy],
+                },
+                PreviewHit::Scale { corner } => {
+                    let source = self.timeline.tracks[track].clips[idx].source;
+                    let canvas = self.canvas();
+                    let (Some((sw, sh)), Some(grab)) =
+                        (self.source_size(source, canvas), self.cursor_on_canvas())
+                    else {
+                        return;
+                    };
+                    let [x, y, w, h] = canvas.place(sw as f32, sh as f32, start);
+                    DragMode::ClipScaleOnCanvas {
+                        track,
+                        idx,
+                        start,
+                        grab,
+                        // The corner across the picture from the one grabbed.
+                        anchor: [
+                            x + (1.0 - corner[0]) * w,
+                            y + (1.0 - corner[1]) * h,
+                        ],
+                        corner,
+                    }
+                }
+            };
+            return;
+        }
         if self.pool_open_btn.contains([cx, cy]) {
             self.open_file_picker();
+            return;
+        }
+        if self.pool_title_btn.contains([cx, cy]) {
+            self.add_title();
             return;
         }
         if let Some(id) = self.pool_close_hit(cx, cy) {
@@ -279,15 +344,78 @@ impl State {
                 };
                 self.set_clip_fade(track, idx, side, len);
             }
+            // A drag across the canvas moves the picture by the same distance
+            // the cursor travelled — converted through the preview's own scale,
+            // so the picture stays under the finger at any panel size, and
+            // stored as a fraction of the canvas so it stays put if the project
+            // is later re-mastered larger.
+            DragMode::ClipMoveOnCanvas { track, idx, start, grab } => {
+                let canvas = self.canvas();
+                let s = self.preview_canvas_scale;
+                if s <= 0.0 {
+                    return;
+                }
+                let wanted = Transform {
+                    x: start.x + (self.cursor[0] - grab[0]) / s / canvas.width as f32,
+                    y: start.y + (self.cursor[1] - grab[1]) / s / canvas.height as f32,
+                    ..start
+                };
+                let source = self.timeline.tracks[track].clips[idx].source;
+                let placed = match self.source_size(source, canvas) {
+                    Some(size) => self.snap_transform_offset(size, wanted),
+                    None => wanted,
+                };
+                self.set_clip_transform(track, idx, placed);
+            }
+            // Scale follows how much further from the pinned corner the cursor
+            // has travelled, projected onto the direction it was grabbed in. A
+            // bare distance ratio would have the picture swelling when the
+            // cursor moved sideways past the corner; the projection only counts
+            // movement along the line the grab established, which is also what
+            // keeps a uniform scale honest on a diagonal drag.
+            DragMode::ClipScaleOnCanvas { track, idx, start, grab, anchor, corner } => {
+                let Some(cursor) = self.cursor_on_canvas() else {
+                    return;
+                };
+                let v0 = [grab[0] - anchor[0], grab[1] - anchor[1]];
+                let v = [cursor[0] - anchor[0], cursor[1] - anchor[1]];
+                let den = v0[0] * v0[0] + v0[1] * v0[1];
+                // A press within a pixel of the pinned corner says nothing
+                // about a direction, and dividing by it would send the scale to
+                // whichever limit the noise pointed at.
+                if den < 1.0 {
+                    return;
+                }
+                let factor = (v[0] * v0[0] + v[1] * v0[1]) / den;
+                let source = self.timeline.tracks[track].clips[idx].source;
+                let Some(size) = self.source_size(source, self.canvas()) else {
+                    return;
+                };
+                let scale = self.snap_scale_about(size, anchor, corner, start.scale * factor);
+                let placed = self.transform_scaled_about(size, anchor, corner, scale);
+                self.set_clip_transform(track, idx, placed);
+            }
             DragMode::Scrollbar { grab_dx } => {
                 let layout = self.timeline_layout();
                 self.view_start = layout.scroll_x_to_view_start(self.cursor[0] - grab_dx);
             }
+            // One gesture, two quantities: the line under the cursor carries
+            // the sound's level on an audio lane and the picture's opacity on a
+            // video one, and which of the two it is follows the lane rather
+            // than anything the drag has to be told.
             DragMode::ClipLevel { track, idx } => {
                 let layout = self.timeline_layout();
                 let lane_y = self.lane_top(track, &layout);
-                let gain = y_to_gain(lane_y, layout.lane_h, self.cursor[1]);
-                self.set_clip_gain(track, idx, gain);
+                match self.timeline.tracks[track].kind {
+                    TrackKind::Audio => {
+                        let gain = y_to_gain(lane_y, layout.lane_h, self.cursor[1]);
+                        self.set_clip_gain(track, idx, gain);
+                    }
+                    TrackKind::Video => {
+                        let opacity = y_to_opacity(lane_y, layout.lane_h, self.cursor[1]);
+                        self.set_clip_opacity(track, idx, opacity);
+                    }
+                }
             }
         }
     }
@@ -306,7 +434,7 @@ impl State {
                     // is a no-op rather than a clip that renders as nothing.
                     TrackKind::Video if !self.media.has_video(source) => {}
                     TrackKind::Video => {
-                        let dur = self.media.duration(source);
+                        let dur = self.media.drop_duration(source);
                         // Decide up front whether we're auto-pairing audio —
                         // only then do we need a link id, and both sides must
                         // use the same one.
