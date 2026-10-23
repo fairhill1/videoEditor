@@ -4,7 +4,8 @@
 //! owning a resource and knowing nothing of the UI: `video` and `audio` decode,
 //! `media` pools what they produce, `timeline` is the edit model, `compose`
 //! resolves it into the pictures one frame is made of, `project` is its file
-//! format, and `export` renders it out.
+//! format, and `export` renders it out. `colorspace` is the RGB/YUV matrix
+//! the decode and the export both convert with.
 //!
 //! Along the other is the UI, which is one big [`state::State`] with its
 //! behaviour split by concern rather than by data. `theme` holds the constants
@@ -17,6 +18,7 @@
 mod app;
 mod audio;
 mod canvas;
+mod colorspace;
 mod compose;
 mod edit;
 mod export;

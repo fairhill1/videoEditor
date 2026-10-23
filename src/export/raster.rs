@@ -10,6 +10,7 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::software::scaling;
 use ffmpeg::{format, frame};
 
+use crate::colorspace;
 use crate::compose::Layer;
 
 /// Limited-range black in YUV420P, matching the range x264 signals by default,
@@ -167,13 +168,16 @@ fn for_each_plane(
     }
 }
 
-/// A colour in the output's YUV, obtained the same way every picture in the
-/// render gets there: by handing it to the scaler.
+/// A colour in the output's YUV, obtained by handing it to the scaler.
 ///
 /// Two by two because that is the smallest frame YUV420P can represent — one
-/// chroma sample needs a full quad of luma. Doing the matrix by hand would be
-/// six lines shorter and would quietly disagree with the footage the title sits
-/// over the first time either side changed its coefficients.
+/// chroma sample needs a full quad of luma.
+///
+/// The scaler is told BT.709 explicitly, matching the tag the encoder writes.
+/// Left to its default it uses BT.601, which a BT.709 player decodes as a
+/// slightly different shade: whites and greys survive, a saturated title
+/// colour does not. Footage needs no such care because it never goes through
+/// RGB — it stays in the YUV it was recorded in.
 pub(super) fn color_to_yuv(color: [f32; 4]) -> (u8, u8, u8) {
     let mut rgb = frame::Video::new(format::Pixel::RGBA, 2, 2);
     let stride = rgb.stride(0);
@@ -190,12 +194,31 @@ pub(super) fn color_to_yuv(color: [f32; 4]) -> (u8, u8, u8) {
             data[at..at + 4].copy_from_slice(&bytes);
         }
     }
-    let mut scaler = None;
     let mut yuv = frame::Video::empty();
-    if !scale_into(&mut scaler, &rgb, &mut yuv, 2, 2) {
-        // The scaler refusing a 2x2 conversion would be remarkable; mid grey
-        // is at least a colour rather than a panic in a background worker.
-        return (128, 128, 128);
+    // The scaler refusing a 2x2 conversion would be remarkable; mid grey is at
+    // least a colour rather than a panic in a background worker.
+    let grey = (128, 128, 128);
+    let mut scaler = match scaling::Context::get(
+        format::Pixel::RGBA,
+        2,
+        2,
+        format::Pixel::YUV420P,
+        2,
+        2,
+        scaling::Flags::BILINEAR,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("title colour scaler setup failed: {e}");
+            return grey;
+        }
+    };
+    if !colorspace::use_matrix(&mut scaler, ffmpeg::ffi::SWS_CS_ITU709) {
+        log::warn!("scaler kept its default matrix; title colours may shift");
+    }
+    if let Err(e) = scaler.run(&rgb, &mut yuv) {
+        log::error!("title colour conversion failed: {e}");
+        return grey;
     }
     (yuv.data(0)[0], yuv.data(1)[0], yuv.data(2)[0])
 }
@@ -487,6 +510,26 @@ mod tests {
     #[test]
     fn a_sliver_thinner_than_a_chroma_sample_places_nowhere() {
         assert!(place_even(&layer([1919.5, 0.0, 1.0, 200.0]), 1920, 1080).is_none());
+    }
+
+    /// Pure red under BT.709 limited range is Y 63, Cb 102, Cr 240; BT.601
+    /// would give Y 81, Cb 90. Luma and blue-difference are where the two
+    /// matrices part, so those are what this pins.
+    #[test]
+    fn title_colours_convert_with_the_bt709_matrix() {
+        let (y, cb, cr) = color_to_yuv([1.0, 0.0, 0.0, 1.0]);
+        assert!(y.abs_diff(63) <= 2, "Y {y}");
+        assert!(cb.abs_diff(102) <= 2, "Cb {cb}");
+        assert!(cr.abs_diff(240) <= 2, "Cr {cr}");
+    }
+
+    /// Neutral greys are where the matrices agree, and where the range
+    /// mapping is easiest to get wrong: white must land on 235, not 255.
+    #[test]
+    fn white_lands_on_limited_range_white() {
+        let (y, cb, cr) = color_to_yuv([1.0, 1.0, 1.0, 1.0]);
+        assert!(y.abs_diff(235) <= 1, "Y {y}");
+        assert!(cb.abs_diff(128) <= 1 && cr.abs_diff(128) <= 1, "Cb {cb} Cr {cr}");
     }
 
     fn flat_frame(w: u32, h: u32, y: u8, uv: u8) -> frame::Video {

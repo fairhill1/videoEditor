@@ -1,5 +1,6 @@
 use ffmpeg_next as ffmpeg;
 
+use crate::colorspace;
 use crate::quad::{QuadRenderer, Texture};
 
 const AV_TIME_BASE: f64 = 1_000_000.0;
@@ -76,8 +77,9 @@ impl VideoStream {
 
         let width = decoder.width();
         let height = decoder.height();
+        let matrix = colorspace::matrix_for(decoder.color_space(), height);
 
-        let scaler = ffmpeg::software::scaling::Context::get(
+        let mut scaler = ffmpeg::software::scaling::Context::get(
             decoder.format(),
             width,
             height,
@@ -86,6 +88,11 @@ impl VideoStream {
             height,
             ffmpeg::software::scaling::Flags::BILINEAR,
         )?;
+        // Both scalers are built once per stream and never rebuilt, so the
+        // matrix set here holds for every frame.
+        if !colorspace::use_matrix(&mut scaler, matrix) {
+            log::warn!("{path}: preview kept the default colour matrix");
+        }
 
         let texture =
             quads.create_empty_texture(device, width, height, wgpu::TextureFormat::Rgba8UnormSrgb);
@@ -102,6 +109,7 @@ impl VideoStream {
             thumb_h,
             ffmpeg::software::scaling::Flags::BILINEAR,
         )?;
+        colorspace::use_matrix(&mut thumb_scaler, matrix);
         let thumbnail = quads.create_empty_texture(
             device,
             thumb_w,
