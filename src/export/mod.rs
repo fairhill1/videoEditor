@@ -30,10 +30,14 @@ use crate::title::Title;
 use streams::{AudioRender, VideoRender};
 use take::{TitleTake, VideoTake};
 
-/// x264 knobs. `medium` is the usual speed/size compromise, and crf 20 is
-/// visually near-transparent on edited footage without producing huge files.
-const X264_OPTS: [(&str, &str); 2] = [("preset", "medium"), ("crf", "20")];
-const AUDIO_BIT_RATE: usize = 192_000;
+/// x264 knobs, set for a master that gets uploaded and re-encoded. Game
+/// footage (particles, foliage, fast pans) shows blocking at crf 20 that the
+/// platform's own encode then makes worse; crf 16 holds up, and `slow` buys
+/// back some of the size for export time nobody is waiting on.
+const X264_OPTS: [(&str, &str); 2] = [("preset", "slow"), ("crf", "16")];
+/// Above what a recording usually carries, so the re-encode adds little loss
+/// of its own.
+const AUDIO_BIT_RATE: usize = 256_000;
 /// Keyframe interval, in seconds. Frequent enough that the result scrubs
 /// responsively in a player.
 const GOP_SECONDS: f64 = 2.0;
@@ -376,6 +380,12 @@ fn open_video_encoder(
     enc.set_height(spec.height);
     enc.set_format(format::Pixel::YUV420P);
     enc.set_color_range(ffmpeg::color::Range::MPEG);
+    // Untagged, every player and upload pipeline guesses the colour space,
+    // and the guesses differ — the usual cause of a file looking washed out on
+    // one site and fine on another. The footage this edits is BT.709.
+    enc.set_colorspace(ffmpeg::color::Space::BT709);
+    enc.set_color_primaries(ffmpeg::color::Primaries::BT709);
+    enc.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
     enc.set_time_base(time_base);
     enc.set_frame_rate(Some(rate));
     enc.set_gop((spec.fps * GOP_SECONDS).round().max(1.0) as u32);
