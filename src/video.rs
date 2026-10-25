@@ -72,7 +72,16 @@ impl VideoStream {
             )
         };
 
-        let ctx = ffmpeg::codec::context::Context::from_parameters(parameters)?;
+        let mut ctx = ffmpeg::codec::context::Context::from_parameters(parameters)?;
+        // libavcodec decodes on one thread unless asked otherwise, and one
+        // core cannot keep up with 1440p60 HEVC: ~17ms a frame against a
+        // 16.7ms budget, before conversion and upload. Frame threading on
+        // every core brings that to ~3ms, at the cost of a few frames' extra
+        // latency after a seek.
+        ctx.set_threading(ffmpeg::codec::threading::Config {
+            kind: ffmpeg::codec::threading::Type::Frame,
+            count: 0,
+        });
         let decoder = ctx.decoder().video()?;
 
         let width = decoder.width();
