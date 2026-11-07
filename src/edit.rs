@@ -8,13 +8,14 @@
 use std::collections::HashSet;
 
 use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
+use crate::media::MediaPool;
 use crate::input::DragMode;
 use crate::state::State;
 use crate::clipboard;
 use crate::fonts;
 use crate::textedit::Cursor;
 use crate::layout::{PoolTab, TitleMenu};
-use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_INFO};
+use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_ERR, STATUS_INFO};
 use crate::title::Title;
 use crate::timeline::{
     db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Tracks, Transform,
@@ -947,9 +948,21 @@ impl State {
             return;
         }
         self.clipboard = self.timeline.copy(&ids);
+        self.remember_clipboard_sources();
         let n = self.clipboard.clips.len();
         let noun = if n == 1 { "clip" } else { "clips" };
         self.set_status(format!("Copied {n} {noun}"), STATUS_INFO);
+    }
+
+    /// Note what every copied clip's source is, and what is inside those, for
+    /// a paste into another project. See [`crate::media::Carried`].
+    fn remember_clipboard_sources(&mut self) {
+        let mut sources = std::collections::HashMap::new();
+        for (_, _, clip) in &self.clipboard.clips {
+            self.media.carry(clip.source, &mut sources);
+        }
+        self.clipboard_sources = sources;
+        self.clipboard_epoch = self.pool_epoch;
     }
 
     /// Paste what was copied at the playhead, or just after the clip the
@@ -959,8 +972,48 @@ impl State {
     /// A title comes back as a title of its own, a copy of the words: changing
     /// one afterwards leaves the other as it was, which is what copying text
     /// means everywhere else.
+    ///
+    /// Copied in another project, the clips bring their sources with them:
+    /// files are opened here (or found, if already in the pool), titles and
+    /// compound clips are made afresh. From then on the copy is one of this
+    /// project's, so pasting it again shares those as a paste here would.
     pub(crate) fn paste(&mut self) {
         let mut board = self.clipboard.clone();
+        // Before anything is filtered: bringing sources in is part of the
+        // paste's undo step.
+        self.begin_edit();
+        let foreign = self.clipboard_epoch != self.pool_epoch;
+        if foreign {
+            let carried = std::mem::take(&mut self.clipboard_sources);
+            let mut done = std::collections::HashMap::new();
+            let mut missing = 0;
+            let (device, queue, quads) = (&self.device, &self.queue, &self.quads);
+            let mut open = |pool: &mut MediaPool, path: &str| match pool.add(path, device, queue, quads) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    log::error!("paste: failed to open {path}: {e}");
+                    None
+                }
+            };
+            board.clips.retain_mut(|(_, _, clip)| {
+                match self.media.bring(clip.source, &carried, &mut done, &mut open) {
+                    Some(source) => {
+                        clip.source = source;
+                        true
+                    }
+                    None => {
+                        missing += 1;
+                        false
+                    }
+                }
+            });
+            self.clipboard = board.clone();
+            self.remember_clipboard_sources();
+            if missing > 0 {
+                let noun = if missing == 1 { "clip's file is" } else { "clips' files are" };
+                self.set_status(format!("{missing} {noun} missing, left out"), STATUS_ERR);
+            }
+        }
         // A source taken out of the pool since the copy has nothing to show.
         board.clips.retain(|(_, _, c)| self.media.get(c.source).is_some());
         // Nor can a compound clip go inside itself.
@@ -970,15 +1023,18 @@ impl State {
             self.refuse_nesting();
         }
         if board.is_empty() {
+            self.commit_edit();
             self.set_status("Nothing to paste - copy clips first".into(), STATUS_INFO);
             return;
         }
-        self.begin_edit();
-        let mut fresh = std::collections::HashMap::new();
-        for (_, _, clip) in &mut board.clips {
-            if let Some(title) = self.media.title(clip.source).cloned() {
-                clip.source =
-                    *fresh.entry(clip.source).or_insert_with(|| self.media.add_title(title));
+        // Titles just brought from another project are already fresh.
+        if !foreign {
+            let mut fresh = std::collections::HashMap::new();
+            for (_, _, clip) in &mut board.clips {
+                if let Some(title) = self.media.title(clip.source).cloned() {
+                    clip.source =
+                        *fresh.entry(clip.source).or_insert_with(|| self.media.add_title(title));
+                }
             }
         }
         let ids = self.timeline.paste(&board, self.audio.position());

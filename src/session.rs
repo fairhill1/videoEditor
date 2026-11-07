@@ -307,6 +307,7 @@ impl State {
         self.audio.set_playing(false);
         self.audio.set_position(0.0);
         self.media = media;
+        self.pool_epoch += 1;
         self.timeline = Timeline::new();
         self.timeline.tracks = tracks;
         self.timeline.reseed_counters();
@@ -343,6 +344,7 @@ impl State {
         self.audio.set_playing(false);
         self.audio.set_position(0.0);
         self.media = MediaPool::new();
+        self.pool_epoch += 1;
         self.timeline = Timeline::new();
         self.timeline.tracks = default_tracks();
         self.canvas_res = Setting::Auto;

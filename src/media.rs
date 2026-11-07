@@ -455,6 +455,94 @@ impl MediaPool {
     }
 }
 
+/// What a copied clip's source is, kept with the copy so a paste into another
+/// project can bring the source along.
+#[derive(Clone, Debug)]
+pub enum Carried {
+    /// Footage, sound or a picture: the file it was opened from. The paste
+    /// opens the same file, so it has to still be there.
+    File(String),
+    Title(Title),
+    Compound { name: String, tracks: Tracks },
+}
+
+impl MediaPool {
+    /// Note what source `id` is into `out`, and every source inside it when
+    /// it is a compound clip, for [`MediaPool::bring`] in another pool.
+    pub fn carry(&self, id: SourceId, out: &mut HashMap<SourceId, Carried>) {
+        if out.contains_key(&id) {
+            return;
+        }
+        let Some(src) = self.sources.get(&id) else {
+            return;
+        };
+        let carried = if let Some(title) = &src.title {
+            Carried::Title(title.clone())
+        } else if let Some(tracks) = &src.compound {
+            Carried::Compound { name: src.name.clone(), tracks: tracks.clone() }
+        } else if !src.path.is_empty() {
+            Carried::File(src.path.clone())
+        } else {
+            return;
+        };
+        let inner: Vec<SourceId> = match &carried {
+            Carried::Compound { tracks, .. } => {
+                tracks.iter().flat_map(|(_, clips)| clips.iter().map(|c| c.source)).collect()
+            }
+            _ => Vec::new(),
+        };
+        out.insert(id, carried);
+        for id in inner {
+            self.carry(id, out);
+        }
+    }
+
+    /// The source in this pool for `id` in the pool `carried` was noted
+    /// from: a file found here already, or opened with `open`; a title or a
+    /// compound clip made afresh, with everything inside it brought too.
+    /// `None` when it cannot be had — a file that has gone since. `done`
+    /// holds what has been brought so far, so a source used twice comes
+    /// once.
+    pub fn bring(
+        &mut self,
+        id: SourceId,
+        carried: &HashMap<SourceId, Carried>,
+        done: &mut HashMap<SourceId, Option<SourceId>>,
+        open: &mut dyn FnMut(&mut MediaPool, &str) -> Option<SourceId>,
+    ) -> Option<SourceId> {
+        if let Some(&known) = done.get(&id) {
+            return known;
+        }
+        // Settled as missing first, so a loop could only ever end.
+        done.insert(id, None);
+        let brought = match carried.get(&id)?.clone() {
+            Carried::File(path) => match self.find_path(&path) {
+                Some(found) => {
+                    self.show(found);
+                    Some(found)
+                }
+                None => open(self, &path),
+            },
+            Carried::Title(title) => Some(self.add_title(title)),
+            Carried::Compound { name, mut tracks } => {
+                for (_, clips) in &mut tracks {
+                    let mut kept = Vec::new();
+                    for mut clip in clips.drain(..) {
+                        if let Some(source) = self.bring(clip.source, carried, done, open) {
+                            clip.source = source;
+                            kept.push(clip);
+                        }
+                    }
+                    *clips = kept;
+                }
+                Some(self.add_compound(name, tracks))
+            }
+        };
+        done.insert(id, brought);
+        brought
+    }
+}
+
 /// The file name a pool row shows for `path`.
 fn file_name(path: &str) -> String {
     std::path::Path::new(path)
@@ -467,6 +555,50 @@ fn file_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compound_brings_everything_inside_it_into_another_pool() {
+        let clip = |source| Clip { source, source_out: 2.0, ..Clip::default() };
+        let mut old = MediaPool::new();
+        let logo = old.insert(Source::empty("logo.png".into(), "/v/logo.png".into()));
+        let gone = old.insert(Source::empty("gone.png".into(), "/v/gone.png".into()));
+        let words = old.add_title(Title { text: "Follow".into(), ..Title::default() });
+        let inner = old.add_compound("inner".into(), vec![(TrackKind::Video, vec![clip(words)])]);
+        let card = old.add_compound(
+            "end card".into(),
+            vec![(TrackKind::Video, vec![clip(logo), clip(gone), clip(words), clip(inner)])],
+        );
+        let mut carried = HashMap::new();
+        old.carry(card, &mut carried);
+        assert_eq!(carried.len(), 5);
+
+        // The new project already has the logo, removed from its pool.
+        let mut new = MediaPool::new();
+        new.add_title(Title::default());
+        let had = new.insert(Source::empty("logo.png".into(), "/v/logo.png".into()));
+        new.remove(had);
+        let mut opened = Vec::new();
+        let mut open = |_: &mut MediaPool, path: &str| {
+            opened.push(path.to_string());
+            None
+        };
+        let mut done = HashMap::new();
+        let brought = new.bring(card, &carried, &mut done, &mut open).unwrap();
+        // Only the file the new pool lacked was opened, and it failed.
+        assert_eq!(opened, vec!["/v/gone.png".to_string()]);
+        assert!(new.is_shown(had));
+
+        let tracks = new.compound(brought).unwrap();
+        let sources: Vec<SourceId> = tracks[0].1.iter().map(|c| c.source).collect();
+        assert_eq!(sources.len(), 3, "the missing file's clip is left out");
+        assert_eq!(sources[0], had);
+        let title = new.title(sources[1]).unwrap();
+        assert_eq!(title.text, "Follow");
+        // The title inside the nested compound is the same one, brought once.
+        let nested = new.compound(sources[2]).unwrap();
+        assert_eq!(nested[0].1[0].source, sources[1]);
+        assert_eq!(new.get(brought).unwrap().name, "end card");
+    }
 
     #[test]
     fn a_file_is_found_by_any_path_to_it_shown_or_not() {

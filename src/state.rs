@@ -146,8 +146,19 @@ pub(crate) struct State {
     /// recently: the *primary* clip, which the actions that only make sense on
     /// one clip — the canvas handles, typing into a title — act on.
     pub(crate) selected: Vec<u32>,
-    /// What Ctrl+C took, for Ctrl+V to put back. Kept for the session only.
+    /// What Ctrl+C took, for Ctrl+V to put back. Kept for the session only,
+    /// and across opening another project: see [`State::clipboard_sources`].
     pub(crate) clipboard: Clipboard,
+    /// What the copied clips' sources are — files, titles, compound clips and
+    /// everything inside those — so a paste into another project can bring
+    /// them along rather than reading its own pool's ids as if they matched.
+    pub(crate) clipboard_sources: std::collections::HashMap<SourceId, crate::media::Carried>,
+    /// Which pool the clipboard's source ids belong to: [`State::pool_epoch`]
+    /// as it was at the copy.
+    pub(crate) clipboard_epoch: u64,
+    /// Bumped whenever a project is opened or started, which replaces the
+    /// pool and every source id with it.
+    pub(crate) pool_epoch: u64,
     /// The compound clips open for editing, outermost first. The timeline
     /// shows the last one's contents; empty, it shows the project's own.
     pub(crate) compound_stack: Vec<crate::compound::CompoundEdit>,
@@ -353,6 +364,9 @@ impl State {
             timeline_paste_btn: Rect::default(),
             selected: Vec::new(),
             clipboard: Clipboard::default(),
+            clipboard_sources: Default::default(),
+            clipboard_epoch: 0,
+            pool_epoch: 0,
             compound_stack: Vec::new(),
             timeline_export_btn: Rect::default(),
             timeline_project_btn: Rect::default(),
