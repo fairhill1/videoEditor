@@ -36,6 +36,7 @@ mod layout;
 mod media;
 mod project;
 mod quad;
+mod reload;
 mod render;
 mod session;
 mod state;
@@ -57,6 +58,24 @@ use app::App;
 
 fn main() {
     env_logger::init();
+
+    // `videoEditor --check edit.vedit`: say whether a project file would
+    // open cleanly, without opening a window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--check") {
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: videoEditor --check <project.vedit>");
+            std::process::exit(2);
+        };
+        match reload::check(std::path::Path::new(path)) {
+            Ok(summary) => println!("{summary}"),
+            Err(problems) => {
+                eprintln!("{problems}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);

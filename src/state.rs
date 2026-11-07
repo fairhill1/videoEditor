@@ -158,6 +158,7 @@ pub(crate) struct State {
     /// rather than the timeline, which is what the left cluster edits.
     pub(crate) timeline_open_btn: Rect,
     pub(crate) timeline_save_btn: Rect,
+    pub(crate) timeline_reload_btn: Rect,
     /// The render in flight, if any. Only one at a time — the button greys out
     /// while it runs, and clicking it again cancels.
     pub(crate) export: Option<ExportJob>,
@@ -232,6 +233,9 @@ pub(crate) struct State {
     /// Where Ctrl+S writes without asking. `None` until the project has been
     /// saved once or opened from disk.
     pub(crate) project_path: Option<PathBuf>,
+    /// The project file as the session last matched it, watched for changes
+    /// made from outside.
+    pub(crate) disk: crate::reload::DiskState,
     /// Whether anything has changed since the last save. Drives the dot in the
     /// title bar and the prompt on close.
     pub(crate) dirty: bool,
@@ -344,6 +348,7 @@ impl State {
             timeline_project_btn: Rect::default(),
             timeline_open_btn: Rect::default(),
             timeline_save_btn: Rect::default(),
+            timeline_reload_btn: Rect::default(),
             export: None,
             status: None,
             snap_enabled: true,
@@ -372,6 +377,7 @@ impl State {
             pending_edit: None,
             edit_depth: 0,
             project_path: None,
+            disk: Default::default(),
             dirty: false,
             title_shown: String::new(),
         };

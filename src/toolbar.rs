@@ -287,6 +287,11 @@ impl State {
             x: (self.timeline_save_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
             ..self.timeline_project_btn
         };
+        // Reload, before Open: the file again, as it is on disk now.
+        self.timeline_reload_btn = Rect {
+            x: (self.timeline_open_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
+            ..self.timeline_project_btn
+        };
         // Zoom, after the editing buttons and set a little apart from them:
         // out, the slider, in, then fit. Every way the keyboard and wheel have
         // of changing the view has a control here too. Left out altogether
@@ -294,7 +299,7 @@ impl State {
         // rather than drawn underneath it.
         let zoom_x = self.timeline_snap_btn.x + stride + TRANSPORT_GAP;
         let zoom_w = TRANSPORT_BTN_W * 3.0 + ZOOM_SLIDER_W + TRANSPORT_GAP * 3.0;
-        let readout_left = self.timeline_open_btn.x - EXPORT_READOUT_GAP - EXPORT_READOUT_W;
+        let readout_left = self.timeline_reload_btn.x - EXPORT_READOUT_GAP - EXPORT_READOUT_W;
         if zoom_x + zoom_w <= readout_left {
             self.timeline_zoom_out_btn = Rect { x: zoom_x, ..self.timeline_split_btn };
             self.timeline_zoom_slider = Rect {
@@ -339,6 +344,20 @@ impl State {
             }
         };
         let buttons = [
+            (
+                self.timeline_reload_btn,
+                ICON_RELOAD,
+                if self.disk.pending {
+                    "Take the change made on disk (Ctrl+Z brings yours back)"
+                } else {
+                    "Reload the project from disk"
+                },
+                if self.disk.pending {
+                    BtnState::Toggle(true)
+                } else {
+                    avail(self.project_path.is_some())
+                },
+            ),
             (
                 self.timeline_open_btn,
                 ICON_OPEN,
@@ -527,7 +546,7 @@ impl State {
     /// the Export button, so a finished message appears exactly where the bar
     /// that produced it was.
     fn draw_export_readout(&mut self, toolbar_center_y: f32) {
-        let readout_right = self.timeline_open_btn.x - EXPORT_READOUT_GAP;
+        let readout_right = self.timeline_reload_btn.x - EXPORT_READOUT_GAP;
         let readout_left = readout_right - EXPORT_READOUT_W;
         let status_ascent = self.text.ascent(STATUS_SIZE);
         if let Some(job) = &self.export {

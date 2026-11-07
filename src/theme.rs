@@ -47,6 +47,7 @@ pub(crate) const ICON_EDIT: char = '\u{E1F9}'; // pencil
 pub(crate) const ICON_BACK: char = '\u{E048}'; // arrow-left
 pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
 pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
+pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.

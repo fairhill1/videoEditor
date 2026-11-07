@@ -79,6 +79,7 @@ impl ApplicationHandler for App {
                         state.import_files(&paths);
                     }
                 }
+                state.poll_disk();
                 state.update_title();
                 state.render();
                 state.get_window().request_redraw();

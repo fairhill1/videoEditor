@@ -282,6 +282,10 @@ impl State {
         // Consumed even when the project is clean and the button is greyed, for
         // the same reason as undo: falling through would scrub the timeline
         // underneath the toolbar.
+        if self.timeline_reload_btn.contains([cx, cy]) {
+            self.reload_project();
+            return;
+        }
         if self.timeline_save_btn.contains([cx, cy]) {
             if self.dirty {
                 self.save_project(false);

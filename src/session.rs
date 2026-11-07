@@ -195,6 +195,8 @@ impl State {
             .to_string();
         self.project_path = Some(path);
         self.dirty = false;
+        // The file now holds the session's own ids.
+        self.note_disk(HashMap::new());
         self.set_status(format!("Saved {name}"), STATUS_OK);
     }
 
@@ -314,6 +316,7 @@ impl State {
         self.apply_layout(loaded.layout);
         self.project_path = Some(path.to_path_buf());
         self.dirty = false;
+        self.note_disk(imported);
 
         let name = path
             .file_name()
@@ -348,6 +351,7 @@ impl State {
         self.apply_layout(None);
         self.project_path = None;
         self.dirty = false;
+        self.note_disk(HashMap::new());
     }
 
     /// Drop everything that pointed into the timeline that was just replaced.

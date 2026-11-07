@@ -51,3 +51,22 @@ future UI zoom folds in at that one place rather than at every call site.
 
 `theme.rs` holds every colour and metric. Drawing modules glob-import it, so a
 new value goes there rather than at its call site.
+
+## Editing a project file from outside
+
+A project (`*.vedit`) is RON, written by `project::write`; the user's live
+ones are in `~/Videos/RUVE_projects/`. The editor watches the open file
+(`reload.rs`) and takes a change in place as one undo step, so edits made to
+the file show up in the running app without reopening it.
+
+- Ask the user to save first. With unsaved work in the app, the change waits
+  and the toolbar's reload button lights up instead.
+- Sources are matched by id (titles, compounds) and by path (media), so keep
+  existing ids. A new source needs an id unused in the file; a new clip needs
+  a clip id unused on its timeline.
+- A clip's `transform` is an offset from centred in canvas widths and
+  heights, and a scale on the fit (1.0 fills without cropping). A title's
+  sizes are fractions of the canvas height; colours are straight sRGB 0 to 1.
+- Check the file before the app sees it:
+  `target/release/videoEditor --check <file>` prints `ok: ...` or the
+  problems, and exits non-zero on any.

@@ -417,6 +417,14 @@ impl MediaPool {
     pub fn ids(&self) -> &[SourceId] {
         &self.order
     }
+
+    /// Every source held, shown in the pool or not — removed ones are kept
+    /// for undo, and can be found again rather than opened a second time.
+    pub fn all_ids(&self) -> Vec<SourceId> {
+        let mut ids: Vec<SourceId> = self.sources.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
 }
 
 /// The file name a pool row shows for `path`.
