@@ -28,6 +28,11 @@ ICONS=(
     settings                  # timeline: project canvas settings
     folder-open               # timeline: open a project
     save                      # timeline: save the project
+    layout-grid               # media pool: switch to the grid view
+    list                      # media pool: switch to the list view
+    zoom-out                  # timeline: zoom out
+    zoom-in                   # timeline: zoom in
+    unfold-horizontal         # timeline: zoom to fit the whole edit
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

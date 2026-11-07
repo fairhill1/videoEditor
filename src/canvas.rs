@@ -19,17 +19,15 @@ use crate::ui::{draw_menu_row, Rect};
 pub(crate) const EXPORT_FALLBACK_SIZE: (u32, u32) = (1920, 1080);
 pub(crate) const EXPORT_FALLBACK_FPS: f64 = 30.0;
 
-// Project canvas presets, offered by the settings popup.
-pub(crate) const RES_PRESETS: [(u32, u32); 4] =
-    [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)];
-/// Grouped by column as they're laid out: film rates, standard, high. Keeping
-/// the grouping in the data means the popup's columns can't drift from the
-/// meaning they're supposed to carry.
-pub(crate) const FPS_COLUMNS: [&[f64]; 3] = [
-    &[23.976, 24.0],
-    &[25.0, 29.97, 30.0],
-    &[50.0, 59.94, 60.0],
+/// Project canvas presets, offered by the settings popup: landscape in one
+/// column, the same sizes stood on end in the other for vertical video.
+pub(crate) const RES_COLUMNS: [&[(u32, u32)]; 2] = [
+    &[(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)],
+    &[(2160, 3840), (1440, 2560), (1080, 1920), (720, 1280)],
 ];
+/// Frame rate presets, listed in the popup in this order: one column, highest
+/// first.
+pub(crate) const FPS_PRESETS: [f64; 8] = [60.0, 59.94, 50.0, 30.0, 29.97, 25.0, 24.0, 23.976];
 
 /// The project canvas: the picture every clip is composed onto, and the format
 /// the export is encoded in.
@@ -177,19 +175,18 @@ impl State {
     pub(crate) fn draw_project_menu(&mut self, anchor: Rect, win_w: f32, win_h: f32) {
         self.project_menu_items.clear();
 
-        let fps_grid_w = MENU_FPS_COL_W * 3.0 + MENU_FPS_COL_GAP * 2.0;
-        let body_w = MENU_RES_W.max(fps_grid_w);
+        let body_w = MENU_RES_COL_W * 2.0 + MENU_COL_GAP;
         let menu_w = body_w + MENU_PAD * 2.0;
 
         let header_h = (self.text.ascent(MENU_HEADER_SIZE) + 8.0).round();
         let stride = MENU_ROW_H + MENU_ROW_GAP;
-        let fps_rows = FPS_COLUMNS.iter().map(|c| c.len()).max().unwrap_or(0) as f32;
+        let res_rows = RES_COLUMNS.iter().map(|c| c.len()).max().unwrap_or(0) as f32;
         let menu_h = MENU_PAD * 2.0
             + header_h
-            + stride * (RES_PRESETS.len() + 1) as f32
+            + stride * (1.0 + res_rows)
             + MENU_SECTION_GAP
             + header_h
-            + stride * (1.0 + fps_rows);
+            + stride * (1 + FPS_PRESETS.len()) as f32;
 
         let below = anchor.y + anchor.h + MENU_GAP;
         let above = anchor.y - MENU_GAP - menu_h;
@@ -238,50 +235,51 @@ impl State {
 
         header(self, "RESOLUTION", cursor_y);
         cursor_y += header_h;
-        let res_options = std::iter::once((Setting::Auto, "Match first clip".to_string())).chain(
-            RES_PRESETS
-                .iter()
-                .map(|&(rw, rh)| (Setting::Fixed((rw, rh)), format!("{rw} x {rh}"))),
-        );
-        for (setting, label) in res_options {
-            let rect = Rect { x: x + MENU_PAD, y: cursor_y, w: body_w, h: MENU_ROW_H };
-            self.push_menu_row(
-                rect,
-                &label,
-                setting == self.canvas_res,
-                ProjectChoice::Resolution(setting),
-            );
-            cursor_y += stride;
-        }
-
-        cursor_y += MENU_SECTION_GAP;
-        header(self, "FRAME RATE", cursor_y);
-        cursor_y += header_h;
         let auto_rect = Rect { x: x + MENU_PAD, y: cursor_y, w: body_w, h: MENU_ROW_H };
         self.push_menu_row(
             auto_rect,
             "Match first clip",
-            self.canvas_fps == Setting::Auto,
-            ProjectChoice::Fps(Setting::Auto),
+            self.canvas_res == Setting::Auto,
+            ProjectChoice::Resolution(Setting::Auto),
         );
         cursor_y += stride;
-        for (col, rates) in FPS_COLUMNS.iter().enumerate() {
-            let col_x = x + MENU_PAD + col as f32 * (MENU_FPS_COL_W + MENU_FPS_COL_GAP);
-            for (row, &fps) in rates.iter().enumerate() {
+        for (col, sizes) in RES_COLUMNS.iter().enumerate() {
+            let col_x = x + MENU_PAD + col as f32 * (MENU_RES_COL_W + MENU_COL_GAP);
+            for (row, &(rw, rh)) in sizes.iter().enumerate() {
                 let rect = Rect {
                     x: col_x,
                     y: cursor_y + row as f32 * stride,
-                    w: MENU_FPS_COL_W,
+                    w: MENU_RES_COL_W,
                     h: MENU_ROW_H,
                 };
-                let setting = Setting::Fixed(fps);
+                let setting = Setting::Fixed((rw, rh));
                 self.push_menu_row(
                     rect,
-                    &fmt_fps(fps),
-                    self.canvas_fps == setting,
-                    ProjectChoice::Fps(setting),
+                    &format!("{rw} x {rh}"),
+                    self.canvas_res == setting,
+                    ProjectChoice::Resolution(setting),
                 );
             }
+        }
+        cursor_y += stride * res_rows;
+
+        cursor_y += MENU_SECTION_GAP;
+        header(self, "FRAME RATE", cursor_y);
+        cursor_y += header_h;
+        let fps_options = std::iter::once((Setting::Auto, "Match first clip".to_string())).chain(
+            FPS_PRESETS
+                .iter()
+                .map(|&fps| (Setting::Fixed(fps), fmt_fps(fps))),
+        );
+        for (setting, label) in fps_options {
+            let rect = Rect { x: x + MENU_PAD, y: cursor_y, w: body_w, h: MENU_ROW_H };
+            self.push_menu_row(
+                rect,
+                &label,
+                self.canvas_fps == setting,
+                ProjectChoice::Fps(setting),
+            );
+            cursor_y += stride;
         }
     }
 

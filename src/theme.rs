@@ -31,6 +31,11 @@ pub(crate) const ICON_CLOSE: char = '\u{E1B2}'; // x
 pub(crate) const ICON_SETTINGS: char = '\u{E154}'; // settings (gear)
 pub(crate) const ICON_OPEN: char = '\u{E247}'; // folder-open
 pub(crate) const ICON_SAVE: char = '\u{E14D}'; // save (floppy)
+pub(crate) const ICON_GRID: char = '\u{E0FF}'; // layout-grid
+pub(crate) const ICON_LIST: char = '\u{E106}'; // list
+pub(crate) const ICON_ZOOM_OUT: char = '\u{E1B7}'; // zoom-out
+pub(crate) const ICON_ZOOM_IN: char = '\u{E1B6}'; // zoom-in
+pub(crate) const ICON_ZOOM_FIT: char = '\u{E43D}'; // unfold-horizontal
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -52,7 +57,9 @@ pub(crate) const SPLITTER_ACTIVE_COLOR: [f32; 4] = [0.45, 0.45, 0.53, 1.0];
 /// The preview minimum is set by its transport bar rather than the picture:
 /// five buttons plus gaps plus the timecode readout is the point below which
 /// controls would start overlapping, and a preview can always letterbox.
-pub(crate) const POOL_MIN_W: f32 = 160.0;
+/// The pool's floor is its header: the label, the import and title buttons on
+/// the left and the view toggle on the right, without the two meeting.
+pub(crate) const POOL_MIN_W: f32 = 210.0;
 pub(crate) const PREVIEW_MIN_W: f32 = 340.0;
 /// Enough for the transport bar plus a sliver of picture above it.
 pub(crate) const TOP_MIN_H: f32 = TRANSPORT_BAR_H + 60.0;
@@ -194,6 +201,13 @@ pub(crate) const TRANSPORT_TOOLTIP_SIZE: f32 = TYPE_SM;
 // result of a save never fight for the same space.
 pub(crate) const EXPORT_BTN_W: f32 = TRANSPORT_BTN_W;
 pub(crate) const EXPORT_READOUT_W: f32 = 190.0;
+/// The timeline zoom slider: its full width, the groove the knob runs in, and
+/// the knob. The knob takes the scrollbar thumb's colours, since both are a
+/// handle on the same view.
+pub(crate) const ZOOM_SLIDER_W: f32 = 110.0;
+pub(crate) const ZOOM_SLIDER_GROOVE_H: f32 = 4.0;
+pub(crate) const ZOOM_SLIDER_KNOB_W: f32 = 10.0;
+pub(crate) const ZOOM_SLIDER_KNOB_H: f32 = 16.0;
 pub(crate) const EXPORT_READOUT_GAP: f32 = 10.0;
 pub(crate) const EXPORT_BAR_H: f32 = 4.0;
 pub(crate) const EXPORT_BAR_TRACK: [f32; 4] = [0.10, 0.10, 0.13, 1.0];
@@ -216,9 +230,9 @@ pub(crate) const MENU_SECTION_GAP: f32 = 12.0;
 pub(crate) const MENU_HEADER_SIZE: f32 = TYPE_SM;
 pub(crate) const MENU_HEADER_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
 pub(crate) const MENU_ROW_SIZE: f32 = TYPE_MD;
-pub(crate) const MENU_RES_W: f32 = 132.0;
-pub(crate) const MENU_FPS_COL_W: f32 = 60.0;
-pub(crate) const MENU_FPS_COL_GAP: f32 = 4.0;
+pub(crate) const MENU_RES_COL_W: f32 = 92.0;
+/// Gap between the landscape and portrait resolution columns.
+pub(crate) const MENU_COL_GAP: f32 = 4.0;
 /// Gap between the gear and the popup it opens, and the same faked soft shadow
 /// the tooltips use — see the note on `TOOLTIP_SHADOW` in `ui.rs`.
 pub(crate) const MENU_GAP: f32 = 7.0;
@@ -299,6 +313,19 @@ pub(crate) const POOL_CLOSE_BG: [f32; 4] = [0.0, 0.0, 0.0, 0.70];
 pub(crate) const POOL_CLOSE_BG_HOVER: [f32; 4] = [0.65, 0.25, 0.25, 0.95];
 pub(crate) const POOL_CLOSE_LABEL_SIZE: f32 = TYPE_LG;
 pub(crate) const POOL_CLOSE_GLYPH_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+
+// Media pool grid view: tiles with the picture on top and the name under it.
+/// Narrowest a tile may get before the grid drops a column. Wide enough that a
+/// frame still reads as a picture rather than a stamp.
+pub(crate) const POOL_TILE_MIN_W: f32 = 150.0;
+pub(crate) const POOL_TILE_GAP: f32 = 6.0;
+/// The band under a tile's picture that holds its name.
+pub(crate) const POOL_TILE_NAME_H: f32 = 22.0;
+/// The line marking where along the clip a hover scrub is looking. The
+/// playhead's colour, because it answers the same question about a clip that
+/// the playhead answers about the timeline.
+pub(crate) const POOL_SCRUB_LINE_COLOR: [f32; 4] = PLAYHEAD_COLOR;
+pub(crate) const POOL_SCRUB_LINE_W: f32 = 1.0;
 
 // Audio clip level and fades.
 //

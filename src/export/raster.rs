@@ -284,6 +284,65 @@ pub(super) fn compose_color(
     }
 }
 
+/// Paint `src` onto `dst` at `(x, y)`, as much of it at each pixel as `mask`
+/// says and `alpha` allows: an image with transparency over what is below.
+///
+/// [`compose_color`] with a picture in place of the flat colour, and the same
+/// treatment of chroma: each 2x2 block takes the mean of its four coverages, so
+/// a soft edge fades its colour at the rate its luma fades.
+pub(super) fn compose_masked(
+    dst: &mut frame::Video,
+    src: &frame::Video,
+    mask: &frame::Video,
+    x: u32,
+    y: u32,
+    alpha: f32,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+    let w = (src.width().min(mask.width())) as usize;
+    let h = (src.height().min(mask.height())) as usize;
+    let mask_stride = mask.stride(0);
+    let mask_data = mask.data(0);
+    let cov = |row: usize, col: usize| mask_data[row * mask_stride + col] as i32;
+    let scale = |c: i32| ((c as f32) * alpha) as i32;
+
+    let (src_stride, src_data) = (src.stride(0), src.data(0));
+    let stride = dst.stride(0);
+    let rows = h.min((dst.plane_height(0) as usize).saturating_sub(y as usize));
+    let cols = w.min((dst.plane_width(0) as usize).saturating_sub(x as usize));
+    let data = dst.data_mut(0);
+    for row in 0..rows {
+        let at = (y as usize + row) * stride + x as usize;
+        for col in 0..cols {
+            let s = src_data[row * src_stride + col];
+            data[at + col] = mix(data[at + col], s, scale(cov(row, col)));
+        }
+    }
+
+    for plane in [1usize, 2] {
+        let (src_stride, src_data) = (src.stride(plane), src.data(plane));
+        let stride = dst.stride(plane);
+        let rows = (h / 2).min((dst.plane_height(plane) as usize).saturating_sub(y as usize / 2));
+        let cols = (w / 2).min((dst.plane_width(plane) as usize).saturating_sub(x as usize / 2));
+        let data = dst.data_mut(plane);
+        for row in 0..rows {
+            let at = (y as usize / 2 + row) * stride + x as usize / 2;
+            for col in 0..cols {
+                let mean = (cov(row * 2, col * 2)
+                    + cov(row * 2, col * 2 + 1)
+                    + cov(row * 2 + 1, col * 2)
+                    + cov(row * 2 + 1, col * 2 + 1))
+                    / 4;
+                let s = src_data[row * src_stride + col];
+                data[at + col] = mix(data[at + col], s, scale(mean));
+            }
+        }
+    }
+}
+
 /// `d` moved `a` of the way to `s`, where `a` is 0..=255.
 fn mix(d: u8, s: u8, a: i32) -> u8 {
     let (d, s) = (d as i32, s as i32);
@@ -392,7 +451,7 @@ pub(super) fn scale_into(
             format::Pixel::YUV420P,
             w,
             h,
-            scaling::Flags::BILINEAR,
+            scaling::Flags::LANCZOS,
         ) {
             Ok(s) => scaler.insert(s),
             Err(e) => {
@@ -408,7 +467,7 @@ pub(super) fn scale_into(
         format::Pixel::YUV420P,
         w,
         h,
-        scaling::Flags::BILINEAR,
+        scaling::Flags::LANCZOS,
     );
     if let Err(e) = ctx.run(src, dst) {
         log::error!("export scale failed: {e}");
@@ -577,5 +636,30 @@ mod tests {
         compose(&mut canvas, &over, 0, 0, 0.0);
         assert_eq!(canvas.data(0)[0], 16);
         assert_eq!(canvas.data(1)[0], 128);
+    }
+
+    /// An image whose left half is opaque and right half clear lands as itself
+    /// on the left and leaves the canvas alone on the right, chroma included.
+    #[test]
+    fn a_masked_picture_shows_only_where_its_mask_is_set() {
+        let mut dst = flat_frame(8, 4, 16, 128);
+        let src = flat_frame(8, 4, 235, 200);
+        let mut mask = frame::Video::new(format::Pixel::GRAY8, 8, 4);
+        let stride = mask.stride(0);
+        for row in 0..4 {
+            for col in 0..8 {
+                mask.data_mut(0)[row * stride + col] = if col < 4 { 255 } else { 0 };
+            }
+        }
+        compose_masked(&mut dst, &src, &mask, 0, 0, 1.0);
+        assert_eq!(dst.data(0)[0], 235);
+        assert_eq!(dst.data(0)[7], 16);
+        assert_eq!(dst.data(1)[0], 200);
+        assert_eq!(dst.data(1)[3], 128);
+
+        // Opacity scales the mask: half of an opaque pixel is half way.
+        let mut dst = flat_frame(8, 4, 16, 128);
+        compose_masked(&mut dst, &src, &mask, 0, 0, 0.5);
+        assert!(dst.data(0)[0].abs_diff(125) <= 1, "{}", dst.data(0)[0]);
     }
 }

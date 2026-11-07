@@ -79,6 +79,26 @@ pub(crate) fn resolve_view(want_start: f64, want_dur: f64, content: f64) -> (f64
     (want_start.clamp(0.0, content - dur), dur)
 }
 
+/// Where a view `dur` long sits on the zoom slider: 0 shows all of `content`,
+/// 1 is zoomed in as far as [`MIN_VIEW_SPAN`].
+///
+/// Logarithmic, so equal distances along the slider are equal zoom ratios, as
+/// wheel notches are. A linear slider would spend nearly its whole length on
+/// the widest views and cram every useful close-up into its last few points.
+pub(crate) fn zoom_fraction(dur: f64, content: f64) -> f64 {
+    let range = (content / MIN_VIEW_SPAN).ln();
+    if range <= 0.0 {
+        return 0.0;
+    }
+    ((content / dur).ln() / range).clamp(0.0, 1.0)
+}
+
+/// The view length at `fraction` along the zoom slider; the inverse of
+/// [`zoom_fraction`].
+pub(crate) fn zoom_span(fraction: f64, content: f64) -> f64 {
+    content / (content / MIN_VIEW_SPAN).max(1.0).powf(fraction.clamp(0.0, 1.0))
+}
+
 pub(crate) enum TimelineHit {
     None,
     Ruler,
@@ -346,6 +366,86 @@ pub(crate) fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
         .round()
 }
 
+/// How the media pool lays its sources out.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) enum PoolView {
+    /// One row per source: a small thumbnail with the name and format beside it.
+    #[default]
+    List,
+    /// Tiles: a large thumbnail with the name under it.
+    Grid,
+}
+
+/// Where one pool entry sits: the whole cell, which a press picks up and the
+/// close button sits in the corner of, and the thumbnail slot inside it, which
+/// a hover scrubs.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct PoolCell {
+    pub(crate) cell: Rect,
+    pub(crate) thumb: Rect,
+}
+
+/// The cells for the first `n` pool entries in a pool `pool_w` wide, stopping
+/// at the first one that would run past `pool_h`.
+///
+/// The one place pool geometry is worked out: drawing and every pool hit test
+/// read it from here, so a view switch cannot leave a row clickable where it
+/// used to be drawn.
+pub(crate) fn pool_cells(view: PoolView, pool_w: f32, pool_h: f32, n: usize) -> Vec<PoolCell> {
+    let avail = (pool_w - LABEL_PAD * 2.0).max(1.0);
+    let mut cells = Vec::with_capacity(n);
+    match view {
+        PoolView::List => {
+            for i in 0..n {
+                let y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
+                if y + POOL_ROW_HEIGHT > pool_h {
+                    break;
+                }
+                cells.push(PoolCell {
+                    cell: Rect { x: LABEL_PAD, y, w: avail, h: POOL_ROW_HEIGHT },
+                    thumb: Rect {
+                        x: LABEL_PAD + POOL_ROW_PAD,
+                        y: y + POOL_ROW_PAD,
+                        w: POOL_THUMB_W,
+                        h: POOL_THUMB_H,
+                    },
+                });
+            }
+        }
+        PoolView::Grid => {
+            // As many columns as fit at the minimum tile width, then the tiles
+            // widen to share out what is left, so the grid always spans the
+            // pool rather than leaving a ragged strip down the right.
+            let cols = ((avail + POOL_TILE_GAP) / (POOL_TILE_MIN_W + POOL_TILE_GAP))
+                .floor()
+                .max(1.0);
+            let tile_w = ((avail - POOL_TILE_GAP * (cols - 1.0)) / cols).floor();
+            let thumb_w = tile_w - POOL_ROW_PAD * 2.0;
+            let thumb_h = (thumb_w * 9.0 / 16.0).round();
+            let tile_h = POOL_ROW_PAD + thumb_h + POOL_TILE_NAME_H;
+            let cols = cols as usize;
+            for i in 0..n {
+                let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+                let x = LABEL_PAD + col * (tile_w + POOL_TILE_GAP);
+                let y = POOL_LIST_TOP + row * (tile_h + POOL_TILE_GAP);
+                if y + tile_h > pool_h {
+                    break;
+                }
+                cells.push(PoolCell {
+                    cell: Rect { x, y, w: tile_w, h: tile_h },
+                    thumb: Rect {
+                        x: x + POOL_ROW_PAD,
+                        y: y + POOL_ROW_PAD,
+                        w: thumb_w,
+                        h: thumb_h,
+                    },
+                });
+            }
+        }
+    }
+    cells
+}
+
 pub(crate) fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
     Rect {
         x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_BOX,
@@ -456,6 +556,21 @@ impl State {
     pub(crate) fn pan_timeline(&mut self, notches: f64) {
         let (start, dur) = self.view_window();
         self.view_start = start + notches * PAN_STEP_FRAC * dur;
+    }
+
+    /// Zoom to `fraction` along the zoom slider, about the playhead as the
+    /// keyboard zoom is: the slider is in the toolbar, and where the pointer
+    /// sits on it says nothing about which part of the edit to look at.
+    pub(crate) fn zoom_timeline_to_fraction(&mut self, fraction: f64) {
+        if fraction <= 0.0 {
+            // Exactly the fit state, rather than a span that happens to equal
+            // today's content and would stop fitting once a clip is added.
+            self.zoom_timeline_to_fit();
+            return;
+        }
+        let (_, dur) = self.view_window();
+        let want = zoom_span(fraction, self.content_duration());
+        self.zoom_at_playhead((dur / want).ln() / ZOOM_STEP.ln());
     }
 
     pub(crate) fn zoom_timeline_to_fit(&mut self) {
@@ -688,33 +803,27 @@ impl State {
         ])
     }
 
+    /// Every pool entry that fits in the panel, with where it sits.
+    pub(crate) fn pool_items(&self) -> Vec<(SourceId, PoolCell)> {
+        let ids = self.media.ids();
+        let cells = pool_cells(self.pool_view, self.media_pool_w(), self.timeline_top(), ids.len());
+        ids.iter().copied().zip(cells).collect()
+    }
+
     pub(crate) fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let media_w = self.media_pool_w();
-        let top_h = self.timeline_top();
-        if cursor_x < 0.0 || cursor_x > media_w || cursor_y < POOL_LIST_TOP || cursor_y > top_h {
-            return None;
-        }
-        let stride = POOL_ROW_HEIGHT + POOL_ROW_GAP;
-        let rel_y = cursor_y - POOL_LIST_TOP;
-        let i = (rel_y / stride).floor() as usize;
-        let within = rel_y - i as f32 * stride;
-        if within > POOL_ROW_HEIGHT {
-            return None; // in the gap between rows
-        }
-        self.media.ids().get(i).copied()
+        self.pool_items()
+            .into_iter()
+            .find(|(_, c)| c.cell.contains([cursor_x, cursor_y]))
+            .map(|(id, _)| id)
     }
 
     pub(crate) fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
-        let media_w = self.media_pool_w();
-        let row_w = (media_w - LABEL_PAD * 2.0).max(1.0);
-        for (i, &id) in self.media.ids().iter().enumerate() {
-            let row_y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
-            let close = pool_row_close_rect(LABEL_PAD, row_y, row_w);
-            if close.contains([cursor_x, cursor_y]) {
-                return Some(id);
-            }
-        }
-        None
+        self.pool_items()
+            .into_iter()
+            .find(|(_, c)| {
+                pool_row_close_rect(c.cell.x, c.cell.y, c.cell.w).contains([cursor_x, cursor_y])
+            })
+            .map(|(id, _)| id)
     }
 }
 
@@ -887,5 +996,72 @@ mod tests {
         assert_eq!(v2 + h + TRACK_LANE_GAP, v1);
         // The gap at the divider is shared, half to each side.
         assert_eq!(center - (v1 + h), a1 - center);
+    }
+
+    #[test]
+    fn a_grid_fills_the_pool_width_with_whole_tiles() {
+        for pool_w in [POOL_MIN_W, 330.0, 500.0, 900.0] {
+            let cells = pool_cells(PoolView::Grid, pool_w, 10_000.0, 12);
+            let right = cells.iter().map(|c| c.cell.x + c.cell.w).fold(0.0, f32::max);
+            assert!(right <= pool_w - LABEL_PAD, "{pool_w}: runs to {right}");
+            for c in &cells {
+                assert!(c.cell.w >= POOL_TILE_MIN_W || pool_w < POOL_TILE_MIN_W + LABEL_PAD * 3.0);
+            }
+        }
+        // Wide enough for three at the minimum, so three it is.
+        let three = LABEL_PAD * 2.0 + POOL_TILE_MIN_W * 3.0 + POOL_TILE_GAP * 2.0;
+        let cells = pool_cells(PoolView::Grid, three, 10_000.0, 4);
+        assert_eq!(cells[2].cell.y, cells[0].cell.y);
+        assert!(cells[3].cell.y > cells[0].cell.y);
+    }
+
+    #[test]
+    fn no_two_pool_cells_overlap_in_either_view() {
+        for view in [PoolView::List, PoolView::Grid] {
+            let cells = pool_cells(view, 480.0, 10_000.0, 9);
+            assert_eq!(cells.len(), 9);
+            for (i, a) in cells.iter().enumerate() {
+                assert!(a.cell.contains([a.thumb.x, a.thumb.y]));
+                assert!(a.cell.contains([a.thumb.x + a.thumb.w, a.thumb.y + a.thumb.h]));
+                for b in &cells[i + 1..] {
+                    let apart = a.cell.x + a.cell.w < b.cell.x
+                        || b.cell.x + b.cell.w < a.cell.x
+                        || a.cell.y + a.cell.h < b.cell.y
+                        || b.cell.y + b.cell.h < a.cell.y;
+                    assert!(apart, "{view:?}: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pool_cell_that_would_run_off_the_panel_is_left_out() {
+        for view in [PoolView::List, PoolView::Grid] {
+            let cells = pool_cells(view, 400.0, 300.0, 50);
+            assert!(!cells.is_empty() && cells.len() < 50);
+            assert!(cells.iter().all(|c| c.cell.y + c.cell.h <= 300.0));
+        }
+    }
+
+    #[test]
+    fn the_zoom_slider_reads_back_the_span_it_sets() {
+        for content in [MIN_CONTENT_SPAN, 12.0, 600.0, 7200.0] {
+            for fraction in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                let back = zoom_fraction(zoom_span(fraction, content), content);
+                assert!((back - fraction).abs() < 1e-9, "{content}: {fraction} -> {back}");
+            }
+            assert_eq!(zoom_span(0.0, content), content);
+            assert!((zoom_span(1.0, content) - MIN_VIEW_SPAN).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_zoom_slider_steps_by_ratios_not_seconds() {
+        // The same distance along the slider is the same zoom factor wherever
+        // it is taken, which is what makes the slider feel like the wheel.
+        let content = 600.0;
+        let a = zoom_span(0.2, content) / zoom_span(0.3, content);
+        let b = zoom_span(0.7, content) / zoom_span(0.8, content);
+        assert!((a - b).abs() < 1e-9);
     }
 }

@@ -5,10 +5,13 @@
 //! is over into a model change and hand it to `edit.rs`; the arithmetic of the
 //! change itself lives there.
 
-use crate::layout::{resolve_split, y_to_gain, y_to_opacity, PreviewHit, Splitter, TimelineHit};
+use crate::layout::{
+    resolve_split, y_to_gain, y_to_opacity, PoolView, PreviewHit, Splitter, TimelineHit,
+};
 use crate::state::State;
 use crate::theme::*;
 use crate::timeline::{Clip, FadeSide, SourceId, TrackKind, Transform};
+use crate::ui::Rect;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum DragMode {
@@ -46,6 +49,9 @@ pub(crate) enum DragMode {
     /// Outside the undo system, like [`DragMode::Splitter`]: where you are
     /// looking is not an edit.
     Scrollbar { grab_dx: f32 },
+    /// Dragging the timeline zoom slider's knob. Outside the undo system for
+    /// the same reason as the scrollbar.
+    ZoomSlider,
     /// Dragging a panel divider. Deliberately outside the undo system: where
     /// the panels sit is a view preference, and burying a real edit one step
     /// further back in the history every time you resize would be maddening.
@@ -139,6 +145,24 @@ impl State {
             self.snap_enabled = !self.snap_enabled;
             return;
         }
+        if self.timeline_zoom_out_btn.contains([cx, cy]) {
+            self.zoom_at_playhead(-1.0);
+            return;
+        }
+        if self.timeline_zoom_in_btn.contains([cx, cy]) {
+            self.zoom_at_playhead(1.0);
+            return;
+        }
+        if self.timeline_zoom_fit_btn.contains([cx, cy]) {
+            self.zoom_timeline_to_fit();
+            return;
+        }
+        if self.timeline_zoom_slider.contains([cx, cy]) {
+            // The knob jumps to the press, then follows the drag.
+            self.drag = DragMode::ZoomSlider;
+            self.update_drag();
+            return;
+        }
         if self.timeline_export_btn.contains([cx, cy]) {
             self.start_export();
             return;
@@ -199,6 +223,13 @@ impl State {
         }
         if self.pool_title_btn.contains([cx, cy]) {
             self.add_title();
+            return;
+        }
+        if self.pool_view_btn.contains([cx, cy]) {
+            self.pool_view = match self.pool_view {
+                PoolView::List => PoolView::Grid,
+                PoolView::Grid => PoolView::List,
+            };
             return;
         }
         if let Some(id) = self.pool_close_hit(cx, cy) {
@@ -269,6 +300,10 @@ impl State {
         match self.drag {
             DragMode::None | DragMode::PoolDrag { .. } => {}
             DragMode::Scrub => self.apply_scrub(),
+            DragMode::ZoomSlider => {
+                let fraction = zoom_slider_fraction(self.timeline_zoom_slider, self.cursor[0]);
+                self.zoom_timeline_to_fraction(fraction);
+            }
             // Store the clamped position rather than the raw cursor. Past a
             // minimum the divider stops either way, but re-clamping on write
             // means it is back under the cursor the instant you drag back,
@@ -606,4 +641,12 @@ impl State {
         }
         self.audio.toggle();
     }
+}
+
+/// How far along the zoom `slider` a cursor at `x` puts the knob's centre, as
+/// 0 to 1. The knob's own half-width is taken off each end, so the extremes
+/// are reached with the knob still wholly inside the slider.
+pub(crate) fn zoom_slider_fraction(slider: Rect, x: f32) -> f64 {
+    let travel = (slider.w - ZOOM_SLIDER_KNOB_W).max(1.0);
+    (((x - slider.x - ZOOM_SLIDER_KNOB_W * 0.5) / travel) as f64).clamp(0.0, 1.0)
 }

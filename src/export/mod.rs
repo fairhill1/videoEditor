@@ -28,7 +28,7 @@ use crate::timeline::{Clip, SourceId, TrackKind};
 use crate::title::Title;
 
 use streams::{AudioRender, VideoRender};
-use take::{TitleTake, VideoTake};
+use take::{StillTake, TitleTake, VideoTake};
 
 /// x264 knobs, set for a master that gets uploaded and re-encoded. Game
 /// footage (particles, foliage, fast pans) shows blocking at crf 20 that the
@@ -66,6 +66,9 @@ pub struct ExportRequest {
     /// instead. Same bargain as `paths`: the worker renders what the timeline
     /// said when the button was pressed, and the session stays editable.
     pub titles: HashMap<SourceId, Title>,
+    /// Images, by path. Kept apart from `paths` because they are opened as a
+    /// picture to hold rather than as footage to decode frame by frame.
+    pub stills: HashMap<SourceId, String>,
 }
 
 pub enum Outcome {
@@ -219,6 +222,7 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
             };
             let takes = open_video_takes(req)?;
             let titles = bake_titles(req, spec);
+            let stills = open_stills(req)?;
             Some(VideoRender {
                 enc,
                 enc_tb,
@@ -227,6 +231,7 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
                 spec,
                 takes,
                 titles,
+                stills,
             })
         }
         None => None,
@@ -424,7 +429,7 @@ fn source_ids(req: &ExportRequest, kind: TrackKind) -> HashSet<SourceId> {
         .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
         // Generated sources have no file behind them, so every path this feeds
         // would come back missing.
-        .filter(|id| !req.titles.contains_key(id))
+        .filter(|id| !req.titles.contains_key(id) && !req.stills.contains_key(id))
         .collect()
 }
 
@@ -464,6 +469,22 @@ fn bake_titles(req: &ExportRequest, spec: VideoSpec) -> HashMap<SourceId, TitleT
         .filter(|(id, _)| used.contains(id))
         .map(|(id, title)| (*id, TitleTake::bake(title, spec.width, spec.height)))
         .collect()
+}
+
+fn open_stills(req: &ExportRequest) -> Result<HashMap<SourceId, StillTake>, String> {
+    let used: HashSet<SourceId> = req
+        .tracks
+        .iter()
+        .filter(|(kind, _)| *kind == TrackKind::Video)
+        .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
+        .collect();
+    let mut stills = HashMap::new();
+    for (id, path) in req.stills.iter().filter(|(id, _)| used.contains(id)) {
+        // Fail the export rather than leave a hole, as for footage.
+        let still = StillTake::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        stills.insert(*id, still);
+    }
+    Ok(stills)
 }
 
 fn open_audio_takes(req: &ExportRequest) -> Result<HashMap<SourceId, AudioStream>, String> {
@@ -561,6 +582,7 @@ mod tests {
             tracks,
             paths,
             titles,
+            stills: HashMap::new(),
         };
 
         let shared = Mutex::new(Shared {
@@ -642,6 +664,7 @@ mod tests {
             tracks,
             paths: HashMap::new(),
             titles: HashMap::from([(overlay, Title::default())]),
+            stills: HashMap::new(),
         };
 
         let shared = Mutex::new(Shared {
@@ -679,6 +702,71 @@ mod tests {
         }
         std::fs::remove_file(&output).ok();
         assert!(brightest > 128, "the title never reached the picture ({brightest})");
+    }
+
+    /// An image whose left half is opaque red and right half clear, rendered
+    /// over nothing: the left half has to come out red in BT.709 terms and the
+    /// right half has to stay black. Covers the still path end to end —
+    /// decode, convert, mask, compose, encode. Skips without an `ffmpeg` CLI
+    /// to draw the fixture.
+    #[test]
+    fn renders_a_still_with_its_transparency() {
+        let dir = std::env::temp_dir().join(format!("ruve-still-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("half.png");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x48"])
+            .args(["-vf", "format=rgba,geq=r=255:g=0:b=0:a='if(lt(X,W/2),255,0)'"])
+            .args(["-frames:v", "1"])
+            .arg(&png)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let still = SourceId(0);
+        let tracks = vec![(
+            TrackKind::Video,
+            vec![Clip { id: 0, source: still, source_out: 1.0, ..Clip::default() }],
+        )];
+        let output = dir.join("out.mp4");
+        let req = ExportRequest {
+            output: output.clone(),
+            video: Some(VideoSpec { width: 64, height: 48, fps: 25.0 }),
+            tracks,
+            paths: HashMap::new(),
+            titles: HashMap::new(),
+            stills: HashMap::from([(still, png.to_str().unwrap().to_string())]),
+        };
+        let shared = Mutex::new(Shared { progress: Progress::default(), outcome: None });
+        assert!(run(&req, &shared, &AtomicBool::new(false)).expect("still export failed"));
+
+        let mut ictx = format::input(&output).expect("output is not readable");
+        let stream = ictx.streams().best(ffmpeg::media::Type::Video).unwrap();
+        let index = stream.index();
+        let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        let mut frame = frame::Video::empty();
+        let mut last = None;
+        for (stream, packet) in ictx.packets() {
+            if stream.index() == index {
+                decoder.send_packet(&packet).unwrap();
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    last = Some(frame.clone());
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        let frame = last.expect("no frames decoded");
+        let y = |x: usize, row: usize| frame.data(0)[row * frame.stride(0) + x];
+        let cr = |x: usize, row: usize| frame.data(2)[row * frame.stride(2) + x];
+        // BT.709 limited-range red is Y 63, Cr 240; BT.601 would put Y at 81.
+        assert!(y(8, 24).abs_diff(63) <= 6, "left Y {}", y(8, 24));
+        assert!(cr(4, 12).abs_diff(240) <= 6, "left Cr {}", cr(4, 12));
+        assert!(y(56, 24).abs_diff(16) <= 6, "right Y {}", y(56, 24));
+        assert!(cr(28, 12).abs_diff(128) <= 6, "right Cr {}", cr(28, 12));
     }
 
     #[test]

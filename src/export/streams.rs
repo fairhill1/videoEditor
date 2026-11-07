@@ -15,8 +15,8 @@ use crate::canvas::Canvas;
 use crate::compose::layers_at;
 use crate::timeline::{Clip, SourceId, TrackKind};
 
-use super::raster::{compose, compose_color, fill_black, place_even};
-use super::take::{TitleTake, VideoTake};
+use super::raster::{compose, compose_color, compose_masked, fill_black, place_even};
+use super::take::{StillTake, TitleTake, VideoTake};
 use super::{drain, VideoSpec};
 
 /// Re-seek an audio source once its read head drifts this far from where the
@@ -31,6 +31,7 @@ pub(super) struct VideoRender {
     pub(super) spec: VideoSpec,
     pub(super) takes: HashMap<SourceId, VideoTake>,
     pub(super) titles: HashMap<SourceId, TitleTake>,
+    pub(super) stills: HashMap<SourceId, StillTake>,
 }
 
 impl VideoRender {
@@ -65,7 +66,7 @@ impl VideoRender {
         // Which pictures, where, and how much of each — decided by the same
         // code the preview asks, so the file is the frame that was approved on
         // screen rather than a second interpretation of the timeline.
-        let (takes, titles) = (&self.takes, &self.titles);
+        let (takes, titles, stills) = (&self.takes, &self.titles, &self.stills);
         let layers = layers_at(
             tracks.iter().map(|(kind, clips)| (*kind, clips.as_slice())),
             t,
@@ -75,6 +76,7 @@ impl VideoRender {
                     .get(&source)
                     .map(VideoTake::size)
                     .or_else(|| titles.get(&source).map(TitleTake::size))
+                    .or_else(|| stills.get(&source).map(StillTake::size))
             },
         );
         for layer in &layers {
@@ -92,6 +94,25 @@ impl VideoRender {
                         color,
                         color_alpha * layer.alpha,
                     );
+                }
+                continue;
+            }
+            if let Some(still) = self.stills.get_mut(&layer.source) {
+                match still.render(placement) {
+                    Some((picture, Some(mask))) => {
+                        compose_masked(
+                            &mut canvas,
+                            picture,
+                            mask,
+                            placement.x,
+                            placement.y,
+                            layer.alpha,
+                        );
+                    }
+                    Some((picture, None)) => {
+                        compose(&mut canvas, picture, placement.x, placement.y, layer.alpha);
+                    }
+                    None => {}
                 }
                 continue;
             }

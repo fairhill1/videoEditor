@@ -8,13 +8,15 @@
 
 use crate::canvas::Canvas;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
+use crate::input::DragMode;
+use crate::layout::{zoom_fraction, PoolView};
 use crate::quad::Quad;
 use crate::state::State;
 use crate::theme::*;
 use crate::ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
 
 impl State {
-    /// The "MEDIA POOL" and "PREVIEW" headings, and the pool's import button.
+    /// The "MEDIA POOL" and "PREVIEW" headings, and the pool's buttons.
     pub(crate) fn draw_panel_labels(&mut self, w: f32, media_w: f32) {
         let baseline_y = LABEL_PAD + self.text.ascent(LABEL_SIZE);
         self.text.draw(
@@ -93,6 +95,41 @@ impl State {
                 w,
             );
         }
+        // Against the pool's right edge, apart from the two that add things:
+        // this one changes how the pool looks rather than what is in it.
+        self.pool_view_btn = Rect {
+            x: (media_w - LABEL_PAD - TRANSPORT_BTN_W).round(),
+            ..self.pool_open_btn
+        };
+        let pool_view_hovered = self.pool_view_btn.contains(self.cursor);
+        // The icon shows the view a press switches to, as the tooltip says.
+        let (view_icon, view_tip) = match self.pool_view {
+            PoolView::List => (ICON_GRID, "Show as grid"),
+            PoolView::Grid => (ICON_LIST, "Show as list"),
+        };
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            self.pool_view_btn,
+            view_icon,
+            TRANSPORT_ICON_SIZE,
+            pool_view_hovered,
+            BtnState::Normal,
+        );
+        if pool_view_hovered {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                self.pool_view_btn,
+                view_tip,
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+                w,
+            );
+        }
+
         self.text.draw(
             &self.queue,
             &mut self.quads,
@@ -175,6 +212,39 @@ impl State {
             x: (self.timeline_save_btn.x - TRANSPORT_GAP - TRANSPORT_BTN_W).round(),
             ..self.timeline_project_btn
         };
+        // Zoom, after the editing buttons and set a little apart from them:
+        // out, the slider, in, then fit. Every way the keyboard and wheel have
+        // of changing the view has a control here too. Left out altogether
+        // when the window is too narrow to fit them before the export readout,
+        // rather than drawn underneath it.
+        let zoom_x = self.timeline_snap_btn.x + stride + TRANSPORT_GAP;
+        let zoom_w = TRANSPORT_BTN_W * 3.0 + ZOOM_SLIDER_W + TRANSPORT_GAP * 3.0;
+        let readout_left = self.timeline_open_btn.x - EXPORT_READOUT_GAP - EXPORT_READOUT_W;
+        if zoom_x + zoom_w <= readout_left {
+            self.timeline_zoom_out_btn = Rect { x: zoom_x, ..self.timeline_split_btn };
+            self.timeline_zoom_slider = Rect {
+                x: zoom_x + TRANSPORT_BTN_W + TRANSPORT_GAP,
+                w: ZOOM_SLIDER_W,
+                ..self.timeline_split_btn
+            };
+            self.timeline_zoom_in_btn = Rect {
+                x: self.timeline_zoom_slider.x + ZOOM_SLIDER_W + TRANSPORT_GAP,
+                ..self.timeline_split_btn
+            };
+            self.timeline_zoom_fit_btn = Rect {
+                x: self.timeline_zoom_in_btn.x + stride,
+                ..self.timeline_split_btn
+            };
+        } else {
+            self.timeline_zoom_out_btn = Rect::default();
+            self.timeline_zoom_slider = Rect::default();
+            self.timeline_zoom_in_btn = Rect::default();
+            self.timeline_zoom_fit_btn = Rect::default();
+        }
+        let (_, view_dur) = self.view_window();
+        let zoom = zoom_fraction(view_dur, self.content_duration());
+        let fitted = view_dur >= self.content_duration();
+
         let exporting = self.export.is_some();
         // The gear's tooltip is the only place the resolved canvas is spelled
         // out, which matters most when both settings are on Auto and the popup
@@ -244,6 +314,24 @@ impl State {
                 BtnState::Toggle(self.snap_enabled),
             ),
             (
+                self.timeline_zoom_out_btn,
+                ICON_ZOOM_OUT,
+                "Zoom out (-)",
+                avail(!fitted),
+            ),
+            (
+                self.timeline_zoom_in_btn,
+                ICON_ZOOM_IN,
+                "Zoom in (=)",
+                avail(zoom < 1.0),
+            ),
+            (
+                self.timeline_zoom_fit_btn,
+                ICON_ZOOM_FIT,
+                "Fit the whole edit (Shift+Z)",
+                avail(!fitted),
+            ),
+            (
                 self.timeline_project_btn,
                 ICON_SETTINGS,
                 project_tip.as_str(),
@@ -261,6 +349,10 @@ impl State {
             ),
         ];
         for (rect, icon, tip, state) in buttons {
+            // A button squeezed out of a narrow window has no rect to draw.
+            if rect.w <= 0.0 {
+                continue;
+            }
             let hovered = rect.contains(self.cursor);
             draw_button(
                 &mut self.quads,
@@ -287,7 +379,55 @@ impl State {
             }
         }
 
+        self.draw_zoom_slider(zoom, w);
         self.draw_export_readout(toolbar_center_y);
+    }
+
+    /// The zoom slider at `zoom` along it (see [`zoom_fraction`]): a groove
+    /// with the knob in it, the stretch left of the knob filled in so how far
+    /// in you are reads at a glance.
+    fn draw_zoom_slider(&mut self, zoom: f64, w: f32) {
+        let slider = self.timeline_zoom_slider;
+        if slider.w <= 0.0 {
+            return;
+        }
+        let center_y = slider.y + slider.h * 0.5;
+        let groove_y = (center_y - ZOOM_SLIDER_GROOVE_H * 0.5).round();
+        self.quads.push(Quad::colored(
+            [slider.x, groove_y],
+            [slider.w, ZOOM_SLIDER_GROOVE_H],
+            SCROLLBAR_TRACK_COLOR,
+        ));
+        let travel = slider.w - ZOOM_SLIDER_KNOB_W;
+        let knob_x = (slider.x + travel * zoom as f32).round();
+        self.quads.push(Quad::colored(
+            [slider.x, groove_y],
+            [knob_x - slider.x, ZOOM_SLIDER_GROOVE_H],
+            SCROLLBAR_THUMB_COLOR,
+        ));
+        let hovered = slider.contains(self.cursor);
+        let knob_color = match self.drag {
+            DragMode::ZoomSlider => SCROLLBAR_THUMB_ACTIVE_COLOR,
+            DragMode::None if hovered => SCROLLBAR_THUMB_HOVER_COLOR,
+            _ => SCROLLBAR_THUMB_COLOR,
+        };
+        self.quads.push(Quad::colored(
+            [knob_x, (center_y - ZOOM_SLIDER_KNOB_H * 0.5).round()],
+            [ZOOM_SLIDER_KNOB_W, ZOOM_SLIDER_KNOB_H],
+            knob_color,
+        ));
+        if hovered && matches!(self.drag, DragMode::None) {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                slider,
+                "Zoom (scroll over the timeline)",
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+                w,
+            );
+        }
     }
 
     /// Progress while rendering, result once done. Both share the strip left of

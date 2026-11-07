@@ -9,11 +9,12 @@ use crate::canvas::Canvas;
 use crate::compose::Layer;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{pool_row_close_rect, transform_handle_rects, Splitter};
+use crate::layout::{pool_row_close_rect, transform_handle_rects, PoolCell, PoolView, Splitter};
 use crate::audio::Waveform;
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::theme::*;
+use crate::timeline::SourceId;
 use crate::ui::Rect;
 
 /// Draw a whole source's waveform into a box, one column per pixel of width.
@@ -187,7 +188,12 @@ impl State {
         // rather than leaving the playhead off the edge for one.
         self.follow_playhead(t);
         self.draw_timeline_panel(w, h, top_h, t);
-        self.draw_media_pool_list(media_w, top_h);
+        {
+            let Self { media, device, queue, quads, .. } = self;
+            media.poll_filmstrips(device, queue, quads);
+            media.release_idle_frames();
+        }
+        self.draw_media_pool_list();
         self.draw_panel_labels(w, media_w);
         self.draw_timeline_toolbar(w, top_h, canvas);
         self.draw_transport_bar(w, media_w, preview_w, preview_h, t);
@@ -334,6 +340,12 @@ impl State {
                     quads.push_with(quad, Some(texture));
                     continue;
                 }
+                // An image's alpha rides through the blend as it is, so a logo
+                // with a transparent background sits on whatever is below it.
+                if let Some(still) = media.get(layer.source).and_then(|s| s.still.as_ref()) {
+                    quads.push_with(quad, Some(still.texture()));
+                    continue;
+                }
                 let Some(stream) = media.get_mut(layer.source).and_then(|s| s.stream.as_mut())
                 else {
                     continue;
@@ -403,60 +415,65 @@ impl State {
         }
     }
 
-    fn draw_media_pool_list(&mut self, pool_w: f32, pool_h: f32) {
-        let row_x = LABEL_PAD;
-        let row_w = (pool_w - LABEL_PAD * 2.0).max(1.0);
-
-        for (i, &id) in self.media.ids().iter().enumerate() {
-            let row_y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
-            if row_y + POOL_ROW_HEIGHT > pool_h {
-                break; // beyond panel; scrolling will come later
-            }
+    fn draw_media_pool_list(&mut self) {
+        let grid = self.pool_view == PoolView::Grid;
+        // Nothing scrubs while a drag is under way: a clip being carried to
+        // the timeline is not being looked through.
+        let idle = matches!(self.drag, DragMode::None);
+        for (id, PoolCell { cell, thumb }) in self.pool_items() {
             let Some(src) = self.media.get(id) else {
                 continue;
             };
 
-            self.quads.push(Quad::colored(
-                [row_x, row_y],
-                [row_w, POOL_ROW_HEIGHT],
-                POOL_ROW_COLOR,
-            ));
+            self.quads
+                .push(Quad::colored([cell.x, cell.y], [cell.w, cell.h], POOL_ROW_COLOR));
 
             // Thumbnail slot (dark background so letterboxed thumbs look intentional).
-            let slot_x = row_x + POOL_ROW_PAD;
-            let slot_y = row_y + POOL_ROW_PAD;
-            self.quads.push(Quad::colored(
-                [slot_x, slot_y],
-                [POOL_THUMB_W, POOL_THUMB_H],
-                POOL_THUMB_BG,
-            ));
+            self.quads
+                .push(Quad::colored([thumb.x, thumb.y], [thumb.w, thumb.h], POOL_THUMB_BG));
 
-            // Fit the baked thumbnail into the slot, preserving source aspect.
+            // The poster frame, fitted into the slot preserving source aspect.
+            // A hover swaps in the filmstrip sample for how far across the
+            // slot the cursor is, so sweeping across it plays through the
+            // clip — once the strip has been decoded; until then the poster
+            // stays put.
+            //
             // A source with no picture gets its waveform in the same slot
             // instead of an empty box or a stand-in icon: it is the one
             // thumbnail an audio file actually has, and it distinguishes a
             // music bed from a voiceover at a glance the way a frame does for
             // video.
             if let Some(video) = src.stream.as_ref() {
-                let thumb = video.thumbnail();
-                let tw = thumb.width as f32;
-                let th = thumb.height as f32;
-                let scale = (POOL_THUMB_W / tw).min(POOL_THUMB_H / th);
-                let dw = (tw * scale).round();
-                let dh = (th * scale).round();
-                let dx = (slot_x + (POOL_THUMB_W - dw) * 0.5).round();
-                let dy = (slot_y + (POOL_THUMB_H - dh) * 0.5).round();
-                self.quads
-                    .push_with(Quad::textured([dx, dy], [dw, dh]), Some(thumb));
-            } else if let Some(wf) = src.waveform.as_ref() {
-                draw_waveform_summary(
-                    &mut self.quads,
-                    wf,
-                    slot_x,
-                    slot_y,
-                    POOL_THUMB_W,
-                    POOL_THUMB_H,
+                let pic = fit_into(video.width() as f32, video.height() as f32, thumb);
+                let scrub = src
+                    .filmstrip
+                    .as_ref()
+                    .filter(|_| idle && thumb.contains(self.cursor))
+                    .and_then(|strip| strip.frame_at((self.cursor[0] - pic.x) / pic.w));
+                match scrub {
+                    Some((atlas, uv)) => {
+                        let quad = Quad { uv, ..Quad::textured([pic.x, pic.y], [pic.w, pic.h]) };
+                        self.quads.push_with(quad, Some(atlas));
+                        let line_x = self.cursor[0].clamp(pic.x, pic.x + pic.w - POOL_SCRUB_LINE_W);
+                        self.quads.push(Quad::colored(
+                            [line_x.round(), pic.y],
+                            [POOL_SCRUB_LINE_W, pic.h],
+                            POOL_SCRUB_LINE_COLOR,
+                        ));
+                    }
+                    None => self.quads.push_with(
+                        Quad::textured([pic.x, pic.y], [pic.w, pic.h]),
+                        Some(video.thumbnail()),
+                    ),
+                }
+            } else if let Some(still) = src.still.as_ref() {
+                let pic = fit_into(still.width() as f32, still.height() as f32, thumb);
+                self.quads.push_with(
+                    Quad::textured([pic.x, pic.y], [pic.w, pic.h]),
+                    Some(still.texture()),
                 );
+            } else if let Some(wf) = src.waveform.as_ref() {
+                draw_waveform_summary(&mut self.quads, wf, thumb.x, thumb.y, thumb.w, thumb.h);
             } else if let Some(title) = src.title.as_ref() {
                 // A title's own words, in its own colour, standing in for the
                 // frame a decoded source has — the same reasoning as the
@@ -467,7 +484,7 @@ impl State {
                     &self.text,
                     title.pool_name(),
                     POOL_ITEM_META_SIZE,
-                    POOL_THUMB_W - 4.0,
+                    thumb.w - 4.0,
                 );
                 let tw = self.text.measure_width(&text, POOL_ITEM_META_SIZE);
                 let ascent = self.text.ascent(POOL_ITEM_META_SIZE);
@@ -475,8 +492,8 @@ impl State {
                     &self.queue,
                     &mut self.quads,
                     [
-                        (slot_x + (POOL_THUMB_W - tw) * 0.5).round(),
-                        (slot_y + (POOL_THUMB_H + ascent) * 0.5).round(),
+                        (thumb.x + (thumb.w - tw) * 0.5).round(),
+                        (thumb.y + (thumb.h + ascent) * 0.5).round(),
                     ],
                     &text,
                     POOL_ITEM_META_SIZE,
@@ -484,11 +501,15 @@ impl State {
                 );
             }
 
-            // Duration pill in the bottom-right of the thumb slot. A title has
-            // no length of its own to report, so it says what it is instead.
-            let dur_text = match src.title {
-                Some(_) => "TITLE".to_string(),
-                None => format_timecode(self.media.duration(id)),
+            // Duration pill in the bottom-right of the thumb slot. A title or an
+            // image has no length of its own to report, so it says what it is
+            // instead.
+            let dur_text = if src.title.is_some() {
+                "TITLE".to_string()
+            } else if src.still.is_some() {
+                "IMAGE".to_string()
+            } else {
+                format_timecode(self.media.duration(id))
             };
             let dur_w = self.text.measure_width(&dur_text, POOL_ITEM_META_SIZE);
             let dur_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
@@ -497,8 +518,8 @@ impl State {
             let pill_w = dur_w + pill_pad_x * 2.0;
             let pill_h = dur_ascent + pill_pad_y * 2.0;
             let pill_inset = 3.0;
-            let pill_x = slot_x + POOL_THUMB_W - pill_inset - pill_w;
-            let pill_y = slot_y + POOL_THUMB_H - pill_inset - pill_h;
+            let pill_x = thumb.x + thumb.w - pill_inset - pill_w;
+            let pill_y = thumb.y + thumb.h - pill_inset - pill_h;
             self.quads
                 .push(Quad::colored([pill_x, pill_y], [pill_w, pill_h], POOL_DUR_BG));
             self.text.draw(
@@ -510,78 +531,28 @@ impl State {
                 POOL_DUR_TEXT,
             );
 
-            // Name and format line to the right of the thumb, the pair centered
-            // as a block. Both clamp with an ellipsis rather than bleeding into
-            // the preview — a narrow pool loses the tail of the filename, which
-            // is the half worth losing.
-            //
-            // The format is worth the second line because it's what decides
-            // whether a clip matches the canvas, and `Setting::Auto` means the
-            // canvas is inherited from one of these rows: without it, the only
-            // way to see what you're inheriting is to look at the export.
-            let name_x = slot_x + POOL_THUMB_W + POOL_ROW_PAD + 4.0;
-            let name_max_w = (row_x + row_w - POOL_ROW_PAD - name_x).max(0.0);
-            let name_ascent = self.text.ascent(POOL_ITEM_NAME_SIZE);
-            let meta_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
-            let block_h = name_ascent + POOL_ITEM_META_GAP + meta_ascent;
-            let name_baseline = (row_y + (POOL_ROW_HEIGHT - block_h) * 0.5 + name_ascent).round();
-            let meta_baseline = name_baseline + POOL_ITEM_META_GAP + meta_ascent;
-            let name = truncate_to_width(&self.text, &src.name, POOL_ITEM_NAME_SIZE, name_max_w);
-            self.text.draw(
-                &self.queue,
-                &mut self.quads,
-                [name_x, name_baseline],
-                &name,
-                POOL_ITEM_NAME_SIZE,
-                CLIP_LABEL_COLOR,
-            );
+            if grid {
+                // Just the name, in the band under the picture: a tile is for
+                // recognising footage, and the format line is a click away in
+                // the list view.
+                let name_ascent = self.text.ascent(POOL_ITEM_NAME_SIZE);
+                let band_y = thumb.y + thumb.h;
+                let baseline = (band_y + (POOL_TILE_NAME_H + name_ascent) * 0.5).round();
+                let name = truncate_to_width(&self.text, &src.name, POOL_ITEM_NAME_SIZE, thumb.w);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [thumb.x, baseline],
+                    &name,
+                    POOL_ITEM_NAME_SIZE,
+                    CLIP_LABEL_COLOR,
+                );
+            } else {
+                self.draw_pool_row_text(id, cell, thumb);
+            }
 
-            // ASCII throughout: the UI font is a stock TTF rather than a subset
-            // we control, so a '×' or '·' that turned out to be missing would
-            // fail as a blank rather than as a build error.
-            let meta = match (src.stream.as_ref(), src.audio.as_ref()) {
-                (Some(v), _) => format!(
-                    "{}x{} @ {} fps",
-                    v.width(),
-                    v.height(),
-                    fmt_fps(v.frame_rate()),
-                ),
-                // The same question one line down for a source with no
-                // picture: not what canvas it would set, but what it is.
-                (None, Some(a)) => format!(
-                    "{} Hz {}",
-                    a.src_rate(),
-                    match a.src_channels() {
-                        1 => "mono".to_string(),
-                        2 => "stereo".to_string(),
-                        n => format!("{n} ch"),
-                    }
-                ),
-                (None, None) => match src.title.as_ref() {
-                    // What a title will be drawn at, which is the same question
-                    // the format line answers for footage: whether it matches
-                    // the canvas. A title always does — it is drawn at whatever
-                    // the canvas turns out to be — so it says its size instead.
-                    Some(t) => format!("title, {}% of frame", (t.size * 100.0).round()),
-                    None => String::new(),
-                },
-            };
-            let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);
-            self.text.draw(
-                &self.queue,
-                &mut self.quads,
-                [name_x, meta_baseline],
-                &meta,
-                POOL_ITEM_META_SIZE,
-                POOL_ITEM_META_COLOR,
-            );
-
-            let row_hovered = self.cursor[0] >= row_x
-                && self.cursor[0] <= row_x + row_w
-                && self.cursor[1] >= row_y
-                && self.cursor[1] <= row_y + POOL_ROW_HEIGHT;
-            if row_hovered {
-                let close = pool_row_close_rect(row_x, row_y, row_w);
+            if cell.contains(self.cursor) {
+                let close = pool_row_close_rect(cell.x, cell.y, cell.w);
                 let close_hover = close.contains(self.cursor);
                 let bg = if close_hover {
                     POOL_CLOSE_BG_HOVER
@@ -606,4 +577,92 @@ impl State {
             }
         }
     }
+
+    /// A list row's name and format line, to the right of its thumbnail.
+    fn draw_pool_row_text(&mut self, id: SourceId, cell: Rect, thumb: Rect) {
+        let Some(src) = self.media.get(id) else {
+            return;
+        };
+        // The pair is centred as a block. Both clamp with an ellipsis rather
+        // than bleeding into the preview — a narrow pool loses the tail of the
+        // filename, which is the half worth losing.
+        //
+        // The format is worth the second line because it's what decides
+        // whether a clip matches the canvas, and `Setting::Auto` means the
+        // canvas is inherited from one of these rows: without it, the only
+        // way to see what you're inheriting is to look at the export.
+        let name_x = thumb.x + thumb.w + POOL_ROW_PAD + 4.0;
+        let name_max_w = (cell.x + cell.w - POOL_ROW_PAD - name_x).max(0.0);
+        let name_ascent = self.text.ascent(POOL_ITEM_NAME_SIZE);
+        let meta_ascent = self.text.ascent(POOL_ITEM_META_SIZE);
+        let block_h = name_ascent + POOL_ITEM_META_GAP + meta_ascent;
+        let name_baseline = (cell.y + (cell.h - block_h) * 0.5 + name_ascent).round();
+        let meta_baseline = name_baseline + POOL_ITEM_META_GAP + meta_ascent;
+        let name = truncate_to_width(&self.text, &src.name, POOL_ITEM_NAME_SIZE, name_max_w);
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [name_x, name_baseline],
+            &name,
+            POOL_ITEM_NAME_SIZE,
+            CLIP_LABEL_COLOR,
+        );
+
+        // ASCII throughout: the UI font is a stock TTF rather than a subset
+        // we control, so a '×' or '·' that turned out to be missing would
+        // fail as a blank rather than as a build error.
+        let meta = match (src.still.as_ref(), src.stream.as_ref(), src.audio.as_ref()) {
+            // An image sets the canvas no more than a title does, but whether
+            // it matches the canvas is the same question footage answers here.
+            (Some(s), _, _) => format!("{}x{} image", s.width(), s.height()),
+            (None, Some(v), _) => format!(
+                "{}x{} @ {} fps",
+                v.width(),
+                v.height(),
+                fmt_fps(v.frame_rate()),
+            ),
+            // The same question one line down for a source with no
+            // picture: not what canvas it would set, but what it is.
+            (None, None, Some(a)) => format!(
+                "{} Hz {}",
+                a.src_rate(),
+                match a.src_channels() {
+                    1 => "mono".to_string(),
+                    2 => "stereo".to_string(),
+                    n => format!("{n} ch"),
+                }
+            ),
+            (None, None, None) => match src.title.as_ref() {
+                // What a title will be drawn at, which is the same question
+                // the format line answers for footage: whether it matches
+                // the canvas. A title always does — it is drawn at whatever
+                // the canvas turns out to be — so it says its size instead.
+                Some(t) => format!("title, {}% of frame", (t.size * 100.0).round()),
+                None => String::new(),
+            },
+        };
+        let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [name_x, meta_baseline],
+            &meta,
+            POOL_ITEM_META_SIZE,
+            POOL_ITEM_META_COLOR,
+        );
+    }
 }
+
+/// A `sw x sh` picture fitted into `slot` preserving its aspect, centred and
+/// snapped to whole points.
+fn fit_into(sw: f32, sh: f32, slot: Rect) -> Rect {
+    let scale = (slot.w / sw.max(1.0)).min(slot.h / sh.max(1.0));
+    let (w, h) = ((sw * scale).round(), (sh * scale).round());
+    Rect {
+        x: (slot.x + (slot.w - w) * 0.5).round(),
+        y: (slot.y + (slot.h - h) * 0.5).round(),
+        w,
+        h,
+    }
+}
+

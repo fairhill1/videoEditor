@@ -115,6 +115,9 @@ impl State {
         if src.title.is_some() {
             return Some((canvas.width, canvas.height));
         }
+        if let Some(still) = src.still.as_ref() {
+            return Some((still.width(), still.height()));
+        }
         let stream = src.stream.as_ref()?;
         Some((stream.width(), stream.height()))
     }

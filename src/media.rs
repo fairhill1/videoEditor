@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use ffmpeg_next as ffmpeg;
 
 use crate::audio::{self, AudioStream, Waveform};
+use crate::filmstrip::Filmstrip;
+use crate::still::{self, Still};
 use crate::quad::{QuadRenderer, Texture};
 use crate::timeline::SourceId;
 use crate::title::{self, Title};
@@ -16,6 +18,12 @@ pub struct Source {
     pub stream: Option<VideoStream>,
     pub audio: Option<AudioStream>,
     pub waveform: Option<Waveform>,
+    /// `Some` for an image: one picture, decoded once, with no length of its
+    /// own. Never alongside `stream`.
+    pub still: Option<Still>,
+    /// Frames across the clip for scrubbing its pool thumbnail. `None` for a
+    /// source with no picture to scrub.
+    pub filmstrip: Option<Filmstrip>,
     pub name: String,
     /// Kept so an export can open its own decoders from the original file
     /// rather than borrowing the ones driving the preview.
@@ -36,6 +44,24 @@ pub struct Source {
 }
 
 impl Source {
+    /// A source with nothing in it yet but a name, for the constructors to
+    /// fill in the one kind of picture or sound they have.
+    fn empty(name: String, path: String) -> Self {
+        Self {
+            stream: None,
+            audio: None,
+            waveform: None,
+            still: None,
+            filmstrip: None,
+            name,
+            path,
+            title: None,
+            title_texture: None,
+            title_baked: None,
+            revision: 0,
+        }
+    }
+
     /// The title's baked picture, if one has been built for the size being
     /// drawn. `None` for footage, and for a title whose bake has not run yet —
     /// see [`MediaPool::bake_title`].
@@ -66,6 +92,13 @@ impl MediaPool {
         queue: &wgpu::Queue,
         quads: &QuadRenderer,
     ) -> Result<SourceId, ffmpeg::Error> {
+        if still::is_still(path) {
+            let still = Still::open(path, device, queue, quads)?;
+            return Ok(self.insert(Source {
+                still: Some(still),
+                ..Source::empty(file_name(path), path.to_string())
+            }));
+        }
         // Neither stream is required on its own — only that the file yields at
         // least one of them. A video-only file imports without audio, an
         // audio-only file imports without a picture, and a file that gives
@@ -102,52 +135,29 @@ impl MediaPool {
         } else {
             None
         };
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(path)
-            .to_string();
+        let filmstrip = stream.as_ref().map(|v| Filmstrip::spawn(path, v.duration()));
+        Ok(self.insert(Source {
+            stream,
+            audio,
+            waveform,
+            filmstrip,
+            ..Source::empty(file_name(path), path.to_string())
+        }))
+    }
+
+    fn insert(&mut self, source: Source) -> SourceId {
         let id = SourceId(self.next_id);
         self.next_id += 1;
-        self.sources.insert(
-            id,
-            Source {
-                stream,
-                audio,
-                waveform,
-                name,
-                path: path.to_string(),
-                title: None,
-                title_texture: None,
-                title_baked: None,
-                revision: 0,
-            },
-        );
+        self.sources.insert(id, source);
         self.order.push(id);
-        Ok(id)
+        id
     }
 
     /// Add a generated title to the pool. Cannot fail — there is no file to
     /// open, which is rather the point of one.
     pub fn add_title(&mut self, title: Title) -> SourceId {
-        let id = SourceId(self.next_id);
-        self.next_id += 1;
-        self.sources.insert(
-            id,
-            Source {
-                stream: None,
-                audio: None,
-                waveform: None,
-                name: title.pool_name().to_string(),
-                path: String::new(),
-                title: Some(title),
-                title_texture: None,
-                title_baked: None,
-                revision: 0,
-            },
-        );
-        self.order.push(id);
-        id
+        let name = title.pool_name().to_string();
+        self.insert(Source { title: Some(title), ..Source::empty(name, String::new()) })
     }
 
     pub fn title(&self, id: SourceId) -> Option<&Title> {
@@ -250,6 +260,30 @@ impl MediaPool {
         src.title_baked = Some(key);
     }
 
+    /// Upload any hover filmstrips whose decode threads have finished.
+    pub fn poll_filmstrips(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: &QuadRenderer,
+    ) {
+        for src in self.sources.values_mut() {
+            if let Some(strip) = src.filmstrip.as_mut() {
+                strip.poll(device, queue, quads);
+            }
+        }
+    }
+
+    /// Let every stream that has gone off screen give back the frames it was
+    /// keeping for stepping backwards. See [`VideoStream::release_idle`].
+    pub fn release_idle_frames(&mut self) {
+        for src in self.sources.values_mut() {
+            if let Some(stream) = src.stream.as_mut() {
+                stream.release_idle();
+            }
+        }
+    }
+
     /// Drop `id` from the visible pool list. The decoded `Source` — GPU
     /// textures, audio, waveform — is deliberately retained so undo can bring
     /// the row back instantly instead of re-opening and re-scanning the file.
@@ -286,6 +320,9 @@ impl MediaPool {
             if s.title.is_some() {
                 return title::MAX_DURATION;
             }
+            if s.still.is_some() {
+                return still::MAX_DURATION;
+            }
             s.stream
                 .as_ref()
                 .map(|v| v.duration())
@@ -300,8 +337,10 @@ impl MediaPool {
     /// has no such length, so it gets a workable default to trim from — the
     /// alternative is dropping an hour-long clip across the timeline.
     pub fn drop_duration(&self, id: SourceId) -> f64 {
-        if self.sources.get(&id).is_some_and(|s| s.title.is_some()) {
-            return title::DEFAULT_DURATION;
+        match self.sources.get(&id) {
+            Some(s) if s.title.is_some() => return title::DEFAULT_DURATION,
+            Some(s) if s.still.is_some() => return still::DEFAULT_DURATION,
+            _ => {}
         }
         self.duration(id)
     }
@@ -310,7 +349,7 @@ impl MediaPool {
     pub fn has_video(&self, id: SourceId) -> bool {
         self.sources
             .get(&id)
-            .is_some_and(|s| s.stream.is_some() || s.title.is_some())
+            .is_some_and(|s| s.stream.is_some() || s.title.is_some() || s.still.is_some())
     }
 
     pub fn audio_duration(&self, id: SourceId) -> Option<f64> {
@@ -322,4 +361,13 @@ impl MediaPool {
     pub fn ids(&self) -> &[SourceId] {
         &self.order
     }
+}
+
+/// The file name a pool row shows for `path`.
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
 }

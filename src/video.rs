@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 use ffmpeg_next as ffmpeg;
 
 use crate::colorspace;
@@ -17,16 +20,40 @@ pub struct VideoStream {
     frame_rate: f64,
     texture: Texture,
     thumbnail: Texture,
-    pending: Option<(ffmpeg::frame::Video, f64)>,
+    /// The frames decoded most recently, so a step back can be answered
+    /// without going back to a keyframe. See [`Recent`].
+    recent: Recent<ffmpeg::frame::Video>,
     rgba_buf: Vec<u8>,
     scaled: ffmpeg::frame::Video,
     displayed_pts: Option<f64>,
+    /// When the preview last asked for a frame, which is every frame while
+    /// this stream is on screen. One that has gone quiet hands its cache back.
+    last_used: Instant,
 }
 
 /// Short side of the baked media-pool thumbnail. The pool slot is a fixed
 /// aspect ratio, so the UI letterboxes the thumb into its slot — we only need
 /// enough pixels here to look crisp at typical row sizes.
 const THUMB_HEIGHT: u32 = 64;
+
+/// Most decoded-frame memory one stream keeps for stepping backwards: about
+/// half a second of 1440p, a second of 1080p.
+///
+/// Stepping back is what this is for. A compressed frame can only be rebuilt
+/// by decoding forward from the keyframe before it, and recordings put those
+/// seconds apart, so without a cache every press of Left decodes a GOP — up to
+/// a few hundred frames — to show one. With it, only every Nth press does.
+const RECENT_BYTES: usize = 192 << 20;
+
+/// However big a frame, the cache holds the one on screen and the one after it,
+/// which is what playing forward needs.
+const RECENT_MIN: usize = 2;
+
+/// How long a stream can go without being shown before it gives its cache
+/// back. Long enough to outlast a hitch in rendering, short enough that a pool
+/// of clips that have each been on screen once doesn't sit on hundreds of
+/// megabytes per clip.
+const RECENT_IDLE: Duration = Duration::from_secs(1);
 
 /// How far forward `t` can be from the displayed frame before `goto` gives up
 /// on linear decode and issues a seek. Tuned to cover a normal playback step
@@ -138,10 +165,11 @@ impl VideoStream {
             frame_rate,
             texture,
             thumbnail,
-            pending: None,
+            recent: Recent::new(RECENT_MIN),
             rgba_buf: vec![0u8; (width * height * 4) as usize],
             scaled: ffmpeg::frame::Video::empty(),
             displayed_pts: None,
+            last_used: Instant::now(),
         };
 
         // Prime with the first frame so nothing flashes black at startup.
@@ -156,26 +184,46 @@ impl VideoStream {
                 thumb_h,
                 &stream.thumbnail,
             );
-            stream.scale_and_upload(queue, &frame);
-            stream.displayed_pts = Some(pts);
+            stream.recent.cap = recent_cap(&frame);
+            stream.recent.push(frame, pts);
+            stream.show(queue, 0);
         }
 
         Ok(stream)
     }
 
     /// Display the frame at `t` using whichever strategy is cheapest.
-    /// - `t` went backward, or is far beyond the decoded position: seek.
+    /// - `t` falls among the frames decoded recently — a step back, or a
+    ///   repeat of the same time while paused: show it from there.
     /// - `t` is close ahead: let the decoder walk forward (cheap).
+    /// - anything else: seek.
     /// This is the only entry point callers should use during playback/scrub;
     /// it keeps per-frame decoder work bounded even under rapid seek requests.
     pub fn goto(&mut self, queue: &wgpu::Queue, t: f64) {
-        match self.displayed_pts {
-            Some(d) if t < d || t > d + FORWARD_DECODE_BUDGET => self.seek(queue, t),
-            Some(_) => self.advance_to(queue, t),
-            None => self.seek(queue, t),
+        self.last_used = Instant::now();
+        if let Some(i) = self.recent.covering(t) {
+            self.show(queue, i);
+            return;
+        }
+        match self.recent.newest_pts() {
+            Some(newest) if t >= newest && t <= newest + FORWARD_DECODE_BUDGET => {
+                self.decode_through(queue, t)
+            }
+            _ => self.seek(queue, t),
         }
     }
 
+    /// Give back the cached frames behind the one on screen if nothing has
+    /// shown this stream for a while. The frame on screen and the one after it
+    /// stay, so playing on from here still doesn't have to seek.
+    pub fn release_idle(&mut self) {
+        if self.last_used.elapsed() < RECENT_IDLE {
+            return;
+        }
+        if let Some(shown) = self.displayed_pts {
+            self.recent.drop_before(shown);
+        }
+    }
     pub fn texture(&self) -> &Texture {
         &self.texture
     }
@@ -200,77 +248,59 @@ impl VideoStream {
         self.frame_rate
     }
 
-    /// Decode frames up to time `t` (seconds). Only the latest frame with `pts <= t`
-    /// is scaled and uploaded; intermediate frames are decoded-then-discarded so
-    /// H.264/VP9/etc temporal deps stay intact without paying for N scales+uploads.
-    pub fn advance_to(&mut self, queue: &wgpu::Queue, t: f64) {
-        if self.pending.is_none() {
+    /// Decode forward until the frame after `t` is in hand, then show the one
+    /// at `t`. Every frame decoded on the way goes into the cache, so stepping
+    /// back over them later costs nothing; only the one shown is converted and
+    /// uploaded.
+    fn decode_through(&mut self, queue: &wgpu::Queue, t: f64) {
+        while self.recent.newest_pts().is_none_or(|newest| newest <= t) {
             match self.decode_next_raw() {
-                Some(p) => self.pending = Some(p),
-                None => return,
+                Some((frame, pts)) => self.recent.push(frame, pts),
+                // The end of the file: the last frame is as close as it gets.
+                None => break,
             }
         }
-
-        if self.pending.as_ref().unwrap().1 > t {
-            return;
-        }
-
-        loop {
-            match self.decode_next_raw() {
-                Some((next_frame, next_pts)) => {
-                    if next_pts <= t {
-                        // Drop the current pending — we'll never display it.
-                        self.pending = Some((next_frame, next_pts));
-                    } else {
-                        let (cur_frame, cur_pts) = self.pending.take().unwrap();
-                        self.scale_and_upload(queue, &cur_frame);
-                        self.displayed_pts = Some(cur_pts);
-                        self.pending = Some((next_frame, next_pts));
-                        return;
-                    }
-                }
-                None => {
-                    if let Some((cur_frame, cur_pts)) = self.pending.take() {
-                        self.scale_and_upload(queue, &cur_frame);
-                        self.displayed_pts = Some(cur_pts);
-                    }
-                    return;
-                }
-            }
+        if let Some(i) = self.recent.at_or_before(t) {
+            self.show(queue, i);
         }
     }
 
     /// Seek to `t` seconds and display the frame containing `t` (frame-accurate:
-    /// the last frame with pts <= t, decoded forward from the nearest keyframe).
+    /// the last frame with pts <= t, decoded forward from the keyframe before
+    /// it).
     pub fn seek(&mut self, queue: &wgpu::Queue, t: f64) {
         let ts = (t.max(0.0) * AV_TIME_BASE) as i64;
-        let _ = self.ictx.seek(ts, ..);
-        self.decoder.flush();
-        self.pending = None;
-
-        let mut last: Option<(ffmpeg::frame::Video, f64)> = None;
-        loop {
-            match self.decode_next_raw() {
-                Some((frame, pts)) => {
-                    if pts > t {
-                        let (to_upload, upload_pts) =
-                            last.take().unwrap_or_else(|| (frame.clone(), pts));
-                        self.scale_and_upload(queue, &to_upload);
-                        self.displayed_pts = Some(upload_pts);
-                        self.pending = Some((frame, pts));
-                        return;
-                    }
-                    last = Some((frame, pts));
-                }
-                None => {
-                    if let Some((prev, prev_pts)) = last.take() {
-                        self.scale_and_upload(queue, &prev);
-                        self.displayed_pts = Some(prev_pts);
-                    }
-                    return;
-                }
-            }
+        // The keyframe at or before `t`; failing that, the nearest one.
+        if self.ictx.seek(ts, ..ts).is_err() {
+            let _ = self.ictx.seek(ts, ..);
         }
+        self.decoder.flush();
+        self.recent.clear();
+        self.decode_through(queue, t);
+    }
+
+    /// Convert and upload cached frame `i`, unless it is already on screen.
+    fn show(&mut self, queue: &wgpu::Queue, i: usize) {
+        let Self { recent, scaler, scaled, rgba_buf, texture, width, height, displayed_pts, .. } =
+            self;
+        let Some((frame, pts)) = recent.get(i) else {
+            return;
+        };
+        if *displayed_pts == Some(pts) {
+            return;
+        }
+        if scaler.run(frame, scaled).is_err() {
+            return;
+        }
+        let stride = scaled.stride(0);
+        let row_bytes = (*width * 4) as usize;
+        let src = scaled.data(0);
+        for y in 0..*height as usize {
+            rgba_buf[y * row_bytes..(y + 1) * row_bytes]
+                .copy_from_slice(&src[y * stride..y * stride + row_bytes]);
+        }
+        texture.write_region(queue, 0, 0, *width, *height, rgba_buf);
+        *displayed_pts = Some(pts);
     }
 
     fn decode_next_raw(&mut self) -> Option<(ffmpeg::frame::Video, f64)> {
@@ -290,23 +320,6 @@ impl VideoStream {
                 },
             }
         }
-    }
-
-    fn scale_and_upload(&mut self, queue: &wgpu::Queue, frame: &ffmpeg::frame::Video) {
-        if self.scaler.run(frame, &mut self.scaled).is_err() {
-            return;
-        }
-        let stride = self.scaled.stride(0);
-        let row_bytes = (self.width * 4) as usize;
-        let src = self.scaled.data(0);
-        for y in 0..self.height as usize {
-            let src_off = y * stride;
-            let dst_off = y * row_bytes;
-            self.rgba_buf[dst_off..dst_off + row_bytes]
-                .copy_from_slice(&src[src_off..src_off + row_bytes]);
-        }
-        self.texture
-            .write_region(queue, 0, 0, self.width, self.height, &self.rgba_buf);
     }
 
     fn next_video_packet(&mut self) -> Option<ffmpeg::Packet> {
@@ -342,4 +355,137 @@ fn bake_thumbnail(
         buf[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
     }
     texture.write_region(queue, 0, 0, w, h, &buf);
+}
+
+/// How many frames like `frame` fit in [`RECENT_BYTES`].
+fn recent_cap(frame: &ffmpeg::frame::Video) -> usize {
+    let bytes: usize = (0..frame.planes())
+        .map(|i| frame.stride(i) * frame.plane_height(i) as usize)
+        .sum();
+    (RECENT_BYTES / bytes.max(1)).max(RECENT_MIN)
+}
+
+/// The last frames a decoder produced, oldest first, each with its time in
+/// seconds. Contiguous: every frame decoded since the last seek goes in, so
+/// the run has no holes, and a time between its first and last frame is
+/// answered exactly. Bounded at `cap` frames by dropping the oldest.
+///
+/// Generic over the frame so the bookkeeping can be tested without a decoder.
+struct Recent<F> {
+    frames: VecDeque<(F, f64)>,
+    cap: usize,
+}
+
+impl<F> Recent<F> {
+    fn new(cap: usize) -> Self {
+        Self { frames: VecDeque::new(), cap }
+    }
+
+    fn push(&mut self, frame: F, pts: f64) {
+        self.frames.push_back((frame, pts));
+        while self.frames.len() > self.cap.max(1) {
+            self.frames.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn get(&self, i: usize) -> Option<(&F, f64)> {
+        self.frames.get(i).map(|(f, pts)| (f, *pts))
+    }
+
+    fn newest_pts(&self) -> Option<f64> {
+        self.frames.back().map(|(_, pts)| *pts)
+    }
+
+    /// The frame showing at `t`, if the run is known to contain it: `t` is at
+    /// or after the oldest frame and before the newest. At or past the newest
+    /// the answer may be a frame not decoded yet, so it is not an answer.
+    fn covering(&self, t: f64) -> Option<usize> {
+        let (_, oldest) = self.frames.front()?;
+        let newest = self.newest_pts()?;
+        if t < *oldest || t >= newest {
+            return None;
+        }
+        self.at_or_before(t)
+    }
+
+    /// The last frame at or before `t`; the oldest one if every frame is after
+    /// it, which is what a seek that landed past `t` has to settle for.
+    fn at_or_before(&self, t: f64) -> Option<usize> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let after = self.frames.partition_point(|(_, pts)| *pts <= t);
+        Some(after.saturating_sub(1))
+    }
+
+    /// Forget every frame before `pts`.
+    fn drop_before(&mut self, pts: f64) {
+        while self.frames.front().is_some_and(|(_, p)| *p < pts) {
+            self.frames.pop_front();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames at 0.0, 0.1, ... 0.9.
+    fn run(cap: usize) -> Recent<()> {
+        let mut r = Recent::new(cap);
+        for i in 0..10 {
+            r.push((), i as f64 / 10.0);
+        }
+        r
+    }
+
+    #[test]
+    fn a_step_back_inside_the_run_is_answered_from_it() {
+        let r = run(100);
+        assert_eq!(r.covering(0.55), Some(5));
+        assert_eq!(r.covering(0.5), Some(5));
+        assert_eq!(r.covering(0.0), Some(0));
+    }
+
+    #[test]
+    fn a_time_at_or_past_the_newest_frame_goes_to_the_decoder() {
+        let r = run(100);
+        // The frame after 0.9 might be due at 0.95; only decoding can say.
+        assert_eq!(r.covering(0.9), None);
+        assert_eq!(r.covering(1.5), None);
+    }
+
+    #[test]
+    fn a_time_before_the_run_goes_to_the_decoder() {
+        let r = run(4);
+        // Only 0.6..=0.9 are left.
+        assert_eq!(r.covering(0.5), None);
+        assert_eq!(r.covering(0.65), Some(0));
+    }
+
+    #[test]
+    fn the_run_is_bounded_by_dropping_the_oldest() {
+        let r = run(3);
+        assert_eq!(r.frames.len(), 3);
+        assert_eq!(r.get(0).map(|(_, p)| p), Some(0.7));
+    }
+
+    #[test]
+    fn a_seek_that_overshoots_settles_for_the_first_frame() {
+        let r = run(100);
+        assert_eq!(r.at_or_before(-1.0), Some(0));
+        assert_eq!(r.at_or_before(5.0), Some(9));
+    }
+
+    #[test]
+    fn an_idle_stream_keeps_the_frame_on_screen_and_what_follows() {
+        let mut r = run(100);
+        r.drop_before(0.8);
+        assert_eq!(r.frames.len(), 2);
+        assert_eq!(r.covering(0.85), Some(0));
+    }
 }

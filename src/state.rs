@@ -24,7 +24,7 @@ use crate::canvas::Setting;
 use crate::edit::EditSnapshot;
 use crate::export::{ExportJob, ExportRequest, Outcome, VideoSpec};
 use crate::input::DragMode;
-use crate::layout::{PreviewHit, Splitter, TimelineHit};
+use crate::layout::{PoolView, PreviewHit, Splitter, TimelineHit};
 use crate::media::MediaPool;
 use crate::project;
 use crate::quad::QuadRenderer;
@@ -118,6 +118,12 @@ pub(crate) struct State {
     pub(crate) timeline_undo_btn: Rect,
     pub(crate) timeline_redo_btn: Rect,
     pub(crate) timeline_snap_btn: Rect,
+    pub(crate) timeline_zoom_out_btn: Rect,
+    /// The whole zoom slider, groove and knob: a press anywhere along it
+    /// takes hold.
+    pub(crate) timeline_zoom_slider: Rect,
+    pub(crate) timeline_zoom_in_btn: Rect,
+    pub(crate) timeline_zoom_fit_btn: Rect,
     pub(crate) timeline_delete_btn: Rect,
     /// Clip id, not a position — see [`crate::timeline::Clip::id`]. A selection
     /// whose clip has been deleted simply resolves to nothing, and comes back
@@ -154,6 +160,10 @@ pub(crate) struct State {
     pub(crate) view_dur: f64,
     pub(crate) pool_open_btn: Rect,
     pub(crate) pool_title_btn: Rect,
+    pub(crate) pool_view_btn: Rect,
+    /// List or grid. A preference about this window rather than part of the
+    /// project, so it is not saved with one.
+    pub(crate) pool_view: PoolView,
     /// The title being typed into, and what it said when typing started, so
     /// Escape can put it back.
     ///
@@ -267,6 +277,10 @@ impl State {
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
             timeline_snap_btn: Rect::default(),
+            timeline_zoom_out_btn: Rect::default(),
+            timeline_zoom_slider: Rect::default(),
+            timeline_zoom_in_btn: Rect::default(),
+            timeline_zoom_fit_btn: Rect::default(),
             timeline_delete_btn: Rect::default(),
             selected: None,
             timeline_export_btn: Rect::default(),
@@ -280,6 +294,8 @@ impl State {
             view_dur: f64::INFINITY,
             pool_open_btn: Rect::default(),
             pool_title_btn: Rect::default(),
+            pool_view_btn: Rect::default(),
+            pool_view: PoolView::default(),
             editing_title: None,
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
@@ -368,7 +384,8 @@ impl State {
             DragMode::Scrub
             | DragMode::ClipMove { .. }
             | DragMode::PoolDrag { .. }
-            | DragMode::Scrollbar { .. } => CursorIcon::Default,
+            | DragMode::Scrollbar { .. }
+            | DragMode::ZoomSlider => CursorIcon::Default,
             DragMode::None => self.hover_cursor(),
         }
     }
@@ -441,11 +458,18 @@ impl State {
         // as far as the timeline is concerned.
         const VIDEO_EXT: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v"];
         const AUDIO_EXT: &[&str] = &["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus"];
-        let all: Vec<&str> = VIDEO_EXT.iter().chain(AUDIO_EXT).copied().collect();
+        let image_ext = crate::still::EXTENSIONS;
+        let all: Vec<&str> = VIDEO_EXT
+            .iter()
+            .chain(AUDIO_EXT)
+            .chain(image_ext)
+            .copied()
+            .collect();
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("media", &all)
             .add_filter("video", VIDEO_EXT)
             .add_filter("audio", AUDIO_EXT)
+            .add_filter("image", image_ext)
             .pick_files()
         else {
             return;
@@ -520,20 +544,20 @@ impl State {
             .collect::<Vec<_>>();
         let mut paths = HashMap::new();
         let mut titles = HashMap::new();
+        let mut stills = HashMap::new();
         for (_, clips) in &tracks {
             for clip in clips {
                 let Some(src) = self.media.get(clip.source) else {
                     continue;
                 };
-                // One or the other: a title has no file to reopen, and footage
-                // has nothing to draw.
-                match src.title.as_ref() {
-                    Some(title) => {
-                        titles.insert(clip.source, title.clone());
-                    }
-                    None => {
-                        paths.insert(clip.source, src.path.clone());
-                    }
+                // One of the three: a title has no file to reopen, an image is
+                // a file opened as one picture, and footage has nothing to draw.
+                if let Some(title) = src.title.as_ref() {
+                    titles.insert(clip.source, title.clone());
+                } else if src.still.is_some() {
+                    stills.insert(clip.source, src.path.clone());
+                } else {
+                    paths.insert(clip.source, src.path.clone());
                 }
             }
         }
@@ -544,6 +568,7 @@ impl State {
             tracks,
             paths,
             titles,
+            stills,
         };
         self.export = Some(ExportJob::start(request));
         self.set_status("Starting…".into(), STATUS_INFO);

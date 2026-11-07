@@ -10,6 +10,8 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::software::scaling;
 use ffmpeg::{codec, format, frame};
 
+use crate::colorspace;
+use crate::still;
 use crate::title::{self, Title};
 
 use super::raster::{
@@ -383,5 +385,139 @@ impl TitleTake {
             return None;
         }
         Some(&self.scaled)
+    }
+}
+
+/// An image, decoded and converted once for the whole render.
+///
+/// Held as YUV at its own size, ready to be cut and scaled to wherever its
+/// clip puts it, with its alpha alongside as a mask when it has any. Nothing
+/// about it changes over time, so a still held on screen for a whole shot is
+/// scaled once rather than once per frame.
+pub(super) struct StillTake {
+    /// The file's own size, which is what decides where the clip lands — the
+    /// same number the preview fits by.
+    width: u32,
+    height: u32,
+    /// The picture in the output's YUV, at the even size nearest below the
+    /// file's: YUV420P has no half chroma sample to give an odd edge.
+    picture: frame::Video,
+    /// Coverage, the same size as `picture`. `None` for an opaque image, which
+    /// composes as a plain picture.
+    mask: Option<frame::Video>,
+    cropped: frame::Video,
+    cropped_mask: frame::Video,
+    staged: frame::Video,
+    staged_mask: frame::Video,
+    scaler: Option<scaling::Context>,
+    mask_scaler: Option<scaling::Context>,
+    staged_for: Option<Placement>,
+}
+
+impl StillTake {
+    pub(super) fn open(path: &str) -> Result<Self, ffmpeg::Error> {
+        let image = still::decode(path)?;
+        let (w, h) = (even_down(image.width).max(2), even_down(image.height).max(2));
+        let mut rgba = frame::Video::new(format::Pixel::RGBA, image.width, image.height);
+        let stride = rgba.stride(0);
+        let row_bytes = image.width as usize * 4;
+        for row in 0..image.height as usize {
+            rgba.data_mut(0)[row * stride..row * stride + row_bytes]
+                .copy_from_slice(&image.pixels[row * row_bytes..(row + 1) * row_bytes]);
+        }
+        let mut scaler = scaling::Context::get(
+            format::Pixel::RGBA,
+            image.width,
+            image.height,
+            format::Pixel::YUV420P,
+            w,
+            h,
+            scaling::Flags::LANCZOS,
+        )?;
+        // BT.709, for the reason `color_to_yuv` gives: an image goes through
+        // RGB as a title colour does, and the default would be BT.601.
+        if !colorspace::use_matrix(&mut scaler, ffmpeg::ffi::SWS_CS_ITU709) {
+            log::warn!("{path}: scaler kept its default matrix; colours may shift");
+        }
+        let mut picture = frame::Video::empty();
+        scaler.run(&rgba, &mut picture)?;
+
+        let mask = image.has_transparency().then(|| {
+            let mut mask = frame::Video::new(format::Pixel::GRAY8, w, h);
+            let stride = mask.stride(0);
+            let data = mask.data_mut(0);
+            for row in 0..h as usize {
+                for col in 0..w as usize {
+                    data[row * stride + col] = image.pixels[(row * image.width as usize + col) * 4 + 3];
+                }
+            }
+            mask
+        });
+
+        Ok(Self {
+            width: image.width,
+            height: image.height,
+            picture,
+            mask,
+            cropped: frame::Video::empty(),
+            cropped_mask: frame::Video::empty(),
+            staged: frame::Video::empty(),
+            staged_mask: frame::Video::empty(),
+            scaler: None,
+            mask_scaler: None,
+            staged_for: None,
+        })
+    }
+
+    pub(super) fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// The picture scaled into `placement`, and its coverage there if it has
+    /// any transparency.
+    pub(super) fn render(&mut self, placement: Placement) -> Option<(&frame::Video, Option<&frame::Video>)> {
+        if self.staged_for != Some(placement) {
+            self.staged_for = None;
+            let (pw, ph) = (self.picture.width(), self.picture.height());
+            let full = placement.src == [0.0, 0.0, 1.0, 1.0];
+            if !full {
+                // The part still on canvas, on even samples as for footage.
+                let [u0, v0, u1, v1] = placement.src;
+                let x0 = even_down((u0 * pw as f32).round() as u32);
+                let y0 = even_down((v0 * ph as f32).round() as u32);
+                let x1 = even_up((u1 * pw as f32).round() as u32).min(pw);
+                let y1 = even_up((v1 * ph as f32).round() as u32).min(ph);
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                alloc_yuv(&mut self.cropped, x1 - x0, y1 - y0);
+                crop_yuv420p(&mut self.cropped, &self.picture, x0, y0);
+                if let Some(mask) = self.mask.as_ref() {
+                    alloc_gray(&mut self.cropped_mask, x1 - x0, y1 - y0);
+                    crop_gray8(&mut self.cropped_mask, mask, x0, y0);
+                }
+            }
+            let (picture, mask) = if full {
+                (&self.picture, self.mask.as_ref())
+            } else {
+                (&self.cropped, self.mask.as_ref().map(|_| &self.cropped_mask))
+            };
+            if !scale_into(&mut self.scaler, picture, &mut self.staged, placement.w, placement.h) {
+                return None;
+            }
+            if let Some(mask) = mask {
+                if !scale_gray_into(
+                    &mut self.mask_scaler,
+                    mask,
+                    &mut self.staged_mask,
+                    placement.w,
+                    placement.h,
+                ) {
+                    return None;
+                }
+            }
+            self.staged_for = Some(placement);
+        }
+        Some((&self.staged, self.mask.as_ref().map(|_| &self.staged_mask)))
     }
 }
