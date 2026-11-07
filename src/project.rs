@@ -1,9 +1,13 @@
 //! The project file: what a session is worth keeping across a restart.
 //!
-//! Three things go in — the canvas settings, the media the timeline references,
-//! and the timeline itself. Everything else on `State` is either derived (the
-//! decoded frames, the waveforms) or a view preference that belongs to the
-//! window rather than the project (panel splits, playhead, undo history).
+//! Four things go in — the canvas settings, the media the timeline references,
+//! the timeline itself, and how the window was laid out for it. Everything else
+//! on `State` is either derived (the decoded frames, the waveforms) or belongs
+//! to the session rather than the project (playhead, zoom, undo history).
+//!
+//! The layout is in because the right one depends on the project: a vertical
+//! canvas wants a tall preview and a 16:9 one a wide one, so a single layout
+//! for every project would be wrong every time you switched between the two.
 //!
 //! RON rather than JSON because the data is enum-shaped: `Setting::Auto` and
 //! `Clip::link` round-trip as `Auto` and `Some(3)` instead of the tagged-object
@@ -15,6 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::Setting;
+use crate::layout::PoolView;
 use crate::timeline::{Clip, SourceId, TrackKind};
 use crate::title::Title;
 
@@ -38,6 +43,21 @@ pub struct Project {
     pub canvas: CanvasSettings,
     pub sources: Vec<SourceEntry>,
     pub tracks: Vec<TrackEntry>,
+    /// Absent from files saved before layouts were kept, which open with the
+    /// default layout. Defaulted rather than versioned: there is nothing to
+    /// half-understand in a file that simply does not say.
+    #[serde(default)]
+    pub layout: Option<Layout>,
+}
+
+/// How the window was arranged when the project was saved.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    /// The dividers, as the fractions of the window `State` keeps them in, so
+    /// a project opened in a different size of window keeps its proportions.
+    pub split_top_bottom: f32,
+    pub split_pool_preview: f32,
+    pub pool_view: PoolView,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -181,6 +201,11 @@ mod tests {
                     ..Clip::default()
                 }],
             }],
+            layout: Some(Layout {
+                split_top_bottom: 0.7,
+                split_pool_preview: 0.2,
+                pool_view: PoolView::Grid,
+            }),
         }
     }
 
@@ -199,6 +224,19 @@ mod tests {
         assert_eq!(back.sources[1].title, sample().sources[1].title);
         assert_eq!(back.tracks[0].kind, TrackKind::Video);
         assert_eq!(back.tracks[0].clips[0], sample().tracks[0].clips[0]);
+        assert_eq!(back.layout, sample().layout);
+    }
+
+    /// Files written before the layout was kept still open, with none.
+    #[test]
+    fn a_file_without_a_layout_still_opens() {
+        let mut old = sample();
+        old.layout = None;
+        let text = ron::ser::to_string_pretty(&old, ron::ser::PrettyConfig::default()).unwrap();
+        let text = text.replace("layout: None,", "");
+        assert!(!text.contains("layout"), "{text}");
+        let back: Project = ron::from_str(&text).unwrap();
+        assert_eq!(back.layout, None);
     }
 
     /// Trim points are the one field where a lossy round trip would be

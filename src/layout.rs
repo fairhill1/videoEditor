@@ -367,7 +367,7 @@ pub(crate) fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
 }
 
 /// How the media pool lays its sources out.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PoolView {
     /// One row per source: a small thumbnail with the name and format beside it.
     #[default]

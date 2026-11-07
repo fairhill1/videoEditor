@@ -85,7 +85,8 @@ pub(crate) struct State {
     pub(crate) cursor: [f32; 2],
     /// Fraction of the window height that sits above the timeline, and fraction
     /// of the width given to the media pool. Read through [`State::timeline_top`]
-    /// and [`State::media_pool_w`], which apply the panel minimums.
+    /// and [`State::media_pool_w`], which apply the panel minimums. Saved with
+    /// the project, since the right split depends on the canvas's shape.
     pub(crate) split_top_bottom: f32,
     pub(crate) split_pool_preview: f32,
     /// Canvas format, each dimension either pinned or following the footage.
@@ -165,8 +166,7 @@ pub(crate) struct State {
     pub(crate) pool_open_btn: Rect,
     pub(crate) pool_title_btn: Rect,
     pub(crate) pool_view_btn: Rect,
-    /// List or grid. A preference about this window rather than part of the
-    /// project, so it is not saved with one.
+    /// List or grid. Saved with the project, alongside the panel splits.
     pub(crate) pool_view: PoolView,
     /// The title being typed into, and what it said when typing started, so
     /// Escape can put it back.

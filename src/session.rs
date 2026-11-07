@@ -12,7 +12,8 @@ use crate::input::DragMode;
 use crate::media::MediaPool;
 use crate::project;
 use crate::state::{default_tracks, State};
-use crate::theme::{STATUS_ERR, STATUS_OK};
+use crate::layout::PoolView;
+use crate::theme::{MEDIA_PREVIEW_SPLIT, STATUS_ERR, STATUS_OK, TOP_BOTTOM_SPLIT};
 use crate::timeline::{Clip, SourceId, Timeline, Track};
 
 impl State {
@@ -102,6 +103,30 @@ impl State {
                     clips: t.clips.clone(),
                 })
                 .collect(),
+            layout: Some(project::Layout {
+                split_top_bottom: self.split_top_bottom,
+                split_pool_preview: self.split_pool_preview,
+                pool_view: self.pool_view,
+            }),
+        }
+    }
+
+    /// Lay the window out as `layout` says, or as a fresh window is when there
+    /// is none. A fraction that is not a number — a hand-edited file — is the
+    /// one value a split cannot recover from, so it falls back too.
+    fn apply_layout(&mut self, layout: Option<project::Layout>) {
+        let split = |v: f32, default: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { default };
+        match layout {
+            Some(l) => {
+                self.split_top_bottom = split(l.split_top_bottom, TOP_BOTTOM_SPLIT);
+                self.split_pool_preview = split(l.split_pool_preview, MEDIA_PREVIEW_SPLIT);
+                self.pool_view = l.pool_view;
+            }
+            None => {
+                self.split_top_bottom = TOP_BOTTOM_SPLIT;
+                self.split_pool_preview = MEDIA_PREVIEW_SPLIT;
+                self.pool_view = PoolView::default();
+            }
         }
     }
 
@@ -226,6 +251,7 @@ impl State {
         self.timeline.reseed_counters();
         self.canvas_res = loaded.canvas.resolution;
         self.canvas_fps = loaded.canvas.fps;
+        self.apply_layout(loaded.layout);
         self.reset_session_state();
         self.project_path = Some(path.to_path_buf());
         self.dirty = false;
@@ -259,6 +285,7 @@ impl State {
         self.timeline.tracks = default_tracks();
         self.canvas_res = Setting::Auto;
         self.canvas_fps = Setting::Auto;
+        self.apply_layout(None);
         self.reset_session_state();
         self.project_path = None;
         self.dirty = false;

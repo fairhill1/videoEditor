@@ -53,8 +53,9 @@ pub(crate) enum DragMode {
     /// the same reason as the scrollbar.
     ZoomSlider,
     /// Dragging a panel divider. Deliberately outside the undo system: where
-    /// the panels sit is a view preference, and burying a real edit one step
-    /// further back in the history every time you resize would be maddening.
+    /// the panels sit is saved with the project, but it is a layout rather than
+    /// an edit, and burying a real edit one step further back in the history
+    /// every time you resize would be maddening.
     Splitter(Splitter),
 }
 
@@ -230,6 +231,8 @@ impl State {
                 PoolView::List => PoolView::Grid,
                 PoolView::Grid => PoolView::List,
             };
+            // Saved with the project's layout.
+            self.dirty = true;
             return;
         }
         if let Some(id) = self.pool_close_hit(cx, cy) {
@@ -336,12 +339,20 @@ impl State {
             DragMode::Splitter(Splitter::TopBottom) => {
                 let h = self.logical_size()[1].max(1.0);
                 let y = resolve_split(self.cursor[1] / h, h, TOP_MIN_H, TIMELINE_MIN_H);
-                self.split_top_bottom = y / h;
+                // Saved with the project, so moving it is a change worth saving
+                // — though not an edit worth undoing.
+                if self.split_top_bottom != y / h {
+                    self.split_top_bottom = y / h;
+                    self.dirty = true;
+                }
             }
             DragMode::Splitter(Splitter::PoolPreview) => {
                 let w = self.logical_size()[0].max(1.0);
                 let x = resolve_split(self.cursor[0] / w, w, POOL_MIN_W, PREVIEW_MIN_W);
-                self.split_pool_preview = x / w;
+                if self.split_pool_preview != x / w {
+                    self.split_pool_preview = x / w;
+                    self.dirty = true;
+                }
             }
             DragMode::ClipMove { track, idx, grab_t_offset } => {
                 let layout = self.timeline_layout();
