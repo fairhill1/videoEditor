@@ -143,10 +143,12 @@ pub(crate) const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 ///
 /// The clip fills are chosen so `CLIP_LABEL_COLOR` clears WCAG AA against
 /// them, but a waveform peak is lighter than any of them and a tall one puts
-/// near-white text on near-white peaks. Black at this alpha takes the
-/// brightest peak down to around 0.30 relative luminance, which holds the
-/// contrast the fills were picked for wherever the label lands.
-pub(crate) const CLIP_LABEL_PLATE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.66];
+/// near-white text on near-white peaks. The plate is nearly opaque because
+/// contrast alone was not enough: at 0.66 a third of the waveform still came
+/// through, and its peaks read as texture behind the text — worst under the
+/// level readout, which sits on the waveform by design. At 0.85 the peaks
+/// fade to a faint shadow and the plate reads as a solid backing.
+pub(crate) const CLIP_LABEL_PLATE_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.85];
 /// Breathing room around the text inside its plate. The vertical pad is the
 /// smaller of the two because the plate's height already comes from the font's
 /// ascent and descent rather than from the glyphs the label happens to use, so
