@@ -227,7 +227,7 @@ impl State {
         // is already folded into the view (see `State::content_duration`), so
         // the width here is the width it will have once dropped.
         if let DragMode::PoolDrag { source } = self.drag {
-            let dur = self.media.duration(source);
+            let dur = self.media.drop_duration(source);
             let ghost_w = ((dur * layout.px_per_sec()) as f32).max(GHOST_MIN_W);
             let ghost_h = lane_h;
             let over_lane = self.track_at_y(self.cursor[1], &layout);

@@ -525,7 +525,7 @@ impl State {
     /// preview it thirty times the width of the panel it is about to land in.
     pub(crate) fn content_duration(&self) -> f64 {
         let incoming = match self.drag {
-            DragMode::PoolDrag { source } => self.media.duration(source),
+            DragMode::PoolDrag { source } => self.media.drop_duration(source),
             _ => 0.0,
         };
         self.timeline.duration().max(incoming).max(MIN_CONTENT_SPAN)
