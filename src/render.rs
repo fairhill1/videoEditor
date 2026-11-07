@@ -9,7 +9,9 @@ use crate::canvas::Canvas;
 use crate::compose::Layer;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{pool_row_close_rect, transform_handle_rects, PoolCell, PoolView, Splitter};
+use crate::layout::{
+    pool_row_close_rect, transform_handle_rects, PoolCell, PoolTab, PoolView, Splitter,
+};
 use crate::audio::Waveform;
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
@@ -193,10 +195,16 @@ impl State {
             media.poll_filmstrips(device, queue, quads);
             media.release_idle_frames();
         }
-        self.draw_media_pool_list();
+        match self.pool_tab {
+            PoolTab::Media => self.draw_media_pool_list(),
+            PoolTab::Effects => self.draw_effects_panel(),
+        }
         self.draw_panel_labels(w, media_w);
         self.draw_timeline_toolbar(w, top_h, canvas);
         self.draw_transport_bar(w, media_w, preview_w, preview_h, t);
+        // Over every panel, since the drag crosses all of them on its way from
+        // the library to a clip.
+        self.draw_effect_drag();
 
         // --- Splitter handle: after the panels, so it sits over both it divides ---
         // A grabbed divider stays lit even once the cursor has run past a panel
@@ -229,6 +237,8 @@ impl State {
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        // Ahead of the main pass, which samples what these write.
+        self.blur.encode(&self.device, &self.queue, &mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -321,37 +331,45 @@ impl State {
         // Scoped disjoint borrows so the decoder advance + textured-quad push can
         // share this block without leaking borrows past it.
         {
-            let Self { media, quads, queue, .. } = self;
+            let Self { media, quads, queue, device, blur, .. } = self;
             for layer in &layers {
                 let Some(mut quad) = canvas_quad(layer, canvas, canvas_x, canvas_y, canvas_scale)
                 else {
                     continue;
                 };
-                // A title's colour rides on the quad and its shape on the
-                // texture's alpha, so one baked picture serves any colour —
-                // and the layer's own opacity multiplies straight into it.
-                if let Some(title) = media.get(layer.source).and_then(|s| s.title.as_ref()) {
+                // Which picture to draw. A title's colour rides on the quad and
+                // its shape on the texture's alpha, so one baked picture serves
+                // any colour — and the layer's own opacity multiplies straight
+                // into it. An image's alpha rides through the blend as it is,
+                // so a logo with a transparent background sits on whatever is
+                // below it.
+                let texture = if let Some(title) =
+                    media.get(layer.source).and_then(|s| s.title.as_ref())
+                {
                     let [r, g, b, a] = title.color;
                     quad.color = [r, g, b, a * layer.alpha];
-                    let Some(texture) = media.get(layer.source).and_then(|s| s.title_texture())
-                    else {
-                        continue;
-                    };
-                    quads.push_with(quad, Some(texture));
-                    continue;
-                }
-                // An image's alpha rides through the blend as it is, so a logo
-                // with a transparent background sits on whatever is below it.
-                if let Some(still) = media.get(layer.source).and_then(|s| s.still.as_ref()) {
-                    quads.push_with(quad, Some(still.texture()));
-                    continue;
-                }
-                let Some(stream) = media.get_mut(layer.source).and_then(|s| s.stream.as_mut())
-                else {
+                    media.get(layer.source).and_then(|s| s.title_texture())
+                } else if let Some(still) = media.get(layer.source).and_then(|s| s.still.as_ref()) {
+                    Some(still.texture())
+                } else if let Some(stream) =
+                    media.get_mut(layer.source).and_then(|s| s.stream.as_mut())
+                {
+                    stream.goto(queue, layer.source_time);
+                    Some(stream.texture())
+                } else {
+                    None
+                };
+                let Some(texture) = texture else {
                     continue;
                 };
-                stream.goto(queue, layer.source_time);
-                quads.push_with(quad, Some(stream.texture()));
+                // A blurred layer draws its blurred copy over the same rect:
+                // the copy keeps the picture's shape, so the uv the placement
+                // worked out holds for it unchanged.
+                let texture = match layer.blur_plan(texture.height) {
+                    Some(plan) => blur.prepare(device, quads, layer.clip, texture, plan),
+                    None => texture,
+                };
+                quads.push_with(quad, Some(texture));
             }
         }
 

@@ -5,6 +5,7 @@
 //! deltas. That split is what lets a keyboard shortcut and a drag share one
 //! implementation of "move this clip".
 
+use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
 use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::{SNAP_PX, STATUS_INFO};
@@ -739,6 +740,99 @@ impl State {
         }
         self.commit_edit();
         self.selected.clear();
+    }
+
+    /// A new empty track of `kind`: above the other video tracks, or below
+    /// the other audio ones — the edge of the stack its add row sits on.
+    pub(crate) fn add_track(&mut self, kind: TrackKind) {
+        self.begin_edit();
+        self.timeline.push_track(kind);
+        self.commit_edit();
+    }
+
+    /// Take out track `idx`, which the header only offers for an empty track
+    /// that is not the last of its kind — checked again here, since a track
+    /// with clips on it going is a loss nobody asked for.
+    pub(crate) fn remove_track(&mut self, idx: usize) {
+        let Some(track) = self.timeline.tracks.get(idx) else {
+            return;
+        };
+        if !track.clips.is_empty() || self.n_tracks_of(track.kind) <= 1 {
+            return;
+        }
+        self.begin_edit();
+        self.timeline.tracks.remove(idx);
+        self.commit_edit();
+    }
+
+    /// Put a fresh `kind` on the end of each clip at `targets`, as one step.
+    /// A clip already carrying all it can hold is skipped and said so.
+    pub(crate) fn apply_effect(&mut self, kind: EffectKind, targets: &[(usize, usize)]) {
+        self.begin_edit();
+        let mut full = 0;
+        for &(track, idx) in targets {
+            if !self.timeline.tracks[track].clips[idx].effects.push(kind.instance()) {
+                full += 1;
+            }
+        }
+        self.commit_edit();
+        if full > 0 {
+            self.set_status(
+                format!("A clip can hold {MAX_EFFECTS} effects; {full} already had that many"),
+                STATUS_INFO,
+            );
+        }
+    }
+
+    /// The apply button: `kind` on every selected clip's picture — each
+    /// selected video clip, and the video half of each selected audio clip.
+    pub(crate) fn apply_effect_to_selection(&mut self, kind: EffectKind) {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        for id in &self.selected {
+            let Some((track, idx)) = self.timeline.find(*id) else {
+                continue;
+            };
+            if let Some(target) = self.effects_clip_for(track, idx) {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        if targets.is_empty() {
+            self.set_status("Select a video clip to apply an effect to".into(), STATUS_INFO);
+            return;
+        }
+        self.apply_effect(kind, &targets);
+    }
+
+    /// Effect `index` on the clip the effects tab is showing, for changing.
+    fn shown_effect_mut(&mut self, index: usize) -> Option<&mut Effect> {
+        let (track, idx) = self.effects_target()?;
+        self.timeline.tracks[track].clips[idx].effects.get_mut(index)
+    }
+
+    pub(crate) fn toggle_effect(&mut self, index: usize) {
+        self.begin_edit();
+        if let Some(effect) = self.shown_effect_mut(index) {
+            effect.enabled = !effect.enabled;
+        }
+        self.commit_edit();
+    }
+
+    pub(crate) fn remove_effect(&mut self, index: usize) {
+        self.begin_edit();
+        if let Some((track, idx)) = self.effects_target() {
+            self.timeline.tracks[track].clips[idx].effects.remove(index);
+        }
+        self.commit_edit();
+    }
+
+    /// Set one parameter of the shown clip's effect `index`. Called through a
+    /// slider drag, which holds the edit open around it.
+    pub(crate) fn set_effect_param(&mut self, index: usize, param: usize, value: f32) {
+        if let Some(effect) = self.shown_effect_mut(index) {
+            effect.set_param(param, value);
+        }
     }
 }
 

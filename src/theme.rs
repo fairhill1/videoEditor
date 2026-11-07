@@ -36,6 +36,9 @@ pub(crate) const ICON_LIST: char = '\u{E106}'; // list
 pub(crate) const ICON_ZOOM_OUT: char = '\u{E1B7}'; // zoom-out
 pub(crate) const ICON_ZOOM_IN: char = '\u{E1B6}'; // zoom-in
 pub(crate) const ICON_ZOOM_FIT: char = '\u{E43D}'; // unfold-horizontal
+pub(crate) const ICON_PLUS: char = '\u{E13D}'; // plus
+pub(crate) const ICON_EYE: char = '\u{E0BA}'; // eye
+pub(crate) const ICON_EYE_OFF: char = '\u{E0BB}'; // eye-off
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -59,14 +62,17 @@ pub(crate) const SPLITTER_ACTIVE_COLOR: [f32; 4] = [0.45, 0.45, 0.53, 1.0];
 /// controls would start overlapping, and a preview can always letterbox.
 /// The pool's floor is its header: the label, the import and title buttons on
 /// the left and the view toggle on the right, without the two meeting.
-pub(crate) const POOL_MIN_W: f32 = 210.0;
+pub(crate) const POOL_MIN_W: f32 = 250.0;
 pub(crate) const PREVIEW_MIN_W: f32 = 340.0;
 /// Enough for the transport bar plus a sliver of picture above it.
 pub(crate) const TOP_MIN_H: f32 = TRANSPORT_BAR_H + 60.0;
 /// Toolbar, ruler and one lane at its minimum height — below this the timeline
 /// stops being a timeline.
-pub(crate) const TIMELINE_MIN_H: f32 =
-    TIMELINE_TOP_PAD + TIMELINE_RULER_H + TRACK_LANE_MIN_H + TIMELINE_SCROLLBAR_H;
+pub(crate) const TIMELINE_MIN_H: f32 = TIMELINE_TOP_PAD
+    + TIMELINE_RULER_H
+    + TRACK_ADD_ROW_H * 2.0
+    + TRACK_LANE_MIN_H
+    + TIMELINE_SCROLLBAR_H;
 
 // Surface elevation scale (sRGB), darkest first. Steps widen as they climb:
 // down near black a small numeric difference is imperceptible, so the low tiers
@@ -389,3 +395,77 @@ pub(crate) fn lighten(c: [f32; 4], f: f32) -> [f32; 4] {
 pub(crate) fn darken(c: [f32; 4], f: f32) -> [f32; 4] {
     [c[0] * f, c[1] * f, c[2] * f, c[3]]
 }
+
+// Pool panel tabs: MEDIA and EFFECTS, in place of a single heading.
+pub(crate) const POOL_TAB_GAP: f32 = 14.0;
+/// The tab not showing. Dimmer than a heading, so the one that is showing reads
+/// as the panel's title and the other as the way to the other page.
+pub(crate) const POOL_TAB_IDLE_COLOR: [f32; 4] = [0.50, 0.50, 0.56, 1.0];
+pub(crate) const POOL_TAB_HOVER_COLOR: [f32; 4] = [0.82, 0.82, 0.88, 1.0];
+pub(crate) const POOL_TAB_ACTIVE_COLOR: [f32; 4] = CLIP_LABEL_COLOR;
+/// The bar under the showing tab: the selection accent, as on a picked clip.
+pub(crate) const POOL_TAB_MARK_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
+pub(crate) const POOL_TAB_MARK_H: f32 = 2.0;
+
+// Effects tab.
+pub(crate) const EFFECTS_SECTION_SIZE: f32 = TYPE_SM;
+pub(crate) const EFFECTS_SECTION_COLOR: [f32; 4] = TRACK_LABEL_COLOR;
+/// A section heading's band, and the space above every heading after the first.
+pub(crate) const EFFECTS_SECTION_H: f32 = 22.0;
+pub(crate) const EFFECTS_SECTION_GAP: f32 = 14.0;
+/// The picture on a library card: what the effect does to a plain square, in
+/// the selection accent so it reads as an illustration rather than footage.
+pub(crate) const EFFECT_CARD_ART_COLOR: [f32; 4] = [0.95, 0.72, 0.30, 1.0];
+/// How many rings the blurred half of the blur card's picture fades over.
+pub(crate) const EFFECT_CARD_BLUR_STEPS: usize = 10;
+/// An applied effect's own row, and each of its parameters under it.
+pub(crate) const EFFECT_ROW_H: f32 = 30.0;
+pub(crate) const EFFECT_PARAM_H: f32 = 28.0;
+pub(crate) const EFFECT_ROW_GAP: f32 = 4.0;
+pub(crate) const EFFECT_NAME_SIZE: f32 = TYPE_MD;
+pub(crate) const EFFECT_META_SIZE: f32 = TYPE_SM;
+pub(crate) const EFFECT_META_COLOR: [f32; 4] = LABEL_COLOR;
+/// An effect that is switched off: its name dims, so the stack reads at a
+/// glance as which of its effects are doing anything.
+pub(crate) const EFFECT_OFF_COLOR: [f32; 4] = [0.50, 0.50, 0.56, 1.0];
+/// The square on-off and remove buttons of an applied effect.
+pub(crate) const EFFECT_SMALL_BTN: f32 = 22.0;
+pub(crate) const EFFECT_PARAM_LABEL_W: f32 = 64.0;
+pub(crate) const EFFECT_PARAM_VALUE_W: f32 = 52.0;
+/// The parameter rows sit under their effect's name, indented to say so.
+pub(crate) const EFFECT_PARAM_INDENT: f32 = 10.0;
+/// The label that follows the cursor while an effect is dragged to a clip.
+pub(crate) const EFFECT_DRAG_BG: [f32; 4] = [0.06, 0.06, 0.08, 0.92];
+pub(crate) const EFFECT_DRAG_PAD: f32 = 6.0;
+pub(crate) const EFFECT_DRAG_OFFSET: f32 = 14.0;
+/// The outline on the clip a dragged effect would land on.
+pub(crate) const EFFECT_DROP_OUTLINE_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
+pub(crate) const EFFECT_DROP_OUTLINE_PX: f32 = 2.0;
+
+// The fx badge on a clip that has effects: the way from a clip on the timeline
+// to the panel that edits them.
+pub(crate) const FX_BADGE_W: f32 = 20.0;
+pub(crate) const FX_BADGE_H: f32 = 14.0;
+/// Right of the fade-in handle's corner box, so the handle keeps its corner.
+pub(crate) const FX_BADGE_INSET_X: f32 = CLIP_FADE_HANDLE_BOX + 3.0;
+pub(crate) const FX_BADGE_INSET_Y: f32 = 3.0;
+/// Space between the badge and the clip's name, which moves along to make room.
+pub(crate) const FX_BADGE_GAP: f32 = 5.0;
+pub(crate) const FX_BADGE_LABEL_SIZE: f32 = TYPE_SM;
+pub(crate) const FX_BADGE_BG: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
+/// Every effect on the clip switched off: still there, doing nothing.
+pub(crate) const FX_BADGE_OFF_BG: [f32; 4] = [0.36, 0.36, 0.42, 1.0];
+pub(crate) const FX_BADGE_TEXT: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
+
+// The rows above the top video lane and below the bottom audio lane, where a
+// new track is made: by the + in the header, or by dropping a clip in the row.
+pub(crate) const TRACK_ADD_ROW_H: f32 = 20.0;
+/// The + and the remove buttons in the track headers.
+pub(crate) const TRACK_HEADER_BTN: f32 = 18.0;
+pub(crate) const TRACK_HEADER_ICON_SIZE: f32 = TYPE_LG;
+/// The rows while a pool drag is under way, so it is visible that they take a
+/// drop; and the one the cursor is over, which is where the new track goes.
+pub(crate) const TRACK_ADD_ROW_HINT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.03];
+pub(crate) const TRACK_ADD_ROW_DROP_COLOR: [f32; 4] = [1.0, 0.72, 0.30, 0.16];
+pub(crate) const TRACK_ADD_ROW_LABEL_SIZE: f32 = TYPE_SM;
+pub(crate) const TRACK_ADD_ROW_LABEL_COLOR: [f32; 4] = TRACK_LABEL_COLOR;

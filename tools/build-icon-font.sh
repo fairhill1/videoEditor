@@ -33,6 +33,9 @@ ICONS=(
     zoom-out                  # timeline: zoom out
     zoom-in                   # timeline: zoom in
     unfold-horizontal         # timeline: zoom to fit the whole edit
+    plus                      # effects: apply to the selected clips
+    eye                       # effects: an applied effect is on
+    eye-off                   # effects: an applied effect is off
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

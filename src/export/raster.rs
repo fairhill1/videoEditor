@@ -514,10 +514,12 @@ mod tests {
 
     fn layer(rect: [f32; 4]) -> Layer {
         Layer {
+            clip: 0,
             source: SourceId(0),
             source_time: 0.0,
             rect,
             alpha: 1.0,
+            blur: 0.0,
         }
     }
 

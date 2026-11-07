@@ -6,6 +6,7 @@
 //! rather than answering them again, which is what keeps a rect you can click
 //! on and the rect you can see from drifting apart.
 
+use crate::effects::{EffectKind, EffectStack};
 use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::*;
@@ -108,6 +109,8 @@ pub(crate) enum TimelineHit {
     ClipTrimRight { track: usize, idx: usize },
     ClipFade { track: usize, idx: usize, side: FadeSide },
     ClipLevel { track: usize, idx: usize },
+    /// The fx badge on a clip that has effects.
+    ClipEffects { track: usize, idx: usize },
 }
 
 #[derive(Copy, Clone)]
@@ -357,6 +360,49 @@ pub(crate) fn topmost_lane_top(center_y: f32, lane_h: f32, n_video: usize) -> f3
     }
 }
 
+/// What the timeline's lanes share their panel with: the ruler, and the add
+/// row at each end of the stack.
+const TRACKS_CHROME_H: f32 = TIMELINE_RULER_H + TRACK_ADD_ROW_H * 2.0;
+
+/// The line between video and audio, for `n` tracks of which `n_video` are
+/// video, in a panel whose lanes start at `tracks_top` and get `area_h`.
+///
+/// The whole block — ruler, add rows, lanes — is centred, with video stacking
+/// up from this line and audio down from it. The line sits wherever the video
+/// lanes end, so a timeline with more video tracks than audio stays centred
+/// rather than running up into the toolbar. Never above the panel's top: a
+/// block taller than the panel runs off the bottom instead, away from the
+/// toolbar. Whole points, so the lane edges derived from it don't land on
+/// halves, which render blurred.
+pub(crate) fn lanes_center_y(tracks_top: f32, area_h: f32, lane_h: f32, n_video: usize, n: usize) -> f32 {
+    let lanes_h = n as f32 * lane_h + n.saturating_sub(1) as f32 * TRACK_LANE_GAP;
+    let block_top = (tracks_top + (area_h - TRACKS_CHROME_H - lanes_h) * 0.5).max(tracks_top);
+    (block_top + TIMELINE_RULER_H + TRACK_ADD_ROW_H + n_video as f32 * (lane_h + TRACK_LANE_GAP)
+        - TRACK_LANE_GAP * 0.5)
+        .round()
+}
+
+/// The add rows for a stack of lanes about `center_y`: one above the top
+/// video lane, one below the bottom audio lane — where a new track appears.
+pub(crate) fn track_add_rows(
+    center_y: f32,
+    lane_h: f32,
+    n_video: usize,
+    n_audio: usize,
+    w: f32,
+) -> [(TrackKind, Rect); 2] {
+    let topmost = topmost_lane_top(center_y, lane_h, n_video);
+    let bottom = if n_audio == 0 {
+        center_y
+    } else {
+        lane_y(center_y, lane_h, n_audio - 1, TrackKind::Audio) + lane_h
+    };
+    [
+        (TrackKind::Video, Rect { x: 0.0, y: topmost - TRACK_ADD_ROW_H, w, h: TRACK_ADD_ROW_H }),
+        (TrackKind::Audio, Rect { x: 0.0, y: bottom, w, h: TRACK_ADD_ROW_H }),
+    ]
+}
+
 pub(crate) fn compute_lane_height(tracks_area_h: f32, n_tracks: usize) -> f32 {
     let n = n_tracks.max(1) as f32;
     let gaps = (n - 1.0).max(0.0) * TRACK_LANE_GAP;
@@ -446,6 +492,201 @@ pub(crate) fn pool_cells(view: PoolView, pool_w: f32, pool_h: f32, n: usize) -> 
     cells
 }
 
+/// Which page the pool panel shows: the media in the project, or the effects
+/// that can be put on it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PoolTab {
+    #[default]
+    Media,
+    Effects,
+}
+
+/// One card in the effects library: the tile a drag picks up, the picture of
+/// what the effect does, and the apply button in the picture's corner.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct LibraryCard {
+    pub(crate) kind: EffectKind,
+    pub(crate) card: PoolCell,
+    pub(crate) apply: Rect,
+}
+
+/// One parameter of an applied effect: its row, and the slider in it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ParamRow {
+    pub(crate) param: usize,
+    pub(crate) row: Rect,
+    pub(crate) slider: Rect,
+}
+
+/// One effect applied to the clip the panel is showing: its own row, with the
+/// on-off and remove buttons, and its parameters under it.
+#[derive(Clone, Debug)]
+pub(crate) struct StackRow {
+    pub(crate) index: usize,
+    pub(crate) row: Rect,
+    pub(crate) toggle: Rect,
+    pub(crate) remove: Rect,
+    pub(crate) params: Vec<ParamRow>,
+}
+
+/// Where everything on the effects tab sits. Like [`pool_cells`], the one
+/// place this is worked out, for drawing and hit testing alike.
+#[derive(Clone, Debug)]
+pub(crate) struct EffectsPanel {
+    pub(crate) library: Vec<LibraryCard>,
+    /// Top of the heading over the selected clip's effects.
+    pub(crate) clip_heading_y: f32,
+    /// Top of the line that stands in for the stack when it has nothing to
+    /// list — no clip picked, or a clip with no effects yet.
+    pub(crate) hint_y: f32,
+    pub(crate) stack: Vec<StackRow>,
+}
+
+/// What a press on the effects tab landed on.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum EffectsHit {
+    /// A library card away from its button: the start of a drag to a clip.
+    Library(EffectKind),
+    Apply(EffectKind),
+    Toggle { index: usize },
+    Remove { index: usize },
+    Param { index: usize, param: usize, slider: Rect },
+}
+
+/// Lay the effects tab out in a pool `pool_w` wide and `pool_h` tall: the
+/// library as cards, then the effects on the clip being shown — `stack` — if
+/// there is one. Rows that would run past the bottom are left out.
+///
+/// The cards are the media pool's grid tiles exactly, so the two pages of the
+/// panel read as one kind of thing. The library comes first so it holds
+/// still: it is what you drag from, and cards that moved down whenever the
+/// selected clip gained an effect would move out from under the cursor
+/// between one drag and the next.
+pub(crate) fn effects_panel(
+    pool_w: f32,
+    pool_h: f32,
+    kinds: &[EffectKind],
+    stack: Option<&EffectStack>,
+) -> EffectsPanel {
+    let x = LABEL_PAD;
+    let w = (pool_w - LABEL_PAD * 2.0).max(1.0);
+    let fits = |y: f32, h: f32| y + h <= pool_h;
+    let cells = pool_cells(PoolView::Grid, pool_w, pool_h, kinds.len());
+    let mut y = cells.iter().map(|c| c.cell.y + c.cell.h).fold(POOL_LIST_TOP, f32::max);
+    let library = kinds
+        .iter()
+        .zip(cells)
+        .map(|(&kind, card)| LibraryCard {
+            kind,
+            card,
+            apply: Rect {
+                x: card.thumb.x + card.thumb.w - POOL_CLOSE_INSET - EFFECT_SMALL_BTN,
+                y: card.thumb.y + POOL_CLOSE_INSET,
+                w: EFFECT_SMALL_BTN,
+                h: EFFECT_SMALL_BTN,
+            },
+        })
+        .collect();
+
+    y += EFFECTS_SECTION_GAP;
+    let clip_heading_y = y;
+    y += EFFECTS_SECTION_H;
+    let hint_y = y;
+
+    let mut rows = Vec::new();
+    for (index, effect) in stack.into_iter().flat_map(|s| s.iter()).enumerate() {
+        if !fits(y, EFFECT_ROW_H) {
+            break;
+        }
+        let row = Rect { x, y, w, h: EFFECT_ROW_H };
+        let btn_y = (y + (EFFECT_ROW_H - EFFECT_SMALL_BTN) * 0.5).round();
+        let toggle = Rect {
+            x: x + POOL_ROW_PAD,
+            y: btn_y,
+            w: EFFECT_SMALL_BTN,
+            h: EFFECT_SMALL_BTN,
+        };
+        let remove = Rect { x: x + w - POOL_ROW_PAD - EFFECT_SMALL_BTN, ..toggle };
+        y += EFFECT_ROW_H;
+        let mut params = Vec::new();
+        for param in 0..effect.kind().params().len() {
+            if !fits(y, EFFECT_PARAM_H) {
+                break;
+            }
+            let prow = Rect { x, y, w, h: EFFECT_PARAM_H };
+            let slider_x = x + EFFECT_PARAM_INDENT + EFFECT_PARAM_LABEL_W;
+            let slider = Rect {
+                x: slider_x,
+                y: (y + (EFFECT_PARAM_H - ZOOM_SLIDER_KNOB_H) * 0.5).round(),
+                w: (x + w - POOL_ROW_PAD - EFFECT_PARAM_VALUE_W - slider_x).max(ZOOM_SLIDER_KNOB_W),
+                h: ZOOM_SLIDER_KNOB_H,
+            };
+            params.push(ParamRow { param, row: prow, slider });
+            y += EFFECT_PARAM_H;
+        }
+        rows.push(StackRow { index, row, toggle, remove, params });
+        y += EFFECT_ROW_GAP;
+    }
+
+    EffectsPanel { library, clip_heading_y, hint_y, stack: rows }
+}
+
+impl EffectsPanel {
+    /// What is under `p`. Buttons before the rows they sit in.
+    pub(crate) fn hit(&self, p: [f32; 2]) -> Option<EffectsHit> {
+        for lib in &self.library {
+            if lib.apply.contains(p) {
+                return Some(EffectsHit::Apply(lib.kind));
+            }
+            if lib.card.cell.contains(p) {
+                return Some(EffectsHit::Library(lib.kind));
+            }
+        }
+        for row in &self.stack {
+            if row.toggle.contains(p) {
+                return Some(EffectsHit::Toggle { index: row.index });
+            }
+            if row.remove.contains(p) {
+                return Some(EffectsHit::Remove { index: row.index });
+            }
+            for pr in &row.params {
+                // The whole row grabs, not just the knob's height: a slider
+                // is a thin target, and the row around it means nothing else.
+                if pr.row.contains(p) && p[0] >= pr.slider.x - ZOOM_SLIDER_KNOB_W {
+                    return Some(EffectsHit::Param {
+                        index: row.index,
+                        param: pr.param,
+                        slider: pr.slider,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The fx badge on a clip with effects, given the left of the clip's visible
+/// part and its right edge, or `None` on a clip too narrow to hold it beside
+/// its trim handles.
+pub(crate) fn fx_badge_rect(vis_x0: f32, x1: f32, lane_y: f32) -> Option<Rect> {
+    let x = vis_x0 + FX_BADGE_INSET_X;
+    if x + FX_BADGE_W > x1 - CLIP_EDGE_GRAB_PX {
+        return None;
+    }
+    Some(Rect { x, y: lane_y + FX_BADGE_INSET_Y, w: FX_BADGE_W, h: FX_BADGE_H })
+}
+
+/// A button in a track header, right-aligned and centred on a row starting
+/// at `y` and `h` tall: the + in an add row, the remove on an empty lane.
+pub(crate) fn track_header_button(y: f32, h: f32) -> Rect {
+    Rect {
+        x: TRACK_HEADER_WIDTH - 6.0 - TRACK_HEADER_BTN,
+        y: (y + (h - TRACK_HEADER_BTN) * 0.5).round(),
+        w: TRACK_HEADER_BTN,
+        h: TRACK_HEADER_BTN,
+    }
+}
+
 pub(crate) fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
     Rect {
         x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_BOX,
@@ -502,6 +743,11 @@ impl State {
         // lane has somewhere to end that isn't underneath the scrollbar.
         let tracks_area_h = (bottom - tracks_top - TIMELINE_SCROLLBAR_H).max(0.0);
         let (view_start, view_dur) = self.view_window();
+        // The ruler and the two add-track rows take their height first; the
+        // lanes share out what is left.
+        let n = self.timeline.tracks.len();
+        let lane_h = compute_lane_height((tracks_area_h - TRACKS_CHROME_H).max(0.0), n);
+        let center_y = lanes_center_y(tracks_top, tracks_area_h, lane_h, self.n_video_tracks(), n);
         TimelineLayout {
             top,
             bottom,
@@ -509,8 +755,8 @@ impl State {
             clips_w: (w - TRACK_HEADER_WIDTH).max(1.0),
             // Snap the centre to a whole point so the lane edges derived from
             // it don't land on halves, which render blurred.
-            center_y: (tracks_top + tracks_area_h * 0.5).round(),
-            lane_h: compute_lane_height(tracks_area_h, self.timeline.tracks.len()),
+            center_y,
+            lane_h,
             view_start,
             view_dur,
             content: self.content_duration(),
@@ -616,6 +862,60 @@ impl State {
         )
     }
 
+    pub(crate) fn n_tracks_of(&self, kind: TrackKind) -> usize {
+        self.timeline.tracks.iter().filter(|t| t.kind == kind).count()
+    }
+
+    /// The rows a new track is made in: above the top video lane, and below
+    /// the bottom audio lane — where the new track will appear.
+    pub(crate) fn track_add_rows(&self, layout: &TimelineLayout) -> [(TrackKind, Rect); 2] {
+        track_add_rows(
+            layout.center_y,
+            layout.lane_h,
+            self.n_video_tracks(),
+            self.n_tracks_of(TrackKind::Audio),
+            layout.clips_right(),
+        )
+    }
+
+    /// Top of the ruler, which sits on top of the video add row.
+    pub(crate) fn ruler_top(&self, layout: &TimelineLayout) -> f32 {
+        self.track_add_rows(layout)[0].1.y - TIMELINE_RULER_H
+    }
+
+    /// Which kind of new track a pool drop of `source` at `[x, y]` would make,
+    /// if the cursor is in an add row and the source has something to put on
+    /// that kind of track.
+    pub(crate) fn new_track_drop(&self, source: SourceId, [x, y]: [f32; 2]) -> Option<TrackKind> {
+        let layout = self.timeline_layout();
+        if x < layout.clips_x {
+            return None;
+        }
+        let (kind, _) = self
+            .track_add_rows(&layout)
+            .into_iter()
+            .find(|(_, row)| row.contains([x, y]))?;
+        let fits = match kind {
+            TrackKind::Video => self.media.has_video(source),
+            TrackKind::Audio => self.media.audio_duration(source).is_some(),
+        };
+        fits.then_some(kind)
+    }
+
+    /// The remove button in an empty track's header, for every track that can
+    /// go: empty, and not the last of its kind.
+    pub(crate) fn track_remove_buttons(&self, layout: &TimelineLayout) -> Vec<(usize, Rect)> {
+        let mut out = Vec::new();
+        for (i, track) in self.timeline.tracks.iter().enumerate() {
+            if !track.clips.is_empty() || self.n_tracks_of(track.kind) <= 1 {
+                continue;
+            }
+            let y = self.lane_top(i, layout);
+            out.push((i, track_header_button(y, layout.lane_h)));
+        }
+        out
+    }
+
     pub(crate) fn n_video_tracks(&self) -> usize {
         self.timeline
             .tracks
@@ -670,9 +970,11 @@ impl State {
         if cursor_y < layout.top {
             return TimelineHit::None;
         }
-        let topmost = topmost_lane_top(layout.center_y, layout.lane_h, self.n_video_tracks());
-        let ruler_top = topmost - TIMELINE_RULER_H;
-        if cursor_y >= ruler_top && cursor_y < topmost && cursor_x >= layout.clips_x {
+        let ruler_top = self.ruler_top(&layout);
+        if cursor_y >= ruler_top
+            && cursor_y < ruler_top + TIMELINE_RULER_H
+            && cursor_x >= layout.clips_x
+        {
             return TimelineHit::Ruler;
         }
         let Some(track_idx) = self.track_at_y(cursor_y, &layout) else {
@@ -687,6 +989,14 @@ impl State {
         for (i, clip) in track.clips.iter().enumerate() {
             let x0 = layout.t_to_x(clip.timeline_start);
             let x1 = layout.t_to_x(clip.timeline_end());
+            // Before the fades and trims, which it sits clear of anyway, and
+            // the body it sits on.
+            if !clip.effects.is_empty() {
+                let badge = fx_badge_rect(x0.max(layout.clips_x), x1, lane_y);
+                if badge.is_some_and(|b| b.contains([cursor_x, cursor_y])) {
+                    return TimelineHit::ClipEffects { track: track_idx, idx: i };
+                }
+            }
             // Fade handles beat the trim handles they sit on top of. Each is
             // one small box in a corner, so a trim keeps the rest of the edge.
             {
@@ -815,6 +1125,33 @@ impl State {
             .into_iter()
             .find(|(_, c)| c.cell.contains([cursor_x, cursor_y]))
             .map(|(id, _)| id)
+    }
+
+    /// The video clip `(track, idx)` stands for when it comes to effects:
+    /// itself on a video track, its linked picture on an audio one — the sound
+    /// of a clip has no picture to blur, but clicking it is still a way of
+    /// pointing at that clip. `None` for audio with no picture beside it.
+    pub(crate) fn effects_clip_for(&self, track: usize, idx: usize) -> Option<(usize, usize)> {
+        if self.timeline.tracks[track].kind == TrackKind::Video {
+            return Some((track, idx));
+        }
+        self.linked_siblings(track, idx)
+            .into_iter()
+            .find(|&(t, _)| self.timeline.tracks[t].kind == TrackKind::Video)
+    }
+
+    /// The clip whose effects the effects tab lists: the one picked last.
+    pub(crate) fn effects_target(&self) -> Option<(usize, usize)> {
+        let (track, idx) = self.primary_selected()?;
+        self.effects_clip_for(track, idx)
+    }
+
+    /// The effects tab, laid out for the clip it is showing.
+    pub(crate) fn effects_panel(&self) -> EffectsPanel {
+        let stack = self
+            .effects_target()
+            .map(|(t, i)| &self.timeline.tracks[t].clips[i].effects);
+        effects_panel(self.media_pool_w(), self.timeline_top(), &EffectKind::ALL, stack)
     }
 
     pub(crate) fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
@@ -996,6 +1333,88 @@ mod tests {
         assert_eq!(v2 + h + TRACK_LANE_GAP, v1);
         // The gap at the divider is shared, half to each side.
         assert_eq!(center - (v1 + h), a1 - center);
+    }
+
+    /// The stack reads top to bottom as ruler, video add row, video lanes,
+    /// audio lanes, audio add row — flush, nothing overlapping — and stays
+    /// inside the panel however lopsided the track counts get.
+    #[test]
+    fn the_track_stack_is_centred_and_its_add_rows_hug_the_lanes() {
+        let (top, area) = (500.0, 400.0);
+        for (n_video, n_audio) in [(2, 2), (5, 1), (1, 4), (3, 0)] {
+            let n = n_video + n_audio;
+            let lane_h = compute_lane_height(area - TRACKS_CHROME_H, n);
+            let center = lanes_center_y(top, area, lane_h, n_video, n);
+            let [(_, video_row), (_, audio_row)] =
+                track_add_rows(center, lane_h, n_video, n_audio, 800.0);
+            let topmost = topmost_lane_top(center, lane_h, n_video);
+            assert_eq!(video_row.y + video_row.h, topmost, "{n_video}v {n_audio}a");
+            let ruler_top = video_row.y - TIMELINE_RULER_H;
+            assert!(ruler_top >= top, "{n_video}v {n_audio}a: ruler at {ruler_top}");
+            assert!(audio_row.y + audio_row.h <= top + area + 1.0, "{n_video}v {n_audio}a");
+            if n_audio > 0 {
+                let last = lane_y(center, lane_h, n_audio - 1, TrackKind::Audio);
+                assert_eq!(audio_row.y, last + lane_h);
+            }
+            // Centred: the space above the ruler matches the space below the
+            // audio row, to the rounding of the centre line.
+            let above = ruler_top - top;
+            let below = top + area - (audio_row.y + audio_row.h);
+            assert!((above - below).abs() <= 1.0, "{n_video}v {n_audio}a: {above} vs {below}");
+        }
+    }
+
+    #[test]
+    fn a_stack_taller_than_the_panel_runs_off_the_bottom_not_the_top() {
+        let (top, area) = (500.0, 200.0);
+        let lane_h = compute_lane_height(area - TRACKS_CHROME_H, 12);
+        let center = lanes_center_y(top, area, lane_h, 8, 12);
+        let [(_, video_row), _] = track_add_rows(center, lane_h, 8, 4, 800.0);
+        assert_eq!(video_row.y - TIMELINE_RULER_H, top);
+    }
+
+    #[test]
+    fn the_effects_tab_stacks_cards_then_the_clips_effects_without_overlap() {
+        use crate::effects::{EffectKind, EffectStack};
+        let mut stack = EffectStack::default();
+        stack.push(EffectKind::GaussianBlur.instance());
+        stack.push(EffectKind::GaussianBlur.instance());
+        let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(&stack));
+        assert_eq!(panel.library.len(), EffectKind::ALL.len());
+        let card = panel.library[0].card;
+        // The card's apply button sits on its picture, and the card is a
+        // media grid tile exactly.
+        let apply = panel.library[0].apply;
+        assert!(card.thumb.contains([apply.x, apply.y]));
+        assert_eq!(card.cell, pool_cells(PoolView::Grid, 400.0, 2000.0, 1)[0].cell);
+        assert!(panel.clip_heading_y > card.cell.y + card.cell.h);
+        assert_eq!(panel.stack.len(), 2);
+        let first_bottom = panel.stack[0].params.last().unwrap().row;
+        assert!(panel.stack[1].row.y >= first_bottom.y + first_bottom.h);
+        // Every press lands on what is drawn there.
+        assert_eq!(panel.hit([card.cell.x + 2.0, card.cell.y + 2.0]),
+            Some(EffectsHit::Library(EffectKind::GaussianBlur)));
+        assert_eq!(panel.hit([apply.x + 2.0, apply.y + 2.0]),
+            Some(EffectsHit::Apply(EffectKind::GaussianBlur)));
+        let toggle = panel.stack[1].toggle;
+        assert_eq!(panel.hit([toggle.x + 2.0, toggle.y + 2.0]), Some(EffectsHit::Toggle { index: 1 }));
+    }
+
+    #[test]
+    fn an_effects_tab_too_short_for_its_rows_leaves_them_out() {
+        use crate::effects::{EffectKind, EffectStack};
+        let mut stack = EffectStack::default();
+        for _ in 0..8 {
+            stack.push(EffectKind::GaussianBlur.instance());
+        }
+        let panel = effects_panel(400.0, 420.0, &EffectKind::ALL, Some(&stack));
+        for row in &panel.stack {
+            assert!(row.row.y + row.row.h <= 420.0);
+            for p in &row.params {
+                assert!(p.row.y + p.row.h <= 420.0);
+            }
+        }
+        assert!(panel.stack.len() < 8);
     }
 
     #[test]

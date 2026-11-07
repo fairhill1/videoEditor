@@ -37,13 +37,19 @@ struct Uniforms {
 }
 
 pub struct Texture {
-    texture: wgpu::Texture,
+    pub(crate) texture: wgpu::Texture,
     bind_group: Arc<wgpu::BindGroup>,
     pub width: u32,
     pub height: u32,
 }
 
 impl Texture {
+    /// A fresh view of the whole texture, for a pass that reads or renders
+    /// into it outside the quad pipeline.
+    pub fn view(&self) -> wgpu::TextureView {
+        self.texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
     pub fn write_region(
         &self,
         queue: &wgpu::Queue,
@@ -242,6 +248,7 @@ impl QuadRenderer {
             1,
             Some(&[255u8, 255, 255, 255]),
             wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureUsages::empty(),
         );
 
         Self {
@@ -275,6 +282,30 @@ impl QuadRenderer {
             height,
             None,
             format,
+            wgpu::TextureUsages::empty(),
+        )
+    }
+
+    /// A texture a render pass can draw into and the quad pipeline can then
+    /// sample, for pictures made on the GPU rather than uploaded. Copyable out
+    /// too, so a test can read back what was drawn.
+    pub fn create_target_texture(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Texture {
+        create_texture_inner(
+            device,
+            None,
+            &self.texture_bgl,
+            &self.sampler,
+            width,
+            height,
+            None,
+            format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         )
     }
 
@@ -408,6 +439,7 @@ fn create_texture_inner(
     height: u32,
     rgba: Option<&[u8]>,
     format: wgpu::TextureFormat,
+    extra_usage: wgpu::TextureUsages,
 ) -> Texture {
     let size = wgpu::Extent3d {
         width,
@@ -421,7 +453,7 @@ fn create_texture_inner(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | extra_usage,
         view_formats: &[],
     });
 

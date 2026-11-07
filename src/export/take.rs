@@ -11,9 +11,11 @@ use ffmpeg::software::scaling;
 use ffmpeg::{codec, format, frame};
 
 use crate::colorspace;
+use crate::effects::BlurPlan;
 use crate::still;
 use crate::title::{self, Title};
 
+use super::blur::{blur_gray, blur_yuv};
 use super::raster::{
     alloc_gray, alloc_yuv, color_to_yuv, crop_gray8, crop_yuv420p, even_down, even_up,
     scale_gray_into, scale_into, Placement,
@@ -53,11 +55,24 @@ pub(super) struct VideoTake {
     pub(super) due: Option<(frame::Video, f64)>,
     /// The picture as last scaled into place, and the request it answers.
     pub(super) staged: frame::Video,
-    pub(super) staged_for: Option<(f64, Placement)>,
+    pub(super) staged_for: Option<(f64, Placement, Option<BlurPlan>)>,
     /// Scratch for the crop path: the source converted to YUV420P at its own
     /// size, and the sub-rectangle of it that is still on canvas.
     pub(super) native: frame::Video,
     pub(super) cropped: frame::Video,
+    /// The blurred path's own scaler for placing, so a source shown both sharp
+    /// and blurred at once — a clip over its own blurred copy — does not have
+    /// the two rebuilding one scaler back and forth every frame.
+    pub(super) blur_scaler: Option<scaling::Context>,
+    /// The due frame blurred at the plan's work size, then scaled back up to
+    /// the source's own, and the frame and plan it answers. Restored to full
+    /// size so it crops on the same samples an unblurred picture would: a crop
+    /// at the work size would land a whole work pixel off, which on a heavy
+    /// blur is a visible shift.
+    pub(super) blur_work: frame::Video,
+    pub(super) restored: frame::Video,
+    pub(super) restore_scaler: Option<scaling::Context>,
+    pub(super) blurred_for: Option<(f64, BlurPlan)>,
 }
 
 impl VideoTake {
@@ -93,6 +108,11 @@ impl VideoTake {
             staged_for: None,
             native: frame::Video::empty(),
             cropped: frame::Video::empty(),
+            blur_scaler: None,
+            blur_work: frame::Video::empty(),
+            restored: frame::Video::empty(),
+            restore_scaler: None,
+            blurred_for: None,
         })
     }
 
@@ -117,78 +137,78 @@ impl VideoTake {
         self.due.as_ref().map(|(_, pts)| *pts)
     }
 
-    /// The due frame scaled into `placement`, ready to compose.
+    /// The due frame scaled into `placement`, ready to compose — blurred
+    /// first when `blur` says so.
     ///
-    /// Cached on the pair of frame and placement, so a source held on screen —
-    /// a still, or a clip running slower than the output rate — is scaled once
-    /// rather than once per output frame.
-    pub(super) fn render(&mut self, placement: Placement) -> Option<&frame::Video> {
+    /// Cached on the frame, placement and blur together, so a source held on
+    /// screen — a still, or a clip running slower than the output rate — is
+    /// scaled once rather than once per output frame.
+    pub(super) fn render(
+        &mut self,
+        placement: Placement,
+        blur: Option<BlurPlan>,
+    ) -> Option<&frame::Video> {
         let pts = self.due_pts()?;
-        if self.staged_for != Some((pts, placement)) {
-            let ok = if placement.src == [0.0, 0.0, 1.0, 1.0] {
-                // The whole picture is on canvas, which is every clip that has
-                // not been pushed past an edge: straight from the decoder's
-                // format into the output rect in one pass, exactly as it went
-                // before there were layers.
-                let (due, _) = self.due.take()?;
-                let ok = scale_into(
-                    &mut self.scaler,
-                    &due,
-                    &mut self.staged,
-                    placement.w,
-                    placement.h,
-                );
-                self.due = Some((due, pts));
-                ok
-            } else {
-                self.render_cropped(placement)
+        if self.staged_for != Some((pts, placement, blur)) {
+            let (due, _) = self.due.take()?;
+            let ok = match blur {
+                None => self.place(&due, placement, false),
+                Some(plan) => {
+                    self.blur_due(&due, pts, plan) && {
+                        let restored =
+                            std::mem::replace(&mut self.restored, frame::Video::empty());
+                        let ok = self.place(&restored, placement, true);
+                        self.restored = restored;
+                        ok
+                    }
+                }
             };
+            self.due = Some((due, pts));
             if !ok {
                 self.staged_for = None;
                 return None;
             }
-            self.staged_for = Some((pts, placement));
+            self.staged_for = Some((pts, placement, blur));
         }
         Some(&self.staged)
     }
 
-    /// The part-of-a-picture path: convert to YUV420P at the source's own size,
-    /// cut out the piece that is still on canvas, and scale only that.
-    ///
-    /// Scaling the whole layer and then copying the visible corner of it would
-    /// be one pass fewer, but a clip scaled up and pushed off an edge would
-    /// have the editor allocating a picture many times the canvas to throw
-    /// nearly all of it away.
-    fn render_cropped(&mut self, placement: Placement) -> bool {
-        let Some((due, pts)) = self.due.take() else {
-            return false;
-        };
-        let ok = self.crop_and_scale(&due, placement);
-        self.due = Some((due, pts));
-        ok
-    }
-
-    fn crop_and_scale(&mut self, due: &frame::Video, placement: Placement) -> bool {
-        let (sw, sh) = (due.width(), due.height());
-        let [u0, v0, u1, v1] = placement.src;
-        let x0 = even_down((u0 * sw as f32).round() as u32);
-        let y0 = even_down((v0 * sh as f32).round() as u32);
-        let x1 = even_up((u1 * sw as f32).round() as u32).min(even_down(sw));
-        let y1 = even_up((v1 * sh as f32).round() as u32).min(even_down(sh));
-        if x1 <= x0 || y1 <= y0 {
-            return false;
+    /// Blur `due` into `restored`, unless it already holds this frame under
+    /// this plan.
+    fn blur_due(&mut self, due: &frame::Video, pts: f64, plan: BlurPlan) -> bool {
+        if self.blurred_for == Some((pts, plan)) {
+            return true;
         }
+        self.blurred_for = None;
+        let (sw, sh) = (due.width(), due.height());
         if !scale_into(&mut self.native_scaler, due, &mut self.native, sw, sh) {
             return false;
         }
-        alloc_yuv(&mut self.cropped, x1 - x0, y1 - y0);
-        crop_yuv420p(&mut self.cropped, &self.native, x0, y0);
-        scale_into(
-            &mut self.scaler,
-            &self.cropped,
+        let mut no_mask = frame::Video::empty();
+        blur_yuv(&self.native, None, plan, &mut self.blur_work, &mut no_mask);
+        if !scale_into(&mut self.restore_scaler, &self.blur_work, &mut self.restored, sw, sh) {
+            return false;
+        }
+        self.blurred_for = Some((pts, plan));
+        true
+    }
+
+    /// `picture` into `placement`: straight from whatever format it is in to
+    /// the output rect in one pass when all of it is on canvas, which is every
+    /// clip that has not been pushed past an edge; through a crop otherwise.
+    fn place(&mut self, picture: &frame::Video, placement: Placement, blurred: bool) -> bool {
+        let scaler = if blurred { &mut self.blur_scaler } else { &mut self.scaler };
+        if placement.src == [0.0, 0.0, 1.0, 1.0] {
+            return scale_into(scaler, picture, &mut self.staged, placement.w, placement.h);
+        }
+        crop_and_scale(
+            picture,
+            placement,
+            &mut self.native_scaler,
+            &mut self.native,
+            &mut self.cropped,
+            scaler,
             &mut self.staged,
-            placement.w,
-            placement.h,
         )
     }
 
@@ -309,6 +329,13 @@ pub(super) struct TitleTake {
     pub(super) cropped: frame::Video,
     pub(super) scaled: frame::Video,
     pub(super) scaler: Option<scaling::Context>,
+    /// The mask blurred at the plan's work size, then back at canvas size, for
+    /// the plan it answers — the same round trip [`VideoTake`] makes, for the
+    /// same reason.
+    pub(super) blur_work: frame::Video,
+    pub(super) restored: frame::Video,
+    pub(super) restore_scaler: Option<scaling::Context>,
+    pub(super) blurred_for: Option<BlurPlan>,
     /// The title's colour, already in the output's own YUV.
     pub(super) color: (u8, u8, u8),
     /// The colour's own alpha, before the clip's opacity and fades multiply in.
@@ -333,6 +360,10 @@ impl TitleTake {
             cropped: frame::Video::empty(),
             scaled: frame::Video::empty(),
             scaler: None,
+            blur_work: frame::Video::empty(),
+            restored: frame::Video::empty(),
+            restore_scaler: None,
+            blurred_for: None,
             color: color_to_yuv(title.color),
             alpha: title.color[3],
             width,
@@ -345,18 +376,39 @@ impl TitleTake {
     }
 
     /// The coverage this placement needs: the part of the mask still on canvas,
-    /// at the size it is being drawn.
+    /// at the size it is being drawn, blurred first when `blur` says so.
     ///
     /// The common case — a title left where it was made — is the mask itself,
     /// untouched: it was rasterized at canvas size, so filling the canvas asks
     /// for no crop and no resample.
-    pub(super) fn stage(&mut self, placement: Placement) -> Option<&frame::Video> {
+    pub(super) fn stage(
+        &mut self,
+        placement: Placement,
+        blur: Option<BlurPlan>,
+    ) -> Option<&frame::Video> {
+        if let Some(plan) = blur {
+            if self.blurred_for != Some(plan) {
+                self.blurred_for = None;
+                blur_gray(&self.mask, plan, &mut self.blur_work);
+                if !scale_gray_into(
+                    &mut self.restore_scaler,
+                    &self.blur_work,
+                    &mut self.restored,
+                    self.width,
+                    self.height,
+                ) {
+                    return None;
+                }
+                self.blurred_for = Some(plan);
+            }
+        }
+        let mask = if blur.is_some() { &self.restored } else { &self.mask };
         let full = placement.src == [0.0, 0.0, 1.0, 1.0];
         if full && placement.w == self.width && placement.h == self.height {
-            return Some(&self.mask);
+            return Some(mask);
         }
         let source = if full {
-            &self.mask
+            mask
         } else {
             let [u0, v0, u1, v1] = placement.src;
             let x0 = (u0 * self.width as f32).round() as u32;
@@ -367,7 +419,7 @@ impl TitleTake {
                 return None;
             }
             alloc_gray(&mut self.cropped, x1 - x0, y1 - y0);
-            crop_gray8(&mut self.cropped, &self.mask, x0, y0);
+            crop_gray8(&mut self.cropped, mask, x0, y0);
             &self.cropped
         };
         // Already exactly the rect it is drawn at, which is what a full-size
@@ -411,7 +463,16 @@ pub(super) struct StillTake {
     staged_mask: frame::Video,
     scaler: Option<scaling::Context>,
     mask_scaler: Option<scaling::Context>,
-    staged_for: Option<Placement>,
+    staged_for: Option<(Placement, Option<BlurPlan>)>,
+    /// The picture and mask blurred, then back at the picture's own size, for
+    /// the plan they answer — see [`VideoTake`]'s fields of the same names.
+    blur_work: frame::Video,
+    blur_work_mask: frame::Video,
+    restored: frame::Video,
+    restored_mask: frame::Video,
+    restore_scaler: Option<scaling::Context>,
+    restore_mask_scaler: Option<scaling::Context>,
+    blurred_for: Option<BlurPlan>,
 }
 
 impl StillTake {
@@ -466,6 +527,13 @@ impl StillTake {
             scaler: None,
             mask_scaler: None,
             staged_for: None,
+            blur_work: frame::Video::empty(),
+            blur_work_mask: frame::Video::empty(),
+            restored: frame::Video::empty(),
+            restored_mask: frame::Video::empty(),
+            restore_scaler: None,
+            restore_mask_scaler: None,
+            blurred_for: None,
         })
     }
 
@@ -474,11 +542,25 @@ impl StillTake {
     }
 
     /// The picture scaled into `placement`, and its coverage there if it has
-    /// any transparency.
-    pub(super) fn render(&mut self, placement: Placement) -> Option<(&frame::Video, Option<&frame::Video>)> {
-        if self.staged_for != Some(placement) {
+    /// any transparency — blurred first, coverage and all, when `blur` says so.
+    pub(super) fn render(
+        &mut self,
+        placement: Placement,
+        blur: Option<BlurPlan>,
+    ) -> Option<(&frame::Video, Option<&frame::Video>)> {
+        if self.staged_for != Some((placement, blur)) {
             self.staged_for = None;
-            let (pw, ph) = (self.picture.width(), self.picture.height());
+            if let Some(plan) = blur {
+                if !self.blur(plan) {
+                    return None;
+                }
+            }
+            let (base, base_mask) = if blur.is_some() {
+                (&self.restored, self.mask.as_ref().map(|_| &self.restored_mask))
+            } else {
+                (&self.picture, self.mask.as_ref())
+            };
+            let (pw, ph) = (base.width(), base.height());
             let full = placement.src == [0.0, 0.0, 1.0, 1.0];
             if !full {
                 // The part still on canvas, on even samples as for footage.
@@ -491,16 +573,16 @@ impl StillTake {
                     return None;
                 }
                 alloc_yuv(&mut self.cropped, x1 - x0, y1 - y0);
-                crop_yuv420p(&mut self.cropped, &self.picture, x0, y0);
-                if let Some(mask) = self.mask.as_ref() {
+                crop_yuv420p(&mut self.cropped, base, x0, y0);
+                if let Some(mask) = base_mask {
                     alloc_gray(&mut self.cropped_mask, x1 - x0, y1 - y0);
                     crop_gray8(&mut self.cropped_mask, mask, x0, y0);
                 }
             }
             let (picture, mask) = if full {
-                (&self.picture, self.mask.as_ref())
+                (base, base_mask)
             } else {
-                (&self.cropped, self.mask.as_ref().map(|_| &self.cropped_mask))
+                (&self.cropped, base_mask.map(|_| &self.cropped_mask))
             };
             if !scale_into(&mut self.scaler, picture, &mut self.staged, placement.w, placement.h) {
                 return None;
@@ -516,8 +598,80 @@ impl StillTake {
                     return None;
                 }
             }
-            self.staged_for = Some(placement);
+            self.staged_for = Some((placement, blur));
         }
         Some((&self.staged, self.mask.as_ref().map(|_| &self.staged_mask)))
     }
+
+    /// Fill `restored` (and `restored_mask`) with the picture under `plan`,
+    /// unless they already hold it.
+    fn blur(&mut self, plan: BlurPlan) -> bool {
+        if self.blurred_for == Some(plan) {
+            return true;
+        }
+        self.blurred_for = None;
+        let (pw, ph) = (self.picture.width(), self.picture.height());
+        blur_yuv(
+            &self.picture,
+            self.mask.as_ref(),
+            plan,
+            &mut self.blur_work,
+            &mut self.blur_work_mask,
+        );
+        if !scale_into(&mut self.restore_scaler, &self.blur_work, &mut self.restored, pw, ph) {
+            return false;
+        }
+        if self.mask.is_some()
+            && !scale_gray_into(
+                &mut self.restore_mask_scaler,
+                &self.blur_work_mask,
+                &mut self.restored_mask,
+                pw,
+                ph,
+            )
+        {
+            return false;
+        }
+        self.blurred_for = Some(plan);
+        true
+    }
+}
+
+/// The part-of-a-picture path: cut out the piece of `picture` that is still on
+/// canvas, on even samples, and scale only that into `staged`.
+///
+/// A picture not already in YUV420P is converted at its own size first, into
+/// `native`, since the cut works on that layout. Scaling the whole layer and
+/// then copying the visible corner of it would be one pass fewer, but a clip
+/// scaled up and pushed off an edge would have the editor allocating a picture
+/// many times the canvas to throw nearly all of it away.
+fn crop_and_scale(
+    picture: &frame::Video,
+    placement: Placement,
+    native_scaler: &mut Option<scaling::Context>,
+    native: &mut frame::Video,
+    cropped: &mut frame::Video,
+    scaler: &mut Option<scaling::Context>,
+    staged: &mut frame::Video,
+) -> bool {
+    let (sw, sh) = (picture.width(), picture.height());
+    let [u0, v0, u1, v1] = placement.src;
+    let x0 = even_down((u0 * sw as f32).round() as u32);
+    let y0 = even_down((v0 * sh as f32).round() as u32);
+    let x1 = even_up((u1 * sw as f32).round() as u32).min(even_down(sw));
+    let y1 = even_up((v1 * sh as f32).round() as u32).min(even_down(sh));
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    let source = if picture.format() == format::Pixel::YUV420P {
+        picture
+    } else {
+        if !scale_into(native_scaler, picture, native, sw, sh) {
+            return false;
+        }
+        &*native
+    };
+    alloc_yuv(cropped, x1 - x0, y1 - y0);
+    crop_yuv420p(cropped, source, x0, y0);
+    scale_into(scaler, cropped, staged, placement.w, placement.h)
 }

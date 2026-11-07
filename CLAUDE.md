@@ -7,7 +7,14 @@
 each adding its own `impl State`: `layout` (geometry, the timeline's visible
 window, and hit testing), `input` (pointer gestures), `edit` (timeline
 mutations and undo), `session` (project files), `canvas` (project format and
-its popup), and `render` / `toolbar` / `timeline_view` (drawing). New behaviour
+its popup), and `render` / `toolbar` / `timeline_view` / `effects_view`
+(drawing).
+
+Effects are modelled in `effects.rs`, which also holds the blur arithmetic
+both renderers follow: `blur.rs` + `blur.wgsl` run it on the GPU for the
+preview, `export/blur.rs` on the CPU for the file. A change to how a blur is
+computed lands in all three, and `blur::tests` checks the shader against the
+CPU path. New behaviour
 joins the module that matches its concern rather than going back into
 `main.rs`.
 

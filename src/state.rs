@@ -24,7 +24,8 @@ use crate::canvas::Setting;
 use crate::edit::EditSnapshot;
 use crate::export::{ExportJob, ExportRequest, Outcome, VideoSpec};
 use crate::input::DragMode;
-use crate::layout::{PoolView, PreviewHit, Splitter, TimelineHit};
+use crate::blur::Blur;
+use crate::layout::{PoolTab, PoolView, PreviewHit, Splitter, TimelineHit};
 use crate::media::MediaPool;
 use crate::project;
 use crate::quad::QuadRenderer;
@@ -77,6 +78,8 @@ pub(crate) struct State {
     pub(crate) surface: wgpu::Surface<'static>,
     pub(crate) surface_format: wgpu::TextureFormat,
     pub(crate) quads: QuadRenderer,
+    /// The preview's blur passes and the per-clip targets they draw into.
+    pub(crate) blur: Blur,
     pub(crate) text: TextRenderer,
     pub(crate) media: MediaPool,
     pub(crate) timeline: Timeline,
@@ -168,6 +171,10 @@ pub(crate) struct State {
     pub(crate) pool_view_btn: Rect,
     /// List or grid. Saved with the project, alongside the panel splits.
     pub(crate) pool_view: PoolView,
+    /// The MEDIA and EFFECTS tabs heading the pool panel, in that order.
+    pub(crate) pool_tab_btns: [Rect; 2],
+    /// Which of the two the panel shows. Saved with the layout.
+    pub(crate) pool_tab: PoolTab,
     /// The title being typed into, and what it said when typing started, so
     /// Escape can put it back.
     ///
@@ -225,6 +232,7 @@ impl State {
         let surface_format = cap.formats[0];
 
         let quads = QuadRenderer::new(&device, &queue, surface_format.add_srgb_suffix());
+        let blur = Blur::new(&device);
         let text = TextRenderer::new(&device, &quads);
 
         let mut timeline = Timeline::new();
@@ -258,6 +266,7 @@ impl State {
             scale,
             surface,
             surface_format,
+            blur,
             quads,
             text,
             media,
@@ -300,6 +309,8 @@ impl State {
             pool_title_btn: Rect::default(),
             pool_view_btn: Rect::default(),
             pool_view: PoolView::default(),
+            pool_tab_btns: [Rect::default(); 2],
+            pool_tab: PoolTab::default(),
             editing_title: None,
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
@@ -377,7 +388,7 @@ impl State {
             DragMode::ClipTrimLeft { .. }
             | DragMode::ClipTrimRight { .. }
             | DragMode::ClipFade { .. } => CursorIcon::ColResize,
-            DragMode::ClipMoveOnCanvas { .. } => CursorIcon::Grabbing,
+            DragMode::ClipMoveOnCanvas { .. } | DragMode::Pan { .. } => CursorIcon::Grabbing,
             DragMode::ClipScaleOnCanvas { corner, .. } => {
                 if corner[0] == corner[1] {
                     CursorIcon::NwseResize
@@ -388,6 +399,8 @@ impl State {
             DragMode::Scrub
             | DragMode::ClipMove { .. }
             | DragMode::PoolDrag { .. }
+            | DragMode::EffectDrag { .. }
+            | DragMode::EffectParam { .. }
             | DragMode::Scrollbar { .. }
             | DragMode::ZoomSlider => CursorIcon::Default,
             DragMode::None => self.hover_cursor(),

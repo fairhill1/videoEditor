@@ -9,7 +9,10 @@
 
 use crate::fmt::{fmt_db, fmt_opacity, format_tick_label, nice_tick_interval, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{fade_handle_rect, lane_y, level_line_y, topmost_lane_top, TimelineLayout};
+use crate::layout::{
+    fade_handle_rect, fx_badge_rect, lane_y, level_line_y, track_header_button, TimelineLayout,
+};
+use crate::ui::{draw_button, draw_tooltip, BtnState, TooltipSide};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::text::TextRenderer;
@@ -137,9 +140,8 @@ impl State {
         // --- Timeline ruler: flush above the topmost video lane, with tick
         //     marks + timecode labels along the bottom edge so the scale is
         //     legible at a glance.
-        let topmost = topmost_lane_top(center_y, lane_h, video_tracks.len());
-        let ruler_bottom = topmost;
-        let ruler_top = ruler_bottom - TIMELINE_RULER_H;
+        let ruler_top = self.ruler_top(&layout);
+        let ruler_bottom = ruler_top + TIMELINE_RULER_H;
         self.quads.push(Quad::colored(
             [0.0, ruler_top],
             [w, TIMELINE_RULER_H],
@@ -199,6 +201,7 @@ impl State {
             let lane_y = lane_y(center_y, lane_h, visual_i, TrackKind::Audio);
             self.draw_track_lane(layout, lane_y, track_idx, visual_i);
         }
+        self.draw_track_header_buttons(&layout, w);
 
         // --- Playhead: drawn last so it's on top of clips ---
         // Starts at the ruler rather than the top of the panel: it marks a
@@ -254,6 +257,22 @@ impl State {
                 },
                 None => (self.cursor[1] - ghost_h * 0.5, DRAG_GHOST_VIDEO_COLOR),
             };
+            // Over an add row the clip is going onto a track that does not
+            // exist yet: the ghost fills the row, which is where it will be.
+            let new_row = self.new_track_drop(source, self.cursor).and_then(|kind| {
+                self.track_add_rows(&layout).into_iter().find(|(k, _)| *k == kind)
+            });
+            let (gy, ghost_h, ghost_color) = match new_row {
+                Some((kind, row)) => (
+                    row.y,
+                    row.h,
+                    match kind {
+                        TrackKind::Video => DRAG_GHOST_VIDEO_COLOR,
+                        TrackKind::Audio => DRAG_GHOST_AUDIO_COLOR,
+                    },
+                ),
+                None => (gy, ghost_h, ghost_color),
+            };
             self.quads.set_clip_x(band[0], band[1]);
             self.quads
                 .push(Quad::colored([gx, gy], [ghost_w, ghost_h], ghost_color));
@@ -282,6 +301,88 @@ impl State {
                 [thumb.w.round(), thumb.h],
                 color,
             ));
+        }
+    }
+
+    /// The add-track rows with their + buttons, and the remove button on
+    /// each empty track. While a pool drag is on, the rows show that they take
+    /// a drop, and the one that would take this drop lights up.
+    fn draw_track_header_buttons(&mut self, layout: &TimelineLayout, w: f32) {
+        let dragging = match self.drag {
+            DragMode::PoolDrag { source } => Some(source),
+            _ => None,
+        };
+        let idle = matches!(self.drag, DragMode::None);
+        let mut tooltip = None;
+        for (kind, row) in self.track_add_rows(layout) {
+            if let Some(source) = dragging {
+                let hit = self.new_track_drop(source, self.cursor) == Some(kind);
+                let color = if hit { TRACK_ADD_ROW_DROP_COLOR } else { TRACK_ADD_ROW_HINT_COLOR };
+                self.quads.push(Quad::colored(
+                    [layout.clips_x, row.y],
+                    [row.w - layout.clips_x, row.h],
+                    color,
+                ));
+                let label = match kind {
+                    TrackKind::Video => "Drop here for a new video track",
+                    TrackKind::Audio => "Drop here for a new audio track",
+                };
+                let ascent = self.text.ascent(TRACK_ADD_ROW_LABEL_SIZE);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [layout.clips_x + 8.0, (row.y + (row.h + ascent) * 0.5).round()],
+                    label,
+                    TRACK_ADD_ROW_LABEL_SIZE,
+                    TRACK_ADD_ROW_LABEL_COLOR,
+                );
+            }
+            let btn = track_header_button(row.y, row.h);
+            let hovered = idle && btn.contains(self.cursor);
+            draw_button(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                btn,
+                ICON_PLUS,
+                TRACK_HEADER_ICON_SIZE,
+                hovered,
+                BtnState::Normal,
+            );
+            if hovered {
+                tooltip = Some(match kind {
+                    TrackKind::Video => (btn, "Add a video track (or drop a clip in this row)", TooltipSide::Below),
+                    TrackKind::Audio => (btn, "Add an audio track (or drop a clip in this row)", TooltipSide::Above),
+                });
+            }
+        }
+        for (_, btn) in self.track_remove_buttons(layout) {
+            let hovered = idle && btn.contains(self.cursor);
+            draw_button(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                btn,
+                ICON_CLOSE,
+                TRACK_HEADER_ICON_SIZE,
+                hovered,
+                BtnState::Normal,
+            );
+            if hovered {
+                tooltip = Some((btn, "Remove this empty track", TooltipSide::Below));
+            }
+        }
+        if let Some((anchor, label, side)) = tooltip {
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                anchor,
+                label,
+                TRANSPORT_TOOLTIP_SIZE,
+                side,
+                w,
+            );
         }
     }
 
@@ -500,16 +601,41 @@ impl State {
                 }
             }
 
+            // The fx badge leads the name, which moves along to make room —
+            // drawn through the same rect the press is tested against.
+            let label_pad = 6.0;
+            let mut name_x = vis_x0 + label_pad;
+            if !clip.effects.is_empty() {
+                if let Some(badge) = fx_badge_rect(vis_x0, x + cw, lane_y) {
+                    let on = clip.effects.iter().any(|e| e.enabled);
+                    let bg = if on { FX_BADGE_BG } else { FX_BADGE_OFF_BG };
+                    self.quads.push(Quad::colored([badge.x, badge.y], [badge.w, badge.h], bg));
+                    let tw = self.text.measure_width("fx", FX_BADGE_LABEL_SIZE);
+                    let (gh, gymin) = self.text.glyph_visual_bounds('x', FX_BADGE_LABEL_SIZE);
+                    self.text.draw(
+                        &self.queue,
+                        &mut self.quads,
+                        [
+                            (badge.x + (badge.w - tw) * 0.5).round(),
+                            (badge.y + (badge.h + gh) * 0.5 + gymin).round(),
+                        ],
+                        "fx",
+                        FX_BADGE_LABEL_SIZE,
+                        FX_BADGE_TEXT,
+                    );
+                    name_x = badge.x + badge.w + FX_BADGE_GAP;
+                }
+            }
+
             if let Some(src) = self.media.get(clip.source) {
-                let label_pad = 6.0;
-                let label_max_w = (vis_w - label_pad * 2.0).max(0.0);
+                let label_max_w = (vis_x1 - label_pad - name_x).max(0.0);
                 let label_baseline = lane_y + self.text.ascent(CLIP_LABEL_SIZE) + 4.0;
                 let name = truncate_to_width(&self.text, &src.name, CLIP_LABEL_SIZE, label_max_w);
                 draw_plated_label(
                     &self.queue,
                     &mut self.text,
                     &mut self.quads,
-                    [vis_x0 + label_pad, label_baseline],
+                    [name_x, label_baseline],
                     &name,
                     CLIP_LABEL_SIZE,
                     CLIP_LABEL_COLOR,

@@ -9,29 +9,34 @@
 use crate::canvas::Canvas;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{zoom_fraction, PoolView};
+use crate::layout::{zoom_fraction, PoolTab, PoolView};
 use crate::quad::Quad;
 use crate::state::State;
 use crate::theme::*;
-use crate::ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
+use crate::ui::{draw_button, draw_slider, draw_tooltip, BtnState, Rect, TooltipSide};
 
 impl State {
-    /// The "MEDIA POOL" and "PREVIEW" headings, and the pool's buttons.
+    /// The pool panel's MEDIA and EFFECTS tabs, the PREVIEW heading, and the
+    /// buttons of whichever pool page is showing.
     pub(crate) fn draw_panel_labels(&mut self, w: f32, media_w: f32) {
         let baseline_y = LABEL_PAD + self.text.ascent(LABEL_SIZE);
+        let tabs_right = self.draw_pool_tabs(baseline_y);
+
         self.text.draw(
             &self.queue,
             &mut self.quads,
-            [LABEL_PAD, baseline_y],
-            "MEDIA POOL",
+            [media_w + LABEL_PAD, baseline_y],
+            "PREVIEW",
             LABEL_SIZE,
             LABEL_COLOR,
         );
+        if self.pool_tab != PoolTab::Media {
+            return;
+        }
 
-        // Media pool toolbar: just right of the MEDIA POOL label.
-        let pool_label_w = self.text.measure_width("MEDIA POOL", LABEL_SIZE);
+        // Media pool toolbar: just right of the tabs.
         self.pool_open_btn = Rect {
-            x: (LABEL_PAD + pool_label_w + LABEL_PAD * 1.5).round(),
+            x: (tabs_right + LABEL_PAD * 1.5).round(),
             y: ((POOL_LIST_TOP - TRANSPORT_BTN_H) * 0.5).round(),
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
@@ -129,15 +134,47 @@ impl State {
                 w,
             );
         }
+    }
 
-        self.text.draw(
-            &self.queue,
-            &mut self.quads,
-            [media_w + LABEL_PAD, baseline_y],
-            "PREVIEW",
-            LABEL_SIZE,
-            LABEL_COLOR,
-        );
+    /// MEDIA and EFFECTS, as the pool panel's heading: the page showing in
+    /// full strength with the accent under it, the other dimmed until the
+    /// cursor is on it. Returns where the last tab ends.
+    fn draw_pool_tabs(&mut self, baseline_y: f32) -> f32 {
+        let mark_y = (baseline_y + self.text.descent(LABEL_SIZE)).round() + 1.0;
+        let mut x = LABEL_PAD;
+        for (i, (label, tab)) in [("MEDIA", PoolTab::Media), ("EFFECTS", PoolTab::Effects)]
+            .into_iter()
+            .enumerate()
+        {
+            let tw = self.text.measure_width(label, LABEL_SIZE);
+            // The hit box takes in the gap around the word, so the tabs are
+            // not a pair of thin targets with dead space between them.
+            let rect = Rect {
+                x: x - POOL_TAB_GAP * 0.5,
+                y: 0.0,
+                w: tw + POOL_TAB_GAP,
+                h: POOL_LIST_TOP - EFFECT_ROW_GAP,
+            };
+            self.pool_tab_btns[i] = rect;
+            let active = self.pool_tab == tab;
+            let color = if active {
+                POOL_TAB_ACTIVE_COLOR
+            } else if rect.contains(self.cursor) && matches!(self.drag, DragMode::None) {
+                POOL_TAB_HOVER_COLOR
+            } else {
+                POOL_TAB_IDLE_COLOR
+            };
+            self.text.draw(&self.queue, &mut self.quads, [x, baseline_y], label, LABEL_SIZE, color);
+            if active {
+                self.quads.push(Quad::colored(
+                    [x, mark_y],
+                    [tw.round(), POOL_TAB_MARK_H],
+                    POOL_TAB_MARK_COLOR,
+                ));
+            }
+            x += tw + POOL_TAB_GAP;
+        }
+        x - POOL_TAB_GAP
     }
 
     /// The timeline's toolbar band: the label and its buttons share one row,
@@ -391,31 +428,13 @@ impl State {
         if slider.w <= 0.0 {
             return;
         }
-        let center_y = slider.y + slider.h * 0.5;
-        let groove_y = (center_y - ZOOM_SLIDER_GROOVE_H * 0.5).round();
-        self.quads.push(Quad::colored(
-            [slider.x, groove_y],
-            [slider.w, ZOOM_SLIDER_GROOVE_H],
-            SCROLLBAR_TRACK_COLOR,
-        ));
-        let travel = slider.w - ZOOM_SLIDER_KNOB_W;
-        let knob_x = (slider.x + travel * zoom as f32).round();
-        self.quads.push(Quad::colored(
-            [slider.x, groove_y],
-            [knob_x - slider.x, ZOOM_SLIDER_GROOVE_H],
-            SCROLLBAR_THUMB_COLOR,
-        ));
         let hovered = slider.contains(self.cursor);
         let knob_color = match self.drag {
             DragMode::ZoomSlider => SCROLLBAR_THUMB_ACTIVE_COLOR,
             DragMode::None if hovered => SCROLLBAR_THUMB_HOVER_COLOR,
             _ => SCROLLBAR_THUMB_COLOR,
         };
-        self.quads.push(Quad::colored(
-            [knob_x, (center_y - ZOOM_SLIDER_KNOB_H * 0.5).round()],
-            [ZOOM_SLIDER_KNOB_W, ZOOM_SLIDER_KNOB_H],
-            knob_color,
-        ));
+        draw_slider(&mut self.quads, slider, zoom as f32, knob_color);
         if hovered && matches!(self.drag, DragMode::None) {
             draw_tooltip(
                 &mut self.quads,

@@ -12,7 +12,7 @@ use crate::input::DragMode;
 use crate::media::MediaPool;
 use crate::project;
 use crate::state::{default_tracks, State};
-use crate::layout::PoolView;
+use crate::layout::{PoolTab, PoolView};
 use crate::theme::{MEDIA_PREVIEW_SPLIT, STATUS_ERR, STATUS_OK, TOP_BOTTOM_SPLIT};
 use crate::timeline::{Clip, SourceId, Timeline, Track};
 
@@ -107,6 +107,9 @@ impl State {
                 split_top_bottom: self.split_top_bottom,
                 split_pool_preview: self.split_pool_preview,
                 pool_view: self.pool_view,
+                pool_tab: self.pool_tab,
+                playhead: self.audio.position(),
+                view: self.view_dur.is_finite().then_some((self.view_start, self.view_dur)),
             }),
         }
     }
@@ -114,18 +117,37 @@ impl State {
     /// Lay the window out as `layout` says, or as a fresh window is when there
     /// is none. A fraction that is not a number — a hand-edited file — is the
     /// one value a split cannot recover from, so it falls back too.
+    ///
+    /// Also puts the playhead and the timeline's view back, so this runs after
+    /// the timeline is in place: the playhead is held inside it.
+    ///
+    /// Neither is something moving marks the project changed. They ride along
+    /// whenever it is saved; a scrub that made closing the window ask about
+    /// unsaved work would make that question mean nothing.
     fn apply_layout(&mut self, layout: Option<project::Layout>) {
+        let finite = |v: f64| v.is_finite().then_some(v);
+        let playhead = layout.and_then(|l| finite(l.playhead)).unwrap_or(0.0);
+        self.audio.set_position(playhead.clamp(0.0, self.timeline.duration().max(0.0)));
+        match layout.and_then(|l| l.view) {
+            Some((start, dur)) if start.is_finite() && dur.is_finite() && dur > 0.0 => {
+                self.view_start = start;
+                self.view_dur = dur;
+            }
+            _ => self.zoom_timeline_to_fit(),
+        }
         let split = |v: f32, default: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { default };
         match layout {
             Some(l) => {
                 self.split_top_bottom = split(l.split_top_bottom, TOP_BOTTOM_SPLIT);
                 self.split_pool_preview = split(l.split_pool_preview, MEDIA_PREVIEW_SPLIT);
                 self.pool_view = l.pool_view;
+                self.pool_tab = l.pool_tab;
             }
             None => {
                 self.split_top_bottom = TOP_BOTTOM_SPLIT;
                 self.split_pool_preview = MEDIA_PREVIEW_SPLIT;
                 self.pool_view = PoolView::default();
+                self.pool_tab = PoolTab::default();
             }
         }
     }
@@ -251,8 +273,8 @@ impl State {
         self.timeline.reseed_counters();
         self.canvas_res = loaded.canvas.resolution;
         self.canvas_fps = loaded.canvas.fps;
-        self.apply_layout(loaded.layout);
         self.reset_session_state();
+        self.apply_layout(loaded.layout);
         self.project_path = Some(path.to_path_buf());
         self.dirty = false;
 
@@ -285,8 +307,8 @@ impl State {
         self.timeline.tracks = default_tracks();
         self.canvas_res = Setting::Auto;
         self.canvas_fps = Setting::Auto;
-        self.apply_layout(None);
         self.reset_session_state();
+        self.apply_layout(None);
         self.project_path = None;
         self.dirty = false;
     }

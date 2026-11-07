@@ -11,6 +11,7 @@
 //! turns one source into the picture due at a time, and [`streams`] runs the
 //! two encode loops over both.
 
+mod blur;
 mod raster;
 mod streams;
 mod take;
@@ -711,7 +712,45 @@ mod tests {
     /// to draw the fixture.
     #[test]
     fn renders_a_still_with_its_transparency() {
-        let dir = std::env::temp_dir().join(format!("ruve-still-export-{}", std::process::id()));
+        let Some(frame) = render_half_red_still("plain", Clip::default()) else {
+            return;
+        };
+        let y = |x: usize, row: usize| frame.data(0)[row * frame.stride(0) + x];
+        let cr = |x: usize, row: usize| frame.data(2)[row * frame.stride(2) + x];
+        // BT.709 limited-range red is Y 63, Cr 240; BT.601 would put Y at 81.
+        assert!(y(8, 24).abs_diff(63) <= 6, "left Y {}", y(8, 24));
+        assert!(cr(4, 12).abs_diff(240) <= 6, "left Cr {}", cr(4, 12));
+        assert!(y(56, 24).abs_diff(16) <= 6, "right Y {}", y(56, 24));
+        assert!(cr(28, 12).abs_diff(128) <= 6, "right Cr {}", cr(28, 12));
+    }
+
+    /// The same half-transparent image blurred: the edge between the red and
+    /// the black behind it goes soft, while the far sides keep their colour —
+    /// the clamped edges and the premultiplied blur both doing their job.
+    #[test]
+    fn renders_a_blurred_still() {
+        let mut clip = Clip::default();
+        let mut blur = crate::effects::EffectKind::GaussianBlur.instance();
+        blur.set_param(0, 0.05);
+        clip.effects.push(blur);
+        let Some(frame) = render_half_red_still("blurred", clip) else {
+            return;
+        };
+        let y = |x: usize| frame.data(0)[24 * frame.stride(0) + x];
+        assert!(y(4).abs_diff(63) <= 6, "far left Y {}", y(4));
+        assert!(y(60).abs_diff(16) <= 6, "far right Y {}", y(60));
+        // Unblurred, 29 is solid red and 34 solid black.
+        assert!(y(29) < 58 && y(34) > 21, "edge stayed hard: {} {}", y(29), y(34));
+        let row: Vec<u8> = (0..64).map(y).collect();
+        assert!(row.windows(2).all(|w| w[1] <= w[0] + 2), "not a ramp: {row:?}");
+    }
+
+    /// Render one second of a 64x48 image whose left half is opaque red and
+    /// right half transparent, as `clip` places it, and hand back the last
+    /// frame. `None` when the ffmpeg CLI that makes the image is missing.
+    fn render_half_red_still(name: &str, clip: Clip) -> Option<frame::Video> {
+        let dir = std::env::temp_dir()
+            .join(format!("ruve-still-export-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("half.png");
         let made = std::process::Command::new("ffmpeg")
@@ -721,12 +760,12 @@ mod tests {
             .arg(&png)
             .status();
         if !made.is_ok_and(|s| s.success()) {
-            return;
+            return None;
         }
         let still = SourceId(0);
         let tracks = vec![(
             TrackKind::Video,
-            vec![Clip { id: 0, source: still, source_out: 1.0, ..Clip::default() }],
+            vec![Clip { id: 0, source: still, source_out: 1.0, ..clip }],
         )];
         let output = dir.join("out.mp4");
         let req = ExportRequest {
@@ -739,7 +778,13 @@ mod tests {
         };
         let shared = Mutex::new(Shared { progress: Progress::default(), outcome: None });
         assert!(run(&req, &shared, &AtomicBool::new(false)).expect("still export failed"));
+        let last = last_frame(&output);
+        std::fs::remove_dir_all(&dir).ok();
+        Some(last)
+    }
 
+    /// The last picture in the rendered file at `output`.
+    fn last_frame(output: &Path) -> frame::Video {
         let mut ictx = format::input(&output).expect("output is not readable");
         let stream = ictx.streams().best(ffmpeg::media::Type::Video).unwrap();
         let index = stream.index();
@@ -758,15 +803,73 @@ mod tests {
                 }
             }
         }
+        last.expect("no frames decoded")
+    }
+
+    /// Mean step between neighbouring luma samples: how much fine detail a
+    /// picture has.
+    fn roughness(f: &frame::Video) -> f64 {
+        let (w, h, stride) = (f.width() as usize, f.height() as usize, f.stride(0));
+        let mut sum = 0u64;
+        for row in 0..h {
+            let line = &f.data(0)[row * stride..row * stride + w];
+            sum += line.windows(2).map(|p| p[0].abs_diff(p[1]) as u64).sum::<u64>();
+        }
+        sum as f64 / ((w - 1) * h) as f64
+    }
+
+    /// Footage through the blur: whole, and as the backdrop of the vertical
+    /// layout it is mostly for — scaled up past the canvas edges, with a sharp
+    /// copy of the same source over it — which runs the crop path and has one
+    /// source answering for a sharp and a blurred layer in the same frame.
+    #[test]
+    fn a_blurred_clip_renders_softer_than_a_sharp_one() {
+        let Ok(list) = std::env::var("RUVE_TEST_MEDIA") else {
+            return;
+        };
+        let Some(path) = list.split(',').find(|s| !s.is_empty()) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ruve-blur-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = SourceId(0);
+        let render = |name: &str, tracks: Vec<Vec<Clip>>| {
+            let output = dir.join(format!("{name}.mp4"));
+            let req = ExportRequest {
+                output: output.clone(),
+                video: Some(VideoSpec { width: 320, height: 180, fps: 25.0 }),
+                tracks: tracks.into_iter().map(|c| (TrackKind::Video, c)).collect(),
+                paths: HashMap::from([(source, path.to_string())]),
+                titles: HashMap::new(),
+                stills: HashMap::new(),
+            };
+            let shared = Mutex::new(Shared { progress: Progress::default(), outcome: None });
+            assert!(run(&req, &shared, &AtomicBool::new(false)).expect("export failed"));
+            last_frame(&output)
+        };
+        let sharp = Clip { id: 1, source, source_in: 1.0, source_out: 1.4, ..Clip::default() };
+        let mut blurred = sharp;
+        let mut blur = crate::effects::EffectKind::GaussianBlur.instance();
+        blur.set_param(0, 0.03);
+        blurred.effects.push(blur);
+        let backdrop = Clip {
+            transform: Transform { x: 0.1, y: 0.0, scale: 1.6 },
+            ..blurred
+        };
+        let inset = Clip { id: 2, transform: Transform { x: 0.0, y: 0.0, scale: 0.5 }, ..sharp };
+
+        let sharp_frame = render("sharp", vec![vec![sharp]]);
+        let blurred_frame = render("blurred", vec![vec![blurred]]);
+        let layered = render("layered", vec![vec![backdrop], vec![inset]]);
         std::fs::remove_dir_all(&dir).ok();
-        let frame = last.expect("no frames decoded");
-        let y = |x: usize, row: usize| frame.data(0)[row * frame.stride(0) + x];
-        let cr = |x: usize, row: usize| frame.data(2)[row * frame.stride(2) + x];
-        // BT.709 limited-range red is Y 63, Cr 240; BT.601 would put Y at 81.
-        assert!(y(8, 24).abs_diff(63) <= 6, "left Y {}", y(8, 24));
-        assert!(cr(4, 12).abs_diff(240) <= 6, "left Cr {}", cr(4, 12));
-        assert!(y(56, 24).abs_diff(16) <= 6, "right Y {}", y(56, 24));
-        assert!(cr(28, 12).abs_diff(128) <= 6, "right Cr {}", cr(28, 12));
+
+        assert_eq!((layered.width(), layered.height()), (320, 180));
+        let (r_sharp, r_blur) = (roughness(&sharp_frame), roughness(&blurred_frame));
+        // Footage with no detail to lose proves nothing either way.
+        if r_sharp < 1.0 {
+            return;
+        }
+        assert!(r_blur < r_sharp * 0.6, "blurred {r_blur} vs sharp {r_sharp}");
     }
 
     #[test]

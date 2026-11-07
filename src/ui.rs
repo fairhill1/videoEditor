@@ -1,7 +1,11 @@
 use crate::quad::{Quad, QuadRenderer};
 use crate::text::TextRenderer;
+use crate::theme::{
+    SCROLLBAR_THUMB_COLOR, SCROLLBAR_TRACK_COLOR, ZOOM_SLIDER_GROOVE_H, ZOOM_SLIDER_KNOB_H,
+    ZOOM_SLIDER_KNOB_W,
+};
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -224,4 +228,33 @@ pub fn draw_tooltip(
         size_px,
         TOOLTIP_LABEL,
     );
+}
+
+/// A horizontal slider: a groove, the part of it below the value filled in,
+/// and a knob at `fraction` (0 to 1) along it. The knob's travel stops short
+/// of each end by half its width, matching [`crate::input::slider_fraction`],
+/// so the knob sits where a press would put it.
+pub fn draw_slider(quads: &mut QuadRenderer, slider: Rect, fraction: f32, knob_color: [f32; 4]) {
+    if slider.w <= 0.0 {
+        return;
+    }
+    let center_y = slider.y + slider.h * 0.5;
+    let groove_y = (center_y - ZOOM_SLIDER_GROOVE_H * 0.5).round();
+    quads.push(Quad::colored(
+        [slider.x, groove_y],
+        [slider.w, ZOOM_SLIDER_GROOVE_H],
+        SCROLLBAR_TRACK_COLOR,
+    ));
+    let travel = slider.w - ZOOM_SLIDER_KNOB_W;
+    let knob_x = (slider.x + travel * fraction.clamp(0.0, 1.0)).round();
+    quads.push(Quad::colored(
+        [slider.x, groove_y],
+        [knob_x - slider.x, ZOOM_SLIDER_GROOVE_H],
+        SCROLLBAR_THUMB_COLOR,
+    ));
+    quads.push(Quad::colored(
+        [knob_x, (center_y - ZOOM_SLIDER_KNOB_H * 0.5).round()],
+        [ZOOM_SLIDER_KNOB_W, ZOOM_SLIDER_KNOB_H],
+        knob_color,
+    ));
 }

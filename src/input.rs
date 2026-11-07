@@ -5,8 +5,10 @@
 //! is over into a model change and hand it to `edit.rs`; the arithmetic of the
 //! change itself lives there.
 
+use crate::effects::EffectKind;
 use crate::layout::{
-    resolve_split, y_to_gain, y_to_opacity, PoolView, PreviewHit, Splitter, TimelineHit,
+    resolve_split, track_header_button, y_to_gain, y_to_opacity, EffectsHit, PoolTab, PoolView,
+    PreviewHit, Splitter, TimelineHit,
 };
 use crate::state::State;
 use crate::theme::*;
@@ -18,6 +20,12 @@ pub(crate) enum DragMode {
     None,
     Scrub,
     PoolDrag { source: SourceId },
+    /// Carrying an effect from the library to a clip on the timeline.
+    EffectDrag { kind: EffectKind },
+    /// Dragging one of an applied effect's sliders. `slider` is the slider's
+    /// rect as the press found it, so the value follows the cursor along the
+    /// same span the knob is drawn in.
+    EffectParam { index: usize, param: usize, slider: Rect },
     ClipMove { track: usize, idx: usize, grab_t_offset: f64 },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
@@ -52,6 +60,10 @@ pub(crate) enum DragMode {
     /// Dragging the timeline zoom slider's knob. Outside the undo system for
     /// the same reason as the scrollbar.
     ZoomSlider,
+    /// Panning the timeline with the middle button held: the time under the
+    /// cursor at the press stays under it. `start` is where the view began
+    /// then, so the pan is measured from the grab rather than accumulated.
+    Pan { grab_x: f32, start: f64 },
     /// Dragging a panel divider. Deliberately outside the undo system: where
     /// the panels sit is saved with the project, but it is a layout rather than
     /// an edit, and burying a real edit one step further back in the history
@@ -218,29 +230,77 @@ impl State {
             };
             return;
         }
-        if self.pool_open_btn.contains([cx, cy]) {
-            self.open_file_picker();
-            return;
+        for (rect, tab) in self.pool_tab_btns.into_iter().zip([PoolTab::Media, PoolTab::Effects]) {
+            if rect.contains([cx, cy]) {
+                if self.pool_tab != tab {
+                    self.pool_tab = tab;
+                    // Saved with the project's layout.
+                    self.dirty = true;
+                }
+                return;
+            }
         }
-        if self.pool_title_btn.contains([cx, cy]) {
-            self.add_title();
-            return;
+        match self.pool_tab {
+            PoolTab::Media => {
+                if self.pool_open_btn.contains([cx, cy]) {
+                    self.open_file_picker();
+                    return;
+                }
+                if self.pool_title_btn.contains([cx, cy]) {
+                    self.add_title();
+                    return;
+                }
+                if self.pool_view_btn.contains([cx, cy]) {
+                    self.pool_view = match self.pool_view {
+                        PoolView::List => PoolView::Grid,
+                        PoolView::Grid => PoolView::List,
+                    };
+                    self.dirty = true;
+                    return;
+                }
+                if let Some(id) = self.pool_close_hit(cx, cy) {
+                    self.remove_source(id);
+                    return;
+                }
+                if let Some(source) = self.pool_hit(cx, cy) {
+                    self.drag = DragMode::PoolDrag { source };
+                    return;
+                }
+            }
+            PoolTab::Effects if cx < self.media_pool_w() && cy < self.timeline_top() => {
+                match self.effects_panel().hit([cx, cy]) {
+                    Some(EffectsHit::Library(kind)) => self.drag = DragMode::EffectDrag { kind },
+                    Some(EffectsHit::Apply(kind)) => self.apply_effect_to_selection(kind),
+                    Some(EffectsHit::Toggle { index }) => self.toggle_effect(index),
+                    Some(EffectsHit::Remove { index }) => self.remove_effect(index),
+                    Some(EffectsHit::Param { index, param, slider }) => {
+                        // One undo step for the whole drag, closed in
+                        // `end_drag`; the value jumps to the press first.
+                        self.begin_edit();
+                        self.drag = DragMode::EffectParam { index, param, slider };
+                        self.update_drag();
+                    }
+                    None => {}
+                }
+                return;
+            }
+            PoolTab::Effects => {}
         }
-        if self.pool_view_btn.contains([cx, cy]) {
-            self.pool_view = match self.pool_view {
-                PoolView::List => PoolView::Grid,
-                PoolView::Grid => PoolView::List,
-            };
-            // Saved with the project's layout.
-            self.dirty = true;
-            return;
+        // Track headers: the + in each add row, and the remove on an empty
+        // lane. They sit left of the clip band, so nothing below competes.
+        let layout = self.timeline_layout();
+        for (kind, row) in self.track_add_rows(&layout) {
+            if track_header_button(row.y, row.h).contains([cx, cy]) {
+                self.add_track(kind);
+                return;
+            }
         }
-        if let Some(id) = self.pool_close_hit(cx, cy) {
-            self.remove_source(id);
-            return;
-        }
-        if let Some(source) = self.pool_hit(cx, cy) {
-            self.drag = DragMode::PoolDrag { source };
+        if let Some((idx, _)) = self
+            .track_remove_buttons(&layout)
+            .into_iter()
+            .find(|(_, r)| r.contains([cx, cy]))
+        {
+            self.remove_track(idx);
             return;
         }
         // The strip along the bottom belongs to the scrollbar whether or not
@@ -276,7 +336,8 @@ impl State {
             | TimelineHit::ClipTrimRight { track, idx }
             | TimelineHit::ClipBody { track, idx, .. }
             | TimelineHit::ClipFade { track, idx, .. }
-            | TimelineHit::ClipLevel { track, idx } = hit
+            | TimelineHit::ClipLevel { track, idx }
+            | TimelineHit::ClipEffects { track, idx } = hit
             {
                 self.toggle_clip_at(track, idx);
                 return;
@@ -309,6 +370,15 @@ impl State {
                 self.begin_edit();
                 self.drag = DragMode::ClipLevel { track, idx };
             }
+            // The badge is the way from a clip to its effects: pick the clip,
+            // and turn the panel to the page that edits them.
+            TimelineHit::ClipEffects { track, idx } => {
+                self.select_clip_at(track, idx);
+                if self.pool_tab != PoolTab::Effects {
+                    self.pool_tab = PoolTab::Effects;
+                    self.dirty = true;
+                }
+            }
             TimelineHit::Lane | TimelineHit::Ruler => {
                 // Shift keeps the selection, so the playhead can be moved to
                 // where a group of clips is about to be cut.
@@ -324,10 +394,28 @@ impl State {
 
     pub(crate) fn update_drag(&mut self) {
         match self.drag {
-            DragMode::None | DragMode::PoolDrag { .. } => {}
+            DragMode::None | DragMode::PoolDrag { .. } | DragMode::EffectDrag { .. } => {}
+            DragMode::EffectParam { index, param, slider } => {
+                let Some((track, idx)) = self.effects_target() else {
+                    return;
+                };
+                let clip = &self.timeline.tracks[track].clips[idx];
+                let Some(spec) = clip.effects.get(index).and_then(|e| e.kind().params().get(param))
+                else {
+                    return;
+                };
+                let value = spec.at(slider_fraction(slider, self.cursor[0]) as f32);
+                self.set_effect_param(index, param, value);
+            }
             DragMode::Scrub => self.apply_scrub(),
+            DragMode::Pan { grab_x, start } => {
+                let px_per_sec = self.timeline_layout().px_per_sec();
+                if px_per_sec > 0.0 {
+                    self.view_start = start - (self.cursor[0] - grab_x) as f64 / px_per_sec;
+                }
+            }
             DragMode::ZoomSlider => {
-                let fraction = zoom_slider_fraction(self.timeline_zoom_slider, self.cursor[0]);
+                let fraction = slider_fraction(self.timeline_zoom_slider, self.cursor[0]);
                 self.zoom_timeline_to_fraction(fraction);
             }
             // Store the clamped position rather than the raw cursor. Past a
@@ -490,11 +578,25 @@ impl State {
     }
 
     pub(crate) fn end_drag(&mut self) {
+        // Dropped on a clip: the effect goes on that clip's picture, and the
+        // clip is selected so the panel the effect came from shows it there.
+        if let DragMode::EffectDrag { kind } = self.drag {
+            if let Some(target) = self.effect_drop_target() {
+                self.apply_effect(kind, &[target]);
+                self.select_clip_at(target.0, target.1);
+            }
+        }
         if let DragMode::PoolDrag { source } = self.drag {
             let cy = self.cursor[1];
             let layout = self.timeline_layout();
-            if let Some(track_idx) = self.track_at_y(cy, &layout) {
-                self.begin_edit();
+            // Opened before a track can be made, so a new track and the clip
+            // that asked for it are one step to undo.
+            self.begin_edit();
+            let target = self.track_at_y(cy, &layout).or_else(|| {
+                self.new_track_drop(source, self.cursor)
+                    .map(|kind| self.timeline.push_track(kind))
+            });
+            if let Some(track_idx) = target {
                 let drop_t = self.pool_drop_start(source);
                 let kind = self.timeline.tracks[track_idx].kind;
                 match kind {
@@ -564,6 +666,37 @@ impl State {
         // gesture (click without move, drop that landed nowhere) discards it.
         self.commit_edit();
         self.drag = DragMode::None;
+    }
+
+    /// The middle button going down: over the timeline, a pan. Anywhere else,
+    /// or with another drag already running, nothing.
+    pub(crate) fn begin_pan(&mut self) {
+        if !matches!(self.drag, DragMode::None) || self.cursor[1] < self.timeline_top() {
+            return;
+        }
+        let (start, _) = self.view_window();
+        self.drag = DragMode::Pan { grab_x: self.cursor[0], start };
+    }
+
+    pub(crate) fn end_pan(&mut self) {
+        if matches!(self.drag, DragMode::Pan { .. }) {
+            self.drag = DragMode::None;
+        }
+    }
+
+    /// The video clip a dragged effect would land on if let go here: the one
+    /// under the cursor, or the picture of the audio clip under it.
+    pub(crate) fn effect_drop_target(&self) -> Option<(usize, usize)> {
+        let (track, idx) = match self.timeline_hit(self.cursor[0], self.cursor[1]) {
+            TimelineHit::ClipBody { track, idx, .. }
+            | TimelineHit::ClipTrimLeft { track, idx }
+            | TimelineHit::ClipTrimRight { track, idx }
+            | TimelineHit::ClipFade { track, idx, .. }
+            | TimelineHit::ClipLevel { track, idx }
+            | TimelineHit::ClipEffects { track, idx } => (track, idx),
+            _ => return None,
+        };
+        self.effects_clip_for(track, idx)
     }
 
     /// One wheel notch, or one flick of a touchpad, over the timeline.
@@ -677,10 +810,10 @@ impl State {
     }
 }
 
-/// How far along the zoom `slider` a cursor at `x` puts the knob's centre, as
-/// 0 to 1. The knob's own half-width is taken off each end, so the extremes
-/// are reached with the knob still wholly inside the slider.
-pub(crate) fn zoom_slider_fraction(slider: Rect, x: f32) -> f64 {
+/// How far along `slider` a cursor at `x` puts the knob's centre, as 0 to 1.
+/// The knob's own half-width is taken off each end, so the extremes are
+/// reached with the knob still wholly inside the slider.
+pub(crate) fn slider_fraction(slider: Rect, x: f32) -> f64 {
     let travel = (slider.w - ZOOM_SLIDER_KNOB_W).max(1.0);
     (((x - slider.x - ZOOM_SLIDER_KNOB_W * 0.5) / travel) as f64).clamp(0.0, 1.0)
 }

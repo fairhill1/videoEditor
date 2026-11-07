@@ -13,6 +13,7 @@
 //! GPU or a decoder.
 
 use crate::canvas::Canvas;
+use crate::effects::BlurPlan;
 use crate::state::State;
 use crate::timeline::{Clip, SourceId, TrackKind};
 
@@ -26,6 +27,9 @@ const MIN_VISIBLE_ALPHA: f32 = 0.002;
 /// much of it to let through.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct Layer {
+    /// The clip this picture is, for a renderer that keeps something per clip
+    /// across frames — the preview's blur targets.
+    pub(crate) clip: u32,
     pub(crate) source: SourceId,
     /// Time inside the source — what to decode, or where the generated picture
     /// is up to.
@@ -35,6 +39,10 @@ pub(crate) struct Layer {
     pub(crate) rect: [f32; 4],
     /// The clip's opacity with its fades applied — see [`Clip::alpha`].
     pub(crate) alpha: f32,
+    /// How much to blur the picture, as a Gaussian's standard deviation in
+    /// canvas pixels; zero for none. See
+    /// [`crate::effects::EffectStack::blur_sigma`].
+    pub(crate) blur: f32,
 }
 
 impl Layer {
@@ -54,6 +62,22 @@ impl Layer {
             return None;
         }
         Some([x0, y0, x1 - x0, y1 - y0])
+    }
+
+    /// How to blur this layer's picture, given that picture's height in its
+    /// own pixels, or `None` when it is not blurred.
+    ///
+    /// The blur is asked for in canvas pixels but run on the source, before it
+    /// is placed — so it is converted through how much placing scales the
+    /// picture. Both renderers call this with the size they are holding, which
+    /// is what makes a blur on a 4K clip shrunk into a corner the same blur in
+    /// the preview as in the file.
+    pub(crate) fn blur_plan(&self, picture_h: u32) -> Option<BlurPlan> {
+        let placed_h = self.rect[3];
+        if self.blur <= 0.0 || placed_h <= 0.0 {
+            return None;
+        }
+        BlurPlan::for_sigma(self.blur * picture_h as f32 / placed_h)
     }
 }
 
@@ -93,10 +117,12 @@ pub(crate) fn layers_at<'a>(
             continue;
         };
         layers.push(Layer {
+            clip: clip.id,
             source: clip.source,
             source_time: clip.source_time(t),
             rect: canvas.place(sw as f32, sh as f32, clip.transform),
             alpha,
+            blur: clip.effects.blur_sigma(canvas.height),
         });
     }
     layers
@@ -144,6 +170,44 @@ mod tests {
 
     fn canvas() -> Canvas {
         Canvas { width: 1920, height: 1080, fps: 25.0 }
+    }
+
+    fn plain_layer() -> Layer {
+        Layer {
+            clip: 0,
+            source: SourceId(0),
+            source_time: 0.0,
+            rect: [0.0, 0.0, 1920.0, 1080.0],
+            alpha: 1.0,
+            blur: 0.0,
+        }
+    }
+
+    /// A blur is set in canvas pixels; a picture shrunk to half the canvas
+    /// height has to be blurred twice as hard in its own pixels to look the
+    /// same once placed.
+    #[test]
+    fn a_blur_converts_into_the_pictures_own_pixels() {
+        let layer = Layer { rect: [0.0, 0.0, 960.0, 540.0], blur: 2.0, ..plain_layer() };
+        assert_eq!(layer.blur_plan(1080), BlurPlan::for_sigma(2.0 * 2.0));
+        assert!(layer.blur_plan(1080).is_some());
+        assert_eq!(Layer { blur: 0.0, ..layer }.blur_plan(1080), None);
+    }
+
+    #[test]
+    fn a_clips_blur_reaches_its_layer_in_canvas_pixels() {
+        let mut c = clip(0, 0.0, 10.0);
+        let mut blur = crate::effects::EffectKind::GaussianBlur.instance();
+        blur.set_param(0, 0.01);
+        c.effects.push(blur);
+        let track = [c];
+        let layers = layers_at(
+            [(TrackKind::Video, &track[..])].into_iter(),
+            1.0,
+            canvas(),
+            |_| Some((1920, 1080)),
+        );
+        assert!((layers[0].blur - 10.8).abs() < 1e-4);
     }
 
     fn clip(source: u32, start: f64, len: f64) -> Clip {
@@ -275,10 +339,8 @@ mod tests {
     #[test]
     fn a_layer_pushed_off_an_edge_keeps_only_what_is_on_screen() {
         let layer = Layer {
-            source: SourceId(0),
-            source_time: 0.0,
             rect: [-100.0, -50.0, 400.0, 200.0],
-            alpha: 1.0,
+            ..plain_layer()
         };
         assert_eq!(layer.visible_rect(1920, 1080), Some([0.0, 0.0, 300.0, 150.0]));
     }
@@ -286,10 +348,8 @@ mod tests {
     #[test]
     fn a_layer_entirely_off_canvas_is_not_visible_at_all() {
         let layer = Layer {
-            source: SourceId(0),
-            source_time: 0.0,
             rect: [-400.0, 0.0, 400.0, 200.0],
-            alpha: 1.0,
+            ..plain_layer()
         };
         assert_eq!(layer.visible_rect(1920, 1080), None);
     }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::effects::EffectStack;
+
 /// Slack when testing "is the playhead already on this boundary". Jumping to a
 /// boundary lands the playhead on it exactly, but the position round-trips
 /// through the audio engine, so an exact compare would let float drift strand
@@ -122,6 +124,10 @@ pub struct Clip {
     pub opacity: f32,
     /// Where the picture lands on the canvas. See [`Transform`].
     pub transform: Transform,
+    /// What is done to the picture before it lands, in order. Defaulted so a
+    /// project saved before clips had effects still opens.
+    #[serde(default)]
+    pub effects: EffectStack,
 }
 
 /// The neutral clip: unity level, no fades. Construction sites spread `..` over
@@ -141,6 +147,7 @@ impl Default for Clip {
             fade_out: 0.0,
             opacity: 1.0,
             transform: Transform::default(),
+            effects: EffectStack::default(),
         }
     }
 }

@@ -17,10 +17,13 @@
 
 mod app;
 mod audio;
+mod blur;
 mod canvas;
 mod colorspace;
 mod compose;
 mod edit;
+mod effects;
+mod effects_view;
 mod export;
 mod filmstrip;
 mod fmt;

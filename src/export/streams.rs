@@ -83,9 +83,13 @@ impl VideoRender {
             let Some(placement) = place_even(layer, self.spec.width, self.spec.height) else {
                 continue;
             };
+            // Each source answers with the height of the picture it holds,
+            // which is what the blur is worked out against — the same number
+            // the preview hands the same call.
             if let Some(title) = self.titles.get_mut(&layer.source) {
                 let (color, color_alpha) = (title.color, title.alpha);
-                if let Some(mask) = title.stage(placement) {
+                let blur = layer.blur_plan(title.size().1);
+                if let Some(mask) = title.stage(placement, blur) {
                     compose_color(
                         &mut canvas,
                         mask,
@@ -98,7 +102,8 @@ impl VideoRender {
                 continue;
             }
             if let Some(still) = self.stills.get_mut(&layer.source) {
-                match still.render(placement) {
+                let blur = layer.blur_plan(still.size().1);
+                match still.render(placement, blur) {
                     Some((picture, Some(mask))) => {
                         compose_masked(
                             &mut canvas,
@@ -122,7 +127,8 @@ impl VideoRender {
             if !take.stage(layer.source_time) {
                 continue;
             }
-            let Some(picture) = take.render(placement) else {
+            let blur = layer.blur_plan(take.size().1);
+            let Some(picture) = take.render(placement, blur) else {
                 continue;
             };
             compose(&mut canvas, picture, placement.x, placement.y, layer.alpha);

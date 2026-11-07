@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::Setting;
-use crate::layout::PoolView;
+use crate::layout::{PoolTab, PoolView};
 use crate::timeline::{Clip, SourceId, TrackKind};
 use crate::title::Title;
 
@@ -58,6 +58,19 @@ pub struct Layout {
     pub split_top_bottom: f32,
     pub split_pool_preview: f32,
     pub pool_view: PoolView,
+    /// Defaulted so a layout saved before the panel had tabs still applies.
+    #[serde(default)]
+    pub pool_tab: PoolTab,
+    /// Where the playhead was, in seconds, so a project reopens on the frame
+    /// it was left at.
+    #[serde(default)]
+    pub playhead: f64,
+    /// The stretch of timeline on screen as `(start, duration)`, or `None`
+    /// for fitted to the whole edit — a fit is saved as a fit rather than as
+    /// whatever span that happened to be, so it still fits after more is
+    /// added.
+    #[serde(default)]
+    pub view: Option<(f64, f64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -205,6 +218,9 @@ mod tests {
                 split_top_bottom: 0.7,
                 split_pool_preview: 0.2,
                 pool_view: PoolView::Grid,
+                pool_tab: PoolTab::Effects,
+                playhead: 12.5,
+                view: Some((10.0, 30.0)),
             }),
         }
     }
