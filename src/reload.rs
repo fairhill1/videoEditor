@@ -8,7 +8,9 @@
 //! playhead, zoom and window stay where they are, and Ctrl+Z puts things back.
 //!
 //! Unsaved work is never replaced without asking. With some, the change waits
-//! and the toolbar's reload button lights up; saving instead keeps yours.
+//! and the toolbar's reload button lights up; saving instead keeps yours. The
+//! exception is a change that only adds to the pool, which replaces nothing:
+//! that is taken straight away, unsaved work or not.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -16,7 +18,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::input::DragMode;
-use crate::project;
+use crate::project::{self, SourceEntry};
 use crate::state::State;
 use crate::theme::{STATUS_ERR, STATUS_INFO, STATUS_OK};
 use crate::timeline::{Clip, SourceId, Track};
@@ -34,6 +36,8 @@ pub(crate) struct DiskState {
     /// What the file said when the session last matched it — loaded from it
     /// or saved to it. A change that leaves it the same is the session's own.
     known: Option<u64>,
+    /// The same, in full, for telling what a change to the file did.
+    known_text: Option<String>,
     /// Ids in the file, by the ids the session gave the same sources. Saving
     /// writes the session's own, so after a save this is empty and every id
     /// is itself.
@@ -74,6 +78,7 @@ impl State {
         self.disk = DiskState {
             stamp: stamp(&path),
             known: text.as_deref().map(digest),
+            known_text: text.clone(),
             ids,
             pending: false,
             checked: Some(Instant::now()),
@@ -107,6 +112,11 @@ impl State {
             return;
         }
         if self.dirty {
+            let added = self.disk.known_text.as_deref().and_then(|old| added_sources(old, &text));
+            if let Some(added) = added {
+                self.take_added_sources(added, &path, text);
+                return;
+            }
             if !self.disk.pending {
                 self.disk.pending = true;
                 self.set_status(
@@ -120,6 +130,50 @@ impl State {
             return;
         }
         self.reload_project();
+    }
+
+    /// Add `added`, sources the file at `path` gained and nothing else, to
+    /// the pool as one undo step, leaving the rest of the session — unsaved
+    /// work included — as it is. `text` is the file now.
+    fn take_added_sources(&mut self, added: Vec<SourceEntry>, path: &Path, text: String) {
+        let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let mut missing = 0;
+        let mut taken = 0;
+        self.begin_edit();
+        for entry in added {
+            let id = if let Some(title) = entry.title {
+                Some(self.media.add_title(title))
+            } else {
+                let resolved = canonical(&project::Project::resolve_path(&entry.path, &dir));
+                let path = resolved.to_string_lossy().into_owned();
+                match self.media.find_path(&path) {
+                    Some(found) => {
+                        self.media.show(found);
+                        Some(found)
+                    }
+                    None => self.media.add(&path, &self.device, &self.queue, &self.quads).ok(),
+                }
+            };
+            match id {
+                Some(id) => {
+                    self.disk.ids.insert(entry.id, id);
+                    taken += 1;
+                }
+                None => {
+                    log::error!("missing media {}", entry.path);
+                    missing += 1;
+                }
+            }
+        }
+        self.commit_edit();
+        self.disk.known = Some(digest(&text));
+        self.disk.known_text = Some(text);
+        let noun = if taken == 1 { "source" } else { "sources" };
+        if missing == 0 {
+            self.set_status(format!("Added {taken} {noun} to the pool from disk"), STATUS_OK);
+        } else {
+            self.set_status(format!("Added {taken} {noun} from disk; {missing} media missing"), STATUS_ERR);
+        }
     }
 
     /// Take the file as it now stands into the session, as one undo step.
@@ -252,6 +306,29 @@ impl State {
     }
 }
 
+/// The sources the project `new` has that `old` does not, when adding them is
+/// all that changed between the two — the timeline, the other sources and the
+/// canvas just as they were. `None` for any other change, which has to be
+/// reloaded whole, and for a compound clip, whose contents point at other
+/// sources by the file's ids and are taken by a reload.
+///
+/// How the window is laid out is not part of the comparison: it is not an
+/// edit, and nothing here would take it either way.
+pub(crate) fn added_sources(old: &str, new: &str) -> Option<Vec<SourceEntry>> {
+    let mut old: project::Project = ron::from_str(old).ok()?;
+    let mut new: project::Project = ron::from_str(new).ok()?;
+    let had: std::collections::HashSet<SourceId> = old.sources.iter().map(|s| s.id).collect();
+    let (kept, added): (Vec<SourceEntry>, Vec<SourceEntry>) =
+        new.sources.into_iter().partition(|s| had.contains(&s.id));
+    if added.is_empty() || added.iter().any(|s| s.compound.is_some()) {
+        return None;
+    }
+    new.sources = kept;
+    old.layout = None;
+    new.layout = None;
+    (ron::to_string(&old).ok()? == ron::to_string(&new).ok()?).then_some(added)
+}
+
 /// Read the project at `path` and say whether it would open cleanly: what is
 /// in it, and anything that would be dropped or substituted. For checking a
 /// file edited outside the editor before the editor sees it.
@@ -346,6 +423,33 @@ mod tests {
 
     fn clip(id: u32, source: u32) -> Clip {
         Clip { id, source: SourceId(source), source_out: 5.0, ..Clip::default() }
+    }
+
+    fn file(id: u32, path: &str) -> SourceEntry {
+        SourceEntry { id: SourceId(id), path: path.into(), title: None, compound: None }
+    }
+
+    fn text(name: &str, sources: Vec<SourceEntry>, clips: Vec<Clip>) -> String {
+        std::fs::read_to_string(write(name, sources, clips)).unwrap()
+    }
+
+    #[test]
+    fn a_change_that_only_adds_sources_is_told_apart_from_any_other() {
+        let old = text("add-old", vec![title(1)], vec![clip(0, 1)]);
+        let new = text("add-new", vec![title(1), file(2, "/v/door.mp3")], vec![clip(0, 1)]);
+        let added = added_sources(&old, &new).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].path, "/v/door.mp3");
+        // Adding a clip of it too touches the timeline: a reload's job.
+        let placed = text("add-placed", vec![title(1), file(2, "/v/door.mp3")], vec![clip(0, 1), clip(1, 2)]);
+        assert!(added_sources(&old, &placed).is_none());
+        // As is changing a source that was there, or taking one away.
+        let mut changed = title(1);
+        changed.title.as_mut().unwrap().text = "Other".into();
+        let edited = text("add-edited", vec![changed, file(2, "/v/door.mp3")], vec![clip(0, 1)]);
+        assert!(added_sources(&old, &edited).is_none());
+        assert!(added_sources(&new, &old).is_none());
+        assert!(added_sources(&old, &old).is_none(), "nothing added is nothing to take");
     }
 
     #[test]

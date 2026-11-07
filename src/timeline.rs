@@ -521,6 +521,30 @@ impl Timeline {
         self.tracks.len() - 1
     }
 
+    /// Move track `idx` one place up the timeline as drawn (`up`), or down,
+    /// past the next track of its kind: for video, up the stack, so it draws
+    /// over the one it passes. Returns where it went, or `None` when it is
+    /// already at that end.
+    ///
+    /// Video lanes are drawn upward from the middle and audio lanes downward,
+    /// so up is a later track of its kind for video and an earlier one for
+    /// audio.
+    pub fn move_track(&mut self, idx: usize, up: bool) -> Option<usize> {
+        let kind = self.tracks.get(idx)?.kind;
+        let later = match kind {
+            TrackKind::Video => up,
+            TrackKind::Audio => !up,
+        };
+        let same = |i: &usize| self.tracks[*i].kind == kind;
+        let to = if later {
+            (idx + 1..self.tracks.len()).find(same)?
+        } else {
+            (0..idx).rev().find(same)?
+        };
+        self.tracks.swap(idx, to);
+        Some(to)
+    }
+
     pub fn remove_source(&mut self, source: SourceId) {
         for track in &mut self.tracks {
             track.clips.retain(|c| c.source != source);
@@ -837,6 +861,27 @@ mod tests {
         let from_compound = all.iter().find(|c| c.source == SourceId(3)).unwrap();
         assert_eq!(from_compound.timeline_start, 11.0);
         assert!(all.iter().any(|c| c.source == SourceId(4)));
+    }
+
+    #[test]
+    fn a_track_moves_past_the_next_of_its_kind_the_way_it_is_drawn() {
+        let mut tl = Timeline::new();
+        for kind in [TrackKind::Video, TrackKind::Audio, TrackKind::Video, TrackKind::Audio] {
+            tl.push_track(kind);
+        }
+        for (i, track) in tl.tracks.iter_mut().enumerate() {
+            track.clips.push(Clip { id: i as u32, ..clip(0.0, 1.0) });
+        }
+        let ids = |tl: &Timeline| -> Vec<u32> { tl.tracks.iter().map(|t| t.clips[0].id).collect() };
+        // Video 0 up the stack: past video 2, the audio in between untouched.
+        assert_eq!(tl.move_track(0, true), Some(2));
+        assert_eq!(ids(&tl), vec![2, 1, 0, 3]);
+        assert_eq!(tl.move_track(2, true), None, "already on top");
+        // Audio is drawn downward: up is the earlier audio track.
+        assert_eq!(tl.move_track(3, true), Some(1));
+        assert_eq!(ids(&tl), vec![2, 3, 0, 1]);
+        assert_eq!(tl.move_track(1, true), None);
+        assert_eq!(tl.move_track(1, false), Some(3));
     }
 
     #[test]

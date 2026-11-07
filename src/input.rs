@@ -473,6 +473,12 @@ impl State {
             self.remove_track(idx);
             return;
         }
+        for (idx, [up, down]) in self.track_move_buttons(&layout) {
+            if up.contains([cx, cy]) || down.contains([cx, cy]) {
+                self.move_track(idx, up.contains([cx, cy]));
+                return;
+            }
+        }
         // The strip along the bottom belongs to the scrollbar whether or not
         // there is a thumb in it: a press there must not fall through to the
         // lane above, which `track_at_y` would otherwise hand it to.

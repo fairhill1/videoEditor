@@ -80,6 +80,20 @@ fn main() {
         return;
     }
 
+    // `videoEditor --export edit.vedit out.mp4`: render a project file
+    // without opening a window.
+    if args.first().map(String::as_str) == Some("--export") {
+        let (Some(project), Some(output)) = (args.get(1), args.get(2)) else {
+            eprintln!("usage: videoEditor --export <project.vedit> <out.mp4>");
+            std::process::exit(2);
+        };
+        if let Err(e) = export::headless::export(std::path::Path::new(project), std::path::Path::new(output)) {
+            eprintln!("export failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 

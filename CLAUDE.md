@@ -60,8 +60,10 @@ ones are in `~/Videos/RUVE_projects/`. The editor watches the open file
 (`reload.rs`) and takes a change in place as one undo step, so edits made to
 the file show up in the running app without reopening it.
 
-- Ask the user to save first. With unsaved work in the app, the change waits
-  and the toolbar's reload button lights up instead.
+- A change that only adds sources to the pool (a new entry under
+  `sources`, nothing else touched) is taken at once, unsaved work or not.
+  Anything else needs the user to save first: with unsaved work in the app,
+  it waits and the toolbar's reload button lights up instead.
 - Sources are matched by id (titles, compounds) and by path (media), so keep
   existing ids. A new source needs an id unused in the file; a new clip needs
   a clip id unused on its timeline.

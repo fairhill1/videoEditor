@@ -1184,6 +1184,15 @@ pub(crate) fn track_header_button(y: f32, h: f32) -> Rect {
     }
 }
 
+/// The move-up and move-down buttons in the header of a lane starting at `y`
+/// and `h` tall: stacked and centred, just left of the remove button.
+pub(crate) fn track_move_rects(y: f32, h: f32) -> [Rect; 2] {
+    let x = TRACK_HEADER_WIDTH - 6.0 - TRACK_HEADER_BTN - TRACK_MOVE_BTN_GAP - TRACK_MOVE_BTN_W;
+    let top = (y + (h - TRACK_MOVE_BTN_H * 2.0 - TRACK_MOVE_BTN_GAP) * 0.5).round();
+    let up = Rect { x, y: top, w: TRACK_MOVE_BTN_W, h: TRACK_MOVE_BTN_H };
+    [up, Rect { y: top + TRACK_MOVE_BTN_H + TRACK_MOVE_BTN_GAP, ..up }]
+}
+
 pub(crate) fn pool_row_close_rect(row_x: f32, row_y: f32, row_w: f32) -> Rect {
     Rect {
         x: row_x + row_w - POOL_CLOSE_INSET - POOL_CLOSE_BOX,
@@ -1411,6 +1420,15 @@ impl State {
             out.push((i, track_header_button(y, layout.lane_h)));
         }
         out
+    }
+
+    /// The move-up and move-down pair in the header of every track that has
+    /// another of its kind to move past.
+    pub(crate) fn track_move_buttons(&self, layout: &TimelineLayout) -> Vec<(usize, [Rect; 2])> {
+        (0..self.timeline.tracks.len())
+            .filter(|&i| self.n_tracks_of(self.timeline.tracks[i].kind) > 1)
+            .map(|i| (i, track_move_rects(self.lane_top(i, layout), layout.lane_h)))
+            .collect()
     }
 
     pub(crate) fn n_video_tracks(&self) -> usize {

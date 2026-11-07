@@ -12,6 +12,7 @@
 //! two encode loops over both.
 
 mod blur;
+pub(crate) mod headless;
 mod raster;
 mod streams;
 mod take;

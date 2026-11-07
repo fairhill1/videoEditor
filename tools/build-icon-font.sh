@@ -48,6 +48,7 @@ ICONS=(
     snowflake                 # timeline: freeze the frame at the playhead
     rotate-ccw                # effects: reset a clip's placement
     arrow-right-from-line     # timeline: ripple trims
+    chevron-up                # timeline: move a track up the stack
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

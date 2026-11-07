@@ -377,6 +377,52 @@ impl State {
                 });
             }
         }
+        let n_video = self.n_tracks_of(TrackKind::Video);
+        let n_audio = self.n_tracks_of(TrackKind::Audio);
+        for (idx, [up, down]) in self.track_move_buttons(layout) {
+            let kind = self.timeline.tracks[idx].kind;
+            let place = self.visual_index(idx);
+            // Video counts up from the middle, audio down from it.
+            let (top, bottom) = match kind {
+                TrackKind::Video => (place + 1 == n_video, place == 0),
+                TrackKind::Audio => (place == 0, place + 1 == n_audio),
+            };
+            for (btn, icon, end, tip) in [
+                (
+                    up,
+                    ICON_CHEVRON_UP,
+                    top,
+                    match kind {
+                        TrackKind::Video => "Move up: draws over the track below",
+                        TrackKind::Audio => "Move this track up",
+                    },
+                ),
+                (
+                    down,
+                    ICON_CHEVRON_DOWN,
+                    bottom,
+                    match kind {
+                        TrackKind::Video => "Move down: goes under the track above",
+                        TrackKind::Audio => "Move this track down",
+                    },
+                ),
+            ] {
+                let hovered = idle && !end && btn.contains(self.cursor);
+                draw_button(
+                    &mut self.quads,
+                    &mut self.text,
+                    &self.queue,
+                    btn,
+                    icon,
+                    TRACK_MOVE_ICON_SIZE,
+                    hovered,
+                    if end { BtnState::Disabled } else { BtnState::Normal },
+                );
+                if hovered {
+                    tooltip = Some((btn, tip, TooltipSide::Below));
+                }
+            }
+        }
         for (_, btn) in self.track_remove_buttons(layout) {
             let hovered = idle && btn.contains(self.cursor);
             draw_button(

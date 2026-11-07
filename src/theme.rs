@@ -51,6 +51,7 @@ pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
 pub(crate) const ICON_FREEZE: char = '\u{E165}'; // snowflake
 pub(crate) const ICON_RESET: char = '\u{E148}'; // rotate-ccw
 pub(crate) const ICON_RIPPLE: char = '\u{E458}'; // arrow-right-from-line
+pub(crate) const ICON_CHEVRON_UP: char = '\u{E070}'; // chevron-up
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -286,7 +287,7 @@ pub(crate) const TRACK_LANE_MAX_H: f32 = 88.0;
 /// Fraction of the tracks-area height the lanes+gaps try to fill.
 pub(crate) const TRACK_LANE_FILL: f32 = 0.9;
 pub(crate) const TRACK_LANE_GAP: f32 = 2.0;
-pub(crate) const TRACK_HEADER_WIDTH: f32 = 48.0;
+pub(crate) const TRACK_HEADER_WIDTH: f32 = 66.0;
 // Height of the toolbar band above the ruler, holding the "TIMELINE" label and
 // its buttons. Sized as the button height plus even breathing room either side
 // rather than hugging it — at the old 30 the 26px buttons cleared the panel
@@ -548,6 +549,12 @@ pub(crate) const TRACK_ADD_ROW_H: f32 = 20.0;
 /// The + and the remove buttons in the track headers.
 pub(crate) const TRACK_HEADER_BTN: f32 = 18.0;
 pub(crate) const TRACK_HEADER_ICON_SIZE: f32 = TYPE_LG;
+/// The move-up and move-down pair in a track header: stacked, left of where
+/// the remove button sits, small enough for two to share the thinnest lane.
+pub(crate) const TRACK_MOVE_BTN_W: f32 = 14.0;
+pub(crate) const TRACK_MOVE_BTN_H: f32 = 13.0;
+pub(crate) const TRACK_MOVE_BTN_GAP: f32 = 2.0;
+pub(crate) const TRACK_MOVE_ICON_SIZE: f32 = TYPE_SM;
 /// The rows while a pool drag is under way, so it is visible that they take a
 /// drop; and the one the cursor is over, which is where the new track goes.
 pub(crate) const TRACK_ADD_ROW_HINT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.03];

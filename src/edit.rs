@@ -1096,6 +1096,14 @@ impl State {
     /// Take out track `idx`, which the header only offers for an empty track
     /// that is not the last of its kind — checked again here, since a track
     /// with clips on it going is a loss nobody asked for.
+    /// Move track `idx` one place up or down the timeline as drawn. A video
+    /// track moved up draws over the one it passed.
+    pub(crate) fn move_track(&mut self, idx: usize, up: bool) {
+        self.begin_edit();
+        self.timeline.move_track(idx, up);
+        self.commit_edit();
+    }
+
     pub(crate) fn remove_track(&mut self, idx: usize) {
         let Some(track) = self.timeline.tracks.get(idx) else {
             return;
