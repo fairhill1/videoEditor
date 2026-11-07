@@ -48,6 +48,7 @@ pub(crate) const ICON_BACK: char = '\u{E048}'; // arrow-left
 pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
 pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
 pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
+pub(crate) const ICON_FREEZE: char = '\u{E165}'; // snowflake
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -486,6 +487,11 @@ pub(crate) const TITLE_TEXT_MAX_LINES: usize = 8;
 /// The text cursor in the text box while a title is being typed into.
 pub(crate) const TITLE_CARET_W: f32 = 1.5;
 pub(crate) const TITLE_CARET_COLOR: [f32; 4] = CLIP_LABEL_COLOR;
+/// Selected text in a box, behind the letters.
+pub(crate) const TEXT_SELECTION_COLOR: [f32; 4] = [0.24, 0.42, 0.78, 0.75];
+/// How far a selection that runs over a line break reaches past the line's
+/// last letter, to show the break is in it.
+pub(crate) const TITLE_SELECTION_EOL_W: f32 = 5.0;
 /// The colour swatches, and the ring around the one in use.
 pub(crate) const TITLE_SWATCH: f32 = 16.0;
 pub(crate) const TITLE_SWATCH_GAP: f32 = 4.0;

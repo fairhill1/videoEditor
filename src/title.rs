@@ -301,10 +301,10 @@ impl TitlePart {
         }
     }
 
-    pub fn toggle(self, title: &mut Title) {
+    pub fn set(self, title: &mut Title, on: bool) {
         match self {
-            Self::Outline => title.outline.enabled = !title.outline.enabled,
-            Self::Shadow => title.shadow.enabled = !title.shadow.enabled,
+            Self::Outline => title.outline.enabled = on,
+            Self::Shadow => title.shadow.enabled = on,
         }
     }
 }

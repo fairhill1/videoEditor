@@ -8,10 +8,12 @@
 use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
 use crate::input::DragMode;
 use crate::state::State;
+use crate::clipboard;
 use crate::fonts;
+use crate::textedit::Cursor;
 use crate::layout::{PoolTab, TitleMenu};
 use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_INFO};
-use crate::title::{self, Title};
+use crate::title::Title;
 use crate::timeline::{
     db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Tracks, Transform,
     MAX_GAIN_DB, MAX_OPACITY, MAX_SCALE, MIN_GAIN_DB, MIN_OPACITY, MIN_SCALE,
@@ -694,7 +696,7 @@ impl State {
         };
         self.finish_title_edit();
         self.close_color_picker();
-        self.title_caret = title.text.len();
+        self.title_cursor = Cursor::at(title.text.len());
         self.editing_title = Some((source, title));
         // One typing session is one undo step, however many keys it took —
         // the same bargain a drag makes. Kept apart from the drag's own edit
@@ -732,11 +734,7 @@ impl State {
         let (source, _) = self.editing_title.as_ref()?;
         let source = *source;
         let text = self.media.title(source)?.text.clone();
-        let mut i = self.title_caret.min(text.len());
-        while !text.is_char_boundary(i) {
-            i -= 1;
-        }
-        self.title_caret = i;
+        self.title_cursor.clamp(&text);
         Some((source, text))
     }
 
@@ -747,7 +745,7 @@ impl State {
         }
     }
 
-    /// Put typed text in at the caret, and the caret after it.
+    /// Put typed text in at the caret, over the selection if there is one.
     ///
     /// Control characters are dropped: the window hands over the key's text
     /// whatever it was, and a tab or an escape has no business in a title even
@@ -756,45 +754,70 @@ impl State {
         let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let typed: String = typed.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+        let typed: String = typed
+            .replace("\r\n", "\n")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
         if typed.is_empty() {
             return;
         }
-        text.insert_str(self.title_caret, &typed);
-        self.title_caret += typed.len();
+        self.title_cursor.insert(&mut text, &typed);
         self.set_typed_text(source, text);
     }
 
-    /// Remove the character before the caret.
+    /// Remove the selection, or the character before the caret.
     pub(crate) fn backspace_title(&mut self) {
         let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let from = title::caret::left(&text, self.title_caret);
-        if from < self.title_caret {
-            text.replace_range(from..self.title_caret, "");
-            self.title_caret = from;
-            self.set_typed_text(source, text);
-        }
+        self.title_cursor.backspace(&mut text);
+        self.set_typed_text(source, text);
     }
 
-    /// Remove the character after the caret.
+    /// Remove the selection, or the character after the caret.
     pub(crate) fn delete_in_title(&mut self) {
         let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let to = title::caret::right(&text, self.title_caret);
-        if to > self.title_caret {
-            text.replace_range(self.title_caret..to, "");
+        self.title_cursor.delete(&mut text);
+        self.set_typed_text(source, text);
+    }
+
+    /// Move the caret with one of [`crate::title::caret`]'s moves, selecting as it
+    /// goes when `extend` (Shift held).
+    pub(crate) fn move_title_caret(&mut self, step: fn(&str, usize) -> usize, extend: bool) {
+        if let Some((_, text)) = self.typing_text() {
+            self.title_cursor.step(&text, step, extend);
+        }
+    }
+
+    pub(crate) fn select_all_in_title(&mut self) {
+        if let Some((_, text)) = self.typing_text() {
+            self.title_cursor = Cursor::all(&text);
+        }
+    }
+
+    /// Copy the selected words to the clipboard; with `cut`, take them out
+    /// too.
+    pub(crate) fn copy_from_title(&mut self, cut: bool) {
+        let Some((source, mut text)) = self.typing_text() else {
+            return;
+        };
+        let picked = self.title_cursor.selected(&text).to_string();
+        if picked.is_empty() {
+            return;
+        }
+        clipboard::copy(&picked);
+        if cut {
+            self.title_cursor.insert(&mut text, "");
             self.set_typed_text(source, text);
         }
     }
 
-    /// Move the caret with one of [`title::caret`]'s moves.
-    pub(crate) fn move_title_caret(&mut self, step: fn(&str, usize) -> usize) {
-        if let Some((_, text)) = self.typing_text() {
-            self.title_caret = step(&text, self.title_caret);
-        }
+    pub(crate) fn paste_into_title(&mut self) {
+        let pasted = clipboard::paste();
+        self.type_into_title(&pasted);
     }
 
     /// Copy the selected clips, and the clips linked to them, for a paste.
@@ -972,21 +995,39 @@ impl State {
         self.commit_edit();
     }
 
-    /// Set one parameter of the shown clip's effect `index`. Called through a
-    /// slider drag, which holds the edit open around it.
-    /// Change the title the effects tab is showing, as part of an edit
-    /// already open — a slider drag, which is one step however far it goes.
-    pub(crate) fn edit_shown_title(&mut self, change: impl FnOnce(&mut Title)) {
-        let Some((source, title)) = self.effects_title() else {
-            return;
+    /// The titles a change of style on the effects tab goes to: the one it
+    /// shows, then every other title among the selected clips — so three
+    /// captions selected together are styled together. Each keeps its own
+    /// words; only what the panel sets changes.
+    pub(crate) fn styled_titles(&self) -> Vec<SourceId> {
+        let Some((shown, _)) = self.effects_title() else {
+            return Vec::new();
         };
-        let mut title = title.clone();
-        change(&mut title);
-        self.media.set_title(source, title);
+        let mut sources = vec![shown];
+        for id in &self.selected {
+            if let Some((t, i)) = self.timeline.find(*id) {
+                let source = self.timeline.tracks[t].clips[i].source;
+                if self.media.title(source).is_some() && !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+        sources
     }
 
-    /// Change the title the effects tab is showing, as one undo step.
-    pub(crate) fn change_shown_title(&mut self, change: impl FnOnce(&mut Title)) {
+    /// Change the titles the effects tab is styling, as part of an edit
+    /// already open — a slider drag, which is one step however far it goes.
+    pub(crate) fn edit_shown_title(&mut self, change: impl Fn(&mut Title)) {
+        for source in self.styled_titles() {
+            if let Some(mut title) = self.media.title(source).cloned() {
+                change(&mut title);
+                self.media.set_title(source, title);
+            }
+        }
+    }
+
+    /// Change the titles the effects tab is styling, as one undo step.
+    pub(crate) fn change_shown_title(&mut self, change: impl Fn(&mut Title)) {
         self.begin_edit();
         self.edit_shown_title(change);
         self.commit_edit();

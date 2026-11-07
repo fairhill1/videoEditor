@@ -7,7 +7,8 @@
 each adding its own `impl State`: `layout` (geometry, the timeline's visible
 window, and hit testing), `input` (pointer gestures), `edit` (timeline
 mutations and undo), `session` (project files), `compound` (compound clips:
-combining, opening and closing them), `picker` (the colour picker: its
+combining, opening and closing them), `freeze` (freeze frames: the frame
+grab, its PNG beside the project, and the gap it fills), `picker` (the colour picker: its
 state, the eyedropper and its gradients; `color.rs` holds the colour maths
 and the recent colours), `canvas` (project format and
 its popup), and `render` / `toolbar` / `timeline_view` / `effects_view`

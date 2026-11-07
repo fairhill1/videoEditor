@@ -33,6 +33,11 @@ pub(crate) enum DragMode {
     /// Dragging one of a title's sliders on the effects tab. One undo step,
     /// opened at the press and closed in `end_drag`, as for an effect's.
     TitleNumber { field: TitleNumber, slider: Rect },
+    /// Selecting in a title's text box by dragging across it. `field` is the
+    /// box as the press found it.
+    TextSelect { field: Rect },
+    /// The same in the colour picker's hex box.
+    HexSelect,
     /// Dragging in the colour picker's square, or along its hue strip.
     PickerSv,
     PickerHue,
@@ -145,7 +150,17 @@ impl State {
                     self.drag = DragMode::PickerHue;
                     self.drag_picker_hue();
                 }
-                Some(PickerHit::Hex) => self.begin_hex_edit(),
+                Some(PickerHit::Hex) => {
+                    // The first press selects the whole code; once typing,
+                    // a press puts the caret down and a drag selects.
+                    if self.typing_hex() {
+                        let at = self.hex_box_hit(layout.as_ref().map_or(Rect::default(), |l| l.hex), [cx, cy]);
+                        self.place_hex_caret(at, self.modifiers.shift_key());
+                        self.drag = DragMode::HexSelect;
+                    } else {
+                        self.begin_hex_edit();
+                    }
+                }
                 Some(PickerHit::Eyedropper) => self.toggle_eyedropper(),
                 Some(PickerHit::Swatch(i)) => self.pick_color(SWATCHES[i]),
                 Some(PickerHit::Recent(i)) => {
@@ -168,7 +183,7 @@ impl State {
                 match kind {
                     TitleMenu::Font => {
                         let family = fonts::choice(i).map(str::to_string);
-                        self.change_shown_title(|t| t.font = family);
+                        self.change_shown_title(|t| t.font = family.clone());
                     }
                     TitleMenu::Weight => {
                         if let Some(&weight) = self.shown_weights().get(i) {
@@ -213,6 +228,10 @@ impl State {
         }
         if self.timeline_split_btn.contains([cx, cy]) {
             self.split_at_playhead();
+            return;
+        }
+        if self.timeline_freeze_btn.contains([cx, cy]) {
+            self.freeze_frame();
             return;
         }
         // Consume the click even with an empty stack — undo() no-ops, and
@@ -383,14 +402,21 @@ impl State {
                         // The caret goes where the click is, worked out on the
                         // box as it was drawn — scrolled to the old caret if
                         // typing was already under way.
-                        let typing = self.typing_title();
-                        let caret = typing.then_some(self.title_caret);
                         let panel = self.effects_panel();
                         let field = panel.title.iter().find(|r| r.control == TitleControl::Text).map(|r| r.field);
                         if let (Some((source, title)), Some(field)) = (self.effects_title(), field) {
+                            let typing = self.editing_title.as_ref().is_some_and(|(s, _)| *s == source);
+                            let caret = typing.then_some(self.title_cursor.caret);
                             let at = self.text_box_hit(field, &title.text, caret, [cx, cy]);
-                            self.begin_title_edit(source);
-                            self.title_caret = at;
+                            if !typing {
+                                self.begin_title_edit(source);
+                            }
+                            // Shift extends what is selected; a plain press
+                            // puts the caret down, and dragging from it
+                            // selects.
+                            let extend = typing && self.modifiers.shift_key();
+                            self.title_cursor.move_to(at, extend);
+                            self.drag = DragMode::TextSelect { field };
                         }
                     }
                     Some(EffectsHit::TitleFont) => self.open_font_menu(),
@@ -405,7 +431,11 @@ impl State {
                         self.change_shown_title(|t| field.set(t, SWATCHES[swatch]));
                     }
                     Some(EffectsHit::TitleToggle(part)) => {
-                        self.change_shown_title(|t| part.toggle(t));
+                        // Every styled title to the opposite of the shown
+                        // one, rather than each flipped from its own.
+                        if let Some(on) = self.effects_title().map(|(_, t)| !part.enabled(t)) {
+                            self.change_shown_title(|t| part.set(t, on));
+                        }
                     }
                     None => {}
                 }
@@ -549,6 +579,19 @@ impl State {
                 };
                 let value = spec.at(slider_fraction(slider, self.cursor[0]) as f32);
                 self.set_effect_param(index, param, value);
+            }
+            DragMode::TextSelect { field } => {
+                let caret = Some(self.title_cursor.caret);
+                if let Some((_, title)) = self.effects_title() {
+                    let at = self.text_box_hit(field, &title.text.clone(), caret, self.cursor);
+                    self.title_cursor.move_to(at, true);
+                }
+            }
+            DragMode::HexSelect => {
+                if let Some(layout) = self.picker_layout() {
+                    let at = self.hex_box_hit(layout.hex, self.cursor);
+                    self.place_hex_caret(at, true);
+                }
             }
             DragMode::PickerSv => self.drag_picker_sv(),
             DragMode::PickerHue => self.drag_picker_hue(),

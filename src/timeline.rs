@@ -599,6 +599,24 @@ impl Timeline {
     }
 }
 
+impl Timeline {
+    /// Make room for `len` seconds at `t`: cut the clips `which` picks where
+    /// they cross `t`, then move every clip starting at or after `t` that much
+    /// later, on every track, so the rest of the edit keeps its timing against
+    /// itself. A clip that `which` leaves alone and that crosses `t` stays as
+    /// it is — a music bed carries on under whatever fills the gap.
+    pub fn open_gap(&mut self, t: f64, len: f64, which: impl Fn(&Clip) -> bool) {
+        self.split_at(t, which);
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                if clip.timeline_start >= t - EDIT_POINT_EPS {
+                    clip.timeline_start += len;
+                }
+            }
+        }
+    }
+}
+
 impl TimelineSnapshot {
     pub fn tracks(&self) -> &[(TrackKind, Vec<Clip>)] {
         &self.tracks
@@ -733,6 +751,40 @@ mod tests {
         let from_compound = all.iter().find(|c| c.source == SourceId(3)).unwrap();
         assert_eq!(from_compound.timeline_start, 11.0);
         assert!(all.iter().any(|c| c.source == SourceId(4)));
+    }
+
+    #[test]
+    fn a_gap_cuts_the_picked_clips_and_moves_everything_after_it() {
+        let mut tl = Timeline::new();
+        tl.push_track(TrackKind::Video);
+        tl.push_track(TrackKind::Audio);
+        tl.push_track(TrackKind::Audio);
+        let link = tl.new_link_id();
+        let shot = Clip { id: tl.new_clip_id(), link: Some(link), ..clip(0.0, 10.0) };
+        let later = Clip { id: tl.new_clip_id(), ..clip(10.0, 5.0) };
+        let sound = Clip { id: tl.new_clip_id(), link: Some(link), ..clip(0.0, 10.0) };
+        let music = Clip { id: tl.new_clip_id(), ..clip(0.0, 20.0) };
+        tl.tracks[0].clips = vec![shot, later];
+        tl.tracks[1].clips = vec![sound];
+        tl.tracks[2].clips = vec![music];
+
+        tl.open_gap(4.0, 2.0, |c| c.link == Some(link));
+
+        let spans = |ti: usize| -> Vec<(f64, f64, f64)> {
+            tl.tracks[ti]
+                .clips
+                .iter()
+                .map(|c| (c.timeline_start, c.timeline_end(), c.source_in))
+                .collect()
+        };
+        assert_eq!(spans(0), vec![(0.0, 4.0, 0.0), (6.0, 12.0, 4.0), (12.0, 17.0, 0.0)]);
+        assert_eq!(spans(1), vec![(0.0, 4.0, 0.0), (6.0, 12.0, 4.0)]);
+        // Not picked, and across the cut: left playing under the gap.
+        assert_eq!(spans(2), vec![(0.0, 20.0, 0.0)]);
+        // The halves after the cut are still a linked pair, of their own.
+        let right = tl.tracks[0].clips[1].link;
+        assert!(right.is_some() && right != Some(link));
+        assert_eq!(tl.tracks[1].clips[1].link, right);
     }
 
     fn board_of(tl: &Timeline, ids: &[u32]) -> Clipboard {

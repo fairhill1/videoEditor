@@ -119,6 +119,7 @@ pub(crate) struct State {
     /// right, so the outer buttons are the coarser jumps.
     pub(crate) transport: [Rect; 5],
     pub(crate) timeline_split_btn: Rect,
+    pub(crate) timeline_freeze_btn: Rect,
     pub(crate) timeline_undo_btn: Rect,
     pub(crate) timeline_redo_btn: Rect,
     pub(crate) timeline_snap_btn: Rect,
@@ -211,9 +212,9 @@ pub(crate) struct State {
     /// lets a cancelled edit leave no step behind at all: the text goes back
     /// and the open edit closes having changed nothing.
     pub(crate) editing_title: Option<(SourceId, Title)>,
-    /// Where in the title being typed into the next letter goes: a byte
-    /// offset into its text, on a character boundary.
-    pub(crate) title_caret: usize,
+    /// Where in the title being typed into the next letter goes, and what is
+    /// selected: byte offsets into its text, on character boundaries.
+    pub(crate) title_cursor: crate::textedit::Cursor,
     /// Everything as it stood when typing began: the undo step the typing
     /// becomes when it finishes, if it changed anything.
     pub(crate) typing_before: Option<crate::edit::EditSnapshot>,
@@ -327,6 +328,7 @@ impl State {
             last_playing_source: None,
             transport: [Rect::default(); 5],
             timeline_split_btn: Rect::default(),
+            timeline_freeze_btn: Rect::default(),
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
             timeline_snap_btn: Rect::default(),
@@ -368,7 +370,7 @@ impl State {
             picker_tex: None,
             surface_copy_src: cap.usages.contains(wgpu::TextureUsages::COPY_SRC),
             editing_title: None,
-            title_caret: 0,
+            title_cursor: Default::default(),
             typing_before: None,
             last_clip_click: None,
             modifiers: ModifiersState::empty(),
@@ -470,6 +472,7 @@ impl State {
             | DragMode::PickerHue
             | DragMode::Scrollbar { .. }
             | DragMode::ZoomSlider => CursorIcon::Default,
+            DragMode::TextSelect { .. } | DragMode::HexSelect => CursorIcon::Text,
             DragMode::None => self.hover_cursor(),
         }
     }

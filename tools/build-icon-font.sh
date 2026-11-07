@@ -45,6 +45,7 @@ ICONS=(
     square-dashed             # timeline: select every clip
     pipette                   # effects: pick a colour off the screen
     refresh-cw                # timeline: reload the project from disk
+    snowflake                 # timeline: freeze the frame at the playhead
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

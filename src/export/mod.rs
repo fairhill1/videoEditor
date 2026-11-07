@@ -265,6 +265,8 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
             stream_idx,
             stream_tb: enc_tb,
             takes: open_audio_takes(req)?,
+            voices: Default::default(),
+            paths: req.paths.clone(),
             block,
             mixed: vec![0.0; block * CHANNELS],
             scratch: vec![0.0; block * CHANNELS],

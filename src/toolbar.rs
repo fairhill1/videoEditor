@@ -226,40 +226,46 @@ impl State {
         };
         let btn_x = first_x + stride;
         self.timeline_split_btn = Rect { x: btn_x, ..self.timeline_select_all_btn };
-        // Delete sits next to Split — both act on clips — with undo/redo after
-        // them. Those live here rather than in a window-level toolbar because
-        // history covers timeline + pool edits, which is what this strip
-        // governs.
-        self.timeline_delete_btn = Rect {
+        // Freeze beside Split: both cut the clip under the playhead, and
+        // this one holds its picture there before playing on.
+        self.timeline_freeze_btn = Rect {
             x: btn_x + stride,
             ..self.timeline_split_btn
         };
-        self.timeline_copy_btn = Rect {
+        // Delete follows — it acts on clips too — with undo/redo after them.
+        // Those live here rather than in a window-level toolbar because
+        // history covers timeline + pool edits, which is what this strip
+        // governs.
+        self.timeline_delete_btn = Rect {
             x: btn_x + stride * 2.0,
             ..self.timeline_split_btn
         };
-        self.timeline_paste_btn = Rect {
+        self.timeline_copy_btn = Rect {
             x: btn_x + stride * 3.0,
             ..self.timeline_split_btn
         };
-        self.timeline_combine_btn = Rect {
+        self.timeline_paste_btn = Rect {
             x: btn_x + stride * 4.0,
             ..self.timeline_split_btn
         };
-        self.timeline_open_compound_btn = Rect {
+        self.timeline_combine_btn = Rect {
             x: btn_x + stride * 5.0,
             ..self.timeline_split_btn
         };
-        self.timeline_undo_btn = Rect {
+        self.timeline_open_compound_btn = Rect {
             x: btn_x + stride * 6.0,
             ..self.timeline_split_btn
         };
-        self.timeline_redo_btn = Rect {
+        self.timeline_undo_btn = Rect {
             x: btn_x + stride * 7.0,
             ..self.timeline_split_btn
         };
-        self.timeline_snap_btn = Rect {
+        self.timeline_redo_btn = Rect {
             x: btn_x + stride * 8.0,
+            ..self.timeline_split_btn
+        };
+        self.timeline_snap_btn = Rect {
+            x: btn_x + stride * 9.0,
             ..self.timeline_split_btn
         };
         // Pinned to the right edge rather than trailing the cluster: Export
@@ -388,6 +394,12 @@ impl State {
                 ICON_SPLIT,
                 "Split selected clips at playhead (S)",
                 avail(self.has_selection()),
+            ),
+            (
+                self.timeline_freeze_btn,
+                ICON_FREEZE,
+                "Freeze the frame at the playhead for 2 seconds (F)",
+                avail(self.freeze_target().is_some()),
             ),
             (
                 self.timeline_delete_btn,

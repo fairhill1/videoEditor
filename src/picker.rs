@@ -5,6 +5,8 @@
 //! The colour changes live as the picker is used, and the whole visit is one
 //! undo step, closed when the picker is.
 
+use crate::clipboard;
+use crate::textedit::Cursor;
 use crate::color::{self, from_hex, hsv_to_rgb, rgb_to_hsv, to_hex};
 use crate::edit::EditSnapshot;
 use crate::quad::Texture;
@@ -25,6 +27,8 @@ pub(crate) struct ColorPicker {
     pub(crate) hsv: [f32; 3],
     /// The hex code being typed, while the hex box has the keyboard.
     pub(crate) hex: Option<String>,
+    /// The caret and selection in it.
+    pub(crate) hex_cursor: Cursor,
     /// Armed: the next press anywhere takes its colour from the screen.
     pub(crate) eyedropper: bool,
     /// Everything as it stood at opening: the undo step the visit becomes.
@@ -66,6 +70,7 @@ impl State {
             source,
             hsv: rgb_to_hsv([rgb[0], rgb[1], rgb[2]]),
             hex: None,
+            hex_cursor: Cursor::default(),
             eyedropper: false,
             before: self.edit_snapshot(),
         });
@@ -98,13 +103,12 @@ impl State {
         let Some(picker) = self.color_picker.as_ref() else {
             return;
         };
-        let (field, source) = (picker.field, picker.source);
-        let Some(mut title) = self.media.title(source).cloned() else {
-            return;
-        };
-        let alpha = field.get(&title)[3];
-        field.set(&mut title, [rgb[0], rgb[1], rgb[2], alpha]);
-        self.media.set_title(source, title);
+        let field = picker.field;
+        // Every title being styled, each keeping its own alpha.
+        self.edit_shown_title(|t| {
+            let alpha = field.get(t)[3];
+            field.set(t, [rgb[0], rgb[1], rgb[2], alpha]);
+        });
     }
 
     /// Take a whole colour from somewhere other than the square: a swatch,
@@ -152,14 +156,17 @@ impl State {
         self.apply_picker_rgb(rgb);
     }
 
-    /// Start typing a hex code, beginning from the colour as it is.
+    /// Start typing a hex code, beginning from the colour as it is, all of
+    /// it selected — so typing replaces it, and Ctrl+C copies it.
     pub(crate) fn begin_hex_edit(&mut self) {
         let current = self.picker_color();
         if let (Some(picker), Some(c)) = (self.color_picker.as_mut(), current) {
             if picker.hex.is_some() {
                 return;
             }
-            picker.hex = Some(to_hex(c));
+            let hex = to_hex(c);
+            picker.hex_cursor = Cursor::all(&hex);
+            picker.hex = Some(hex);
             picker.eyedropper = false;
         }
     }
@@ -168,25 +175,80 @@ impl State {
         self.color_picker.as_ref().is_some_and(|p| p.hex.is_some())
     }
 
-    /// Type into the hex box. Whatever is not a hex digit is left out, and a
-    /// complete code takes effect at once.
-    pub(crate) fn type_hex(&mut self, text: &str) {
-        let Some(hex) = self.color_picker.as_mut().and_then(|p| p.hex.as_mut()) else {
+    /// The hex code being typed and its caret, to change; a complete code
+    /// takes effect straight after.
+    fn edit_hex(&mut self, change: impl FnOnce(&mut String, &mut Cursor)) {
+        let Some(picker) = self.color_picker.as_mut() else {
             return;
         };
-        for c in text.chars().filter(char::is_ascii_hexdigit) {
-            if hex.len() < HEX_DIGITS {
-                hex.push(c.to_ascii_uppercase());
-            }
-        }
+        let Some(hex) = picker.hex.as_mut() else {
+            return;
+        };
+        change(hex, &mut picker.hex_cursor);
+        hex.truncate(HEX_DIGITS);
+        picker.hex_cursor.clamp(hex);
         self.apply_typed_hex();
     }
 
-    pub(crate) fn backspace_hex(&mut self) {
-        if let Some(hex) = self.color_picker.as_mut().and_then(|p| p.hex.as_mut()) {
-            hex.pop();
+    /// Type into the hex box, over the selection. Whatever is not a hex
+    /// digit is left out — a pasted `#` with the rest — and so is anything
+    /// past six digits.
+    pub(crate) fn type_hex(&mut self, text: &str) {
+        let digits: String = text
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        if digits.is_empty() {
+            return;
         }
-        self.apply_typed_hex();
+        self.edit_hex(|hex, cursor| {
+            let (a, b) = cursor.range().unwrap_or((cursor.caret, cursor.caret));
+            let room = HEX_DIGITS.saturating_sub(hex.len() - (b - a));
+            let take = &digits[..digits.len().min(room)];
+            cursor.insert(hex, take);
+        });
+    }
+
+    pub(crate) fn backspace_hex(&mut self) {
+        self.edit_hex(|hex, cursor| cursor.backspace(hex));
+    }
+
+    pub(crate) fn delete_hex(&mut self) {
+        self.edit_hex(|hex, cursor| cursor.delete(hex));
+    }
+
+    pub(crate) fn move_hex_caret(&mut self, step: fn(&str, usize) -> usize, extend: bool) {
+        self.edit_hex(|hex, cursor| cursor.step(hex, step, extend));
+    }
+
+    /// Put the hex box's caret at `i`, selecting from where it was when
+    /// `extend`.
+    pub(crate) fn place_hex_caret(&mut self, i: usize, extend: bool) {
+        self.edit_hex(|_, cursor| cursor.move_to(i, extend));
+    }
+
+    pub(crate) fn select_all_hex(&mut self) {
+        self.edit_hex(|hex, cursor| *cursor = Cursor::all(hex));
+    }
+
+    /// Copy the selected digits; with `cut`, take them out too.
+    pub(crate) fn copy_hex(&mut self, cut: bool) {
+        self.edit_hex(|hex, cursor| {
+            let picked = cursor.selected(hex).to_string();
+            if picked.is_empty() {
+                return;
+            }
+            clipboard::copy(&picked);
+            if cut {
+                cursor.insert(hex, "");
+            }
+        });
+    }
+
+    pub(crate) fn paste_hex(&mut self) {
+        let pasted = clipboard::paste();
+        self.type_hex(&pasted);
     }
 
     /// Stop typing in the hex box. A short code like `F80` counts now; one

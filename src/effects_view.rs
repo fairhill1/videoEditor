@@ -11,6 +11,7 @@ use crate::effects::EffectKind;
 use crate::layout::{color_chip_rect, TitleMenu, swatch_rects, EffectsPanel, PoolCell, TitleControl, TitleRow};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
+use crate::textedit::Cursor;
 use crate::theme::*;
 use crate::title::{self, Title, TitleColor, TitleNumber, TitlePart, SWATCHES};
 use crate::ui::{
@@ -114,7 +115,15 @@ impl State {
         let clip = self.timeline.tracks[track].clips[idx];
         if let Some(src) = self.media.get(clip.source) {
             let x = LABEL_PAD + heading_w + 8.0;
-            let name = truncate_to_width(&self.text, &src.name, EFFECTS_SECTION_SIZE, pool_right - x);
+            // Several titles selected are styled together; the heading says
+            // so, since the panel shows only the first of them.
+            let others = self.styled_titles().len().saturating_sub(1);
+            let label = match others {
+                0 => src.name.clone(),
+                1 => format!("{} + 1 more title", src.name),
+                n => format!("{} + {n} more titles", src.name),
+            };
+            let name = truncate_to_width(&self.text, &label, EFFECTS_SECTION_SIZE, pool_right - x);
             let baseline = self.section_baseline(panel.clip_heading_y);
             self.text.draw(
                 &self.queue,
@@ -325,8 +334,8 @@ impl State {
             match control {
                 TitleControl::Text => {
                     let field_hovered = idle && field.contains(self.cursor);
-                    let caret = typing.then_some(self.title_caret);
-                    self.draw_text_box(field, &title.text, field_hovered, caret);
+                    let cursor = typing.then_some(self.title_cursor);
+                    self.draw_text_box(field, &title.text, field_hovered, cursor);
                     if field_hovered && !typing {
                         *tooltip = Some((field, "Click to type"));
                     }
@@ -509,8 +518,10 @@ impl State {
 
     /// The title's words, every line of them, in a box that grows to hold
     /// them, with the caret where it is while being typed into.
-    fn draw_text_box(&mut self, r: Rect, text: &str, hovered: bool, caret: Option<usize>) {
-        self.draw_field(r, "", hovered, caret.is_some(), None);
+    fn draw_text_box(&mut self, r: Rect, text: &str, hovered: bool, cursor: Option<Cursor>) {
+        self.draw_field(r, "", hovered, cursor.is_some(), None);
+        let caret = cursor.map(|c| c.caret);
+        let selection = cursor.and_then(|c| c.range());
         let view = self.text_box_view(r, text, caret);
         let max_w = (r.w - TITLE_FIELD_PAD * 2.0).max(0.0);
         let ascent = self.text.ascent(TITLE_FIELD_SIZE);
@@ -519,6 +530,25 @@ impl State {
         for (n, row) in view.rows.iter().enumerate() {
             let baseline = (first_baseline + n as f32 * TITLE_TEXT_LINE_H).round();
             let x0 = r.x + TITLE_FIELD_PAD;
+            // The selection behind the letters: the part of it on this line,
+            // and a sliver past the end where it runs on over the line break.
+            if let Some((a, b)) = selection {
+                let lo = a.max(row.from);
+                let hi = b.min(row.end);
+                if lo <= hi && (lo < hi || b > row.end) && a <= row.end && b >= row.from {
+                    let x_at = |i: usize| x0 + self.text.measure_width(&text[row.from..i], TITLE_FIELD_SIZE);
+                    let x1 = (x_at(lo)).min(r.x + r.w - TITLE_FIELD_PAD);
+                    let mut x2 = (x_at(hi)).min(r.x + r.w - TITLE_FIELD_PAD);
+                    if b > row.end {
+                        x2 = (x2 + TITLE_SELECTION_EOL_W).min(r.x + r.w - 1.0);
+                    }
+                    self.quads.push(Quad::colored(
+                        [x1.round(), (baseline - ascent).round() - 1.0],
+                        [(x2 - x1).round().max(1.0), (ascent * 1.25).round() + 2.0],
+                        TEXT_SELECTION_COLOR,
+                    ));
+                }
+            }
             let shown = truncate_to_width(&self.text, &text[row.from..row.end], TITLE_FIELD_SIZE, max_w);
             self.text.draw(&self.queue, &mut self.quads, [x0, baseline], &shown, TITLE_FIELD_SIZE, CLIP_LABEL_COLOR);
             if let Some(i) = caret.filter(|&i| i >= row.start && i <= row.end) {
@@ -530,6 +560,19 @@ impl State {
                 ));
             }
         }
+    }
+
+    /// The place among the hex box's digits nearest to `p`.
+    pub(crate) fn hex_box_hit(&self, r: Rect, p: [f32; 2]) -> usize {
+        let digits = self.color_picker.as_ref().and_then(|c| c.hex.clone()).unwrap_or_default();
+        let shown = format!("#{digits}");
+        let x = p[0] - (r.x + TITLE_FIELD_PAD);
+        (0..=digits.len())
+            .min_by(|&a, &b| {
+                let d = |i: usize| (self.text.measure_width(&shown[..1 + i], TITLE_FIELD_SIZE) - x).abs();
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap_or(0)
     }
 
     /// A box with words in it: the title's text, or its font with a chevron
@@ -665,6 +708,7 @@ impl State {
         };
         let [hue, s, v] = picker.hsv;
         let hex = picker.hex.clone();
+        let hex_cursor = Some(picker.hex_cursor);
         let armed = picker.eyedropper;
         let idle = matches!(self.drag, DragMode::None) && !armed;
         let cursor = self.cursor;
@@ -719,13 +763,34 @@ impl State {
         // The colour as it is, its hex code, and the eyedropper.
         self.draw_color_chip(layout.current, current, false, false);
         let typing = hex.is_some();
-        let shown = format!("#{}", hex.unwrap_or_else(|| crate::color::to_hex(current)));
+        let digits = hex.unwrap_or_else(|| crate::color::to_hex(current));
+        let shown = format!("#{digits}");
         let hex_hovered = idle && layout.hex.contains(cursor);
-        self.draw_field(layout.hex, &shown, hex_hovered, typing, None);
-        if typing {
-            let tw = self.text.measure_width(&shown, TITLE_FIELD_SIZE);
-            let caret_x = (layout.hex.x + TITLE_FIELD_PAD + tw + 1.0).round();
-            let pad = (layout.hex.h - TITLE_TEXT_LINE_H) * 0.5;
+        let pad = (layout.hex.h - TITLE_TEXT_LINE_H) * 0.5;
+        // Where position `i` among the digits sits, after the `#`.
+        let x_at = |s: &Self, i: usize| {
+            layout.hex.x + TITLE_FIELD_PAD + s.text.measure_width(&shown[..1 + i], TITLE_FIELD_SIZE)
+        };
+        self.draw_field(layout.hex, "", hex_hovered, typing, None);
+        if let Some((a, b)) = hex_cursor.filter(|_| typing).and_then(|c| c.range()) {
+            let (x1, x2) = (x_at(self, a), x_at(self, b));
+            self.quads.push(Quad::colored(
+                [x1.round(), layout.hex.y + pad],
+                [(x2 - x1).round().max(1.0), TITLE_TEXT_LINE_H],
+                TEXT_SELECTION_COLOR,
+            ));
+        }
+        let baseline = self.centred_baseline(layout.hex, TITLE_FIELD_SIZE);
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [layout.hex.x + TITLE_FIELD_PAD, baseline],
+            &shown,
+            TITLE_FIELD_SIZE,
+            CLIP_LABEL_COLOR,
+        );
+        if let Some(c) = hex_cursor.filter(|_| typing) {
+            let caret_x = x_at(self, c.caret.min(digits.len())).round();
             self.quads.push(Quad::colored(
                 [caret_x, layout.hex.y + pad],
                 [TITLE_CARET_W, TITLE_TEXT_LINE_H],

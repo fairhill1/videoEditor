@@ -150,16 +150,24 @@ impl ApplicationHandler for App {
                 };
                 let ctrl = state.modifiers.control_key();
                 let shift = state.modifiers.shift_key();
-                // Typing into a title takes the whole keyboard. Every bare
-                // letter below is a verb that edits, and they cannot both have
-                // the key — so while a title has the caret, nothing else does.
-                // The hex box, the same way.
+                // The colour picker's hex box takes the whole keyboard while
+                // it has the caret, as a title's text box does below.
                 if state.typing_hex() {
                     match code {
                         KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter => {
                             state.finish_hex_edit()
                         }
+                        KeyCode::KeyA if ctrl => state.select_all_hex(),
+                        KeyCode::KeyC if ctrl => state.copy_hex(false),
+                        KeyCode::KeyX if ctrl => state.copy_hex(true),
+                        KeyCode::KeyV if ctrl => state.paste_hex(),
                         KeyCode::Backspace => state.backspace_hex(),
+                        KeyCode::Delete => state.delete_hex(),
+                        KeyCode::ArrowLeft => state.move_hex_caret(caret::left, shift),
+                        KeyCode::ArrowRight => state.move_hex_caret(caret::right, shift),
+                        KeyCode::Home | KeyCode::ArrowUp => state.move_hex_caret(caret::home, shift),
+                        KeyCode::End | KeyCode::ArrowDown => state.move_hex_caret(caret::end, shift),
+                        _ if ctrl => {}
                         _ => {
                             if let Some(text) = text.as_deref() {
                                 state.type_hex(text);
@@ -168,17 +176,26 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                // Typing into a title takes the whole keyboard. Every bare
+                // letter below is a verb that edits, and they cannot both have
+                // the key — so while a title has the caret, nothing else does.
                 if state.typing_title() {
                     match code {
                         KeyCode::Escape => state.finish_title_edit(),
+                        KeyCode::KeyA if ctrl => state.select_all_in_title(),
+                        KeyCode::KeyC if ctrl => state.copy_from_title(false),
+                        KeyCode::KeyX if ctrl => state.copy_from_title(true),
+                        KeyCode::KeyV if ctrl => state.paste_into_title(),
                         KeyCode::Backspace => state.backspace_title(),
                         KeyCode::Delete => state.delete_in_title(),
-                        KeyCode::ArrowLeft => state.move_title_caret(caret::left),
-                        KeyCode::ArrowRight => state.move_title_caret(caret::right),
-                        KeyCode::ArrowUp => state.move_title_caret(caret::up),
-                        KeyCode::ArrowDown => state.move_title_caret(caret::down),
-                        KeyCode::Home => state.move_title_caret(caret::home),
-                        KeyCode::End => state.move_title_caret(caret::end),
+                        KeyCode::ArrowLeft => state.move_title_caret(caret::left, shift),
+                        KeyCode::ArrowRight => state.move_title_caret(caret::right, shift),
+                        KeyCode::ArrowUp => state.move_title_caret(caret::up, shift),
+                        KeyCode::ArrowDown => state.move_title_caret(caret::down, shift),
+                        KeyCode::Home => state.move_title_caret(caret::home, shift),
+                        KeyCode::End => state.move_title_caret(caret::end, shift),
+                        // Other Ctrl chords type nothing.
+                        _ if ctrl && !matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) => {}
                         // A text box: Enter starts a new line, as in any
                         // box that holds more than one. Done is Esc or a
                         // click anywhere else, and the whole session is one
@@ -258,6 +275,7 @@ impl ApplicationHandler for App {
                     KeyCode::KeyE => state.open_selected_compound(),
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),
+                    KeyCode::KeyF if !ctrl => state.freeze_frame(),
                     KeyCode::KeyN if !ctrl => {
                         state.snap_enabled = !state.snap_enabled;
                     }

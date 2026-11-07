@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{encoder, format, frame, picture, ChannelLayout, Rational};
 
-use crate::audio::{AudioStream, CHANNELS, SAMPLE_RATE};
+use crate::audio::{mix_clip, AudioStream, Voices, CHANNELS, SAMPLE_RATE};
 use crate::canvas::Canvas;
 use crate::compose::layers_with_compounds;
 use crate::timeline::{Clip, SourceId, TrackKind, Tracks};
@@ -18,10 +18,6 @@ use crate::timeline::{Clip, SourceId, TrackKind, Tracks};
 use super::raster::{compose, compose_masked, fill_black, place_even};
 use super::take::{StillTake, VideoTake};
 use super::{drain, VideoSpec};
-
-/// Re-seek an audio source once its read head drifts this far from where the
-/// mix wants to sample next. Mirrors the live mixer's tolerance.
-const RESEEK_THRESHOLD_SEC: f64 = 0.030;
 
 pub(super) struct VideoRender {
     pub(super) enc: encoder::Video,
@@ -142,6 +138,10 @@ pub(super) struct AudioRender {
     pub(super) stream_idx: usize,
     pub(super) stream_tb: Rational,
     pub(super) takes: HashMap<SourceId, AudioStream>,
+    /// Readers for clips playing over another clip of the same file.
+    pub(super) voices: Voices,
+    /// Where each source's file is, for opening those.
+    pub(super) paths: HashMap<SourceId, String>,
     /// Samples per encoder frame — 1024 for AAC.
     pub(super) block: usize,
     pub(super) mixed: Vec<f32>,
@@ -212,29 +212,30 @@ impl AudioRender {
     fn mix(&mut self, t: f64, frames: usize, tracks: &[(TrackKind, Vec<Clip>)]) {
         let wanted = frames * CHANNELS;
         self.mixed[..wanted].fill(0.0);
-        for (kind, clips) in tracks {
+        self.voices.begin_round();
+        // As live playback: the file's own reader for the first clip of it,
+        // one of its own for each other playing at the same time.
+        let mut claimed: Vec<SourceId> = Vec::new();
+        for (track_idx, (kind, clips)) in tracks.iter().enumerate() {
             if *kind != TrackKind::Audio {
                 continue;
             }
             let Some(clip) = clips.iter().find(|c| c.contains(t)) else {
                 continue;
             };
-            let Some(stream) = self.takes.get_mut(&clip.source) else {
+            let stream = if claimed.contains(&clip.source) {
+                let Some(path) = self.paths.get(&clip.source) else {
+                    continue;
+                };
+                self.voices.get(track_idx, clip.id, path)
+            } else {
+                claimed.push(clip.source);
+                self.takes.get_mut(&clip.source)
+            };
+            let Some(stream) = stream else {
                 continue;
             };
-            let src_t = clip.source_time(t);
-            if (stream.position() - src_t).abs() > RESEEK_THRESHOLD_SEC {
-                stream.seek(src_t);
-            }
-            // Zeroed first because a short read at EOF leaves the tail of
-            // `scratch` holding the previous block's samples.
-            self.scratch[..wanted].fill(0.0);
-            let n = stream.read(&mut self.scratch[..wanted]);
-            let dt = 1.0 / SAMPLE_RATE as f64;
-            for i in 0..n {
-                let level = clip.level(t + (i / CHANNELS) as f64 * dt);
-                self.mixed[i] += self.scratch[i] * level;
-            }
+            mix_clip(stream, clip, t, &mut self.scratch[..wanted], &mut self.mixed[..wanted]);
         }
     }
 }
