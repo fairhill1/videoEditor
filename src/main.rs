@@ -41,6 +41,8 @@ mod title;
 mod toolbar;
 mod ui;
 mod video;
+#[cfg(target_os = "linux")]
+mod wayland_drop;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

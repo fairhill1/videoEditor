@@ -2390,6 +2390,8 @@ dependencies = [
  "rfd",
  "ron",
  "serde",
+ "wayland-backend",
+ "wayland-client",
  "wgpu",
  "winit",
 ]

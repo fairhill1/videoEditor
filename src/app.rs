@@ -24,6 +24,10 @@ const PIXELS_PER_NOTCH: f32 = 40.0;
 #[derive(Default)]
 pub(crate) struct App {
     state: Option<State>,
+    /// Where dropped files come from on Wayland, which winit does not report
+    /// them on. `None` everywhere else, where `DroppedFile` covers it.
+    #[cfg(target_os = "linux")]
+    wayland_drop: Option<crate::wayland_drop::WaylandDrop>,
 }
 
 impl ApplicationHandler for App {
@@ -37,6 +41,11 @@ impl ApplicationHandler for App {
                 )
                 .unwrap(),
         );
+
+        #[cfg(target_os = "linux")]
+        {
+            self.wayland_drop = crate::wayland_drop::WaylandDrop::new(&window);
+        }
 
         let state = pollster::block_on(State::new(
             event_loop.owned_display_handle(),
@@ -63,6 +72,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                #[cfg(target_os = "linux")]
+                if let Some(drop) = self.wayland_drop.as_mut() {
+                    for paths in drop.poll() {
+                        state.import_files(&paths);
+                    }
+                }
                 state.update_title();
                 state.render();
                 state.get_window().request_redraw();

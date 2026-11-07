@@ -18,6 +18,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 wgpu = "29.0.1"
 winit = "0.30.13"
 
+# File drops on Wayland, which winit does not deliver there; see
+# `src/wayland_drop.rs`. The same versions winit itself links, so the listener
+# can share its connection.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31.10"
+wayland-backend = { version = "0.3.10", features = ["client_system"] }
+
 [profile.dev]
 opt-level = 1
 

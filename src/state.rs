@@ -474,13 +474,18 @@ impl State {
         else {
             return;
         };
-        // One picker interaction is one undo step, however many files it
-        // brought in — the per-file edits nest inside this one.
+        let paths: Vec<String> =
+            paths.iter().filter_map(|p| p.to_str()).map(str::to_string).collect();
+        self.import_files(&paths);
+    }
+
+    /// Import every file in `paths` as one undo step, however many there are —
+    /// one picker interaction or one drop is one thing to take back. The
+    /// per-file edits nest inside this one.
+    pub(crate) fn import_files(&mut self, paths: &[String]) {
         self.begin_edit();
         for path in paths {
-            if let Some(p) = path.to_str() {
-                self.import_file(p);
-            }
+            self.import_file(path);
         }
         self.commit_edit();
     }
