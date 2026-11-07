@@ -190,7 +190,19 @@ pub(crate) struct State {
     /// How far the effects tab is scrolled down, in points.
     pub(crate) effects_scroll: f32,
     /// The font list, while it is open: how many rows it is scrolled down.
-    pub(crate) font_menu: Option<usize>,
+    pub(crate) font_menu: Option<(crate::layout::TitleMenu, usize)>,
+    /// The colour picker, while it is open.
+    pub(crate) color_picker: Option<crate::picker::ColorPicker>,
+    /// The colours picked lately, most recent first. Kept between sessions.
+    pub(crate) recent_colors: Vec<[f32; 4]>,
+    /// A pixel the eyedropper asked for, in physical pixels: read off the
+    /// next frame drawn.
+    pub(crate) eyedropper_pick: Option<[u32; 2]>,
+    /// Whether the window's pictures can be copied out of, which the
+    /// eyedropper needs. Not every platform allows it.
+    pub(crate) surface_copy_src: bool,
+    /// The picker's gradients, made the first time it opens.
+    pub(crate) picker_tex: Option<crate::picker::PickerTextures>,
     /// The title being typed into, and what it said when typing started, so
     /// Escape can put it back.
     ///
@@ -201,6 +213,11 @@ pub(crate) struct State {
     /// Where in the title being typed into the next letter goes: a byte
     /// offset into its text, on a character boundary.
     pub(crate) title_caret: usize,
+    /// Everything as it stood when typing began: the undo step the typing
+    /// becomes when it finishes, if it changed anything.
+    pub(crate) typing_before: Option<crate::edit::EditSnapshot>,
+    /// The clip pressed last and when, to tell a double-click from two.
+    pub(crate) last_clip_click: Option<(u32, std::time::Instant)>,
     pub(crate) modifiers: ModifiersState,
     pub(crate) undo_stack: Vec<EditSnapshot>,
     pub(crate) redo_stack: Vec<EditSnapshot>,
@@ -340,8 +357,15 @@ impl State {
             pool_tab: PoolTab::default(),
             effects_scroll: 0.0,
             font_menu: None,
+            color_picker: None,
+            recent_colors: crate::color::load_recent(),
+            eyedropper_pick: None,
+            picker_tex: None,
+            surface_copy_src: cap.usages.contains(wgpu::TextureUsages::COPY_SRC),
             editing_title: None,
             title_caret: 0,
+            typing_before: None,
+            last_clip_click: None,
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -368,7 +392,11 @@ impl State {
 
     pub(crate) fn configure_surface(&self) {
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if self.surface_copy_src {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: self.surface_format,
             view_formats: vec![self.surface_format.add_srgb_suffix()],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
@@ -432,6 +460,8 @@ impl State {
             | DragMode::EffectDrag { .. }
             | DragMode::EffectParam { .. }
             | DragMode::TitleNumber { .. }
+            | DragMode::PickerSv
+            | DragMode::PickerHue
             | DragMode::Scrollbar { .. }
             | DragMode::ZoomSlider => CursorIcon::Default,
             DragMode::None => self.hover_cursor(),
@@ -448,6 +478,9 @@ impl State {
         // has to swallow the hover as well.
         if self.project_menu_open {
             return CursorIcon::Default;
+        }
+        if self.eyedropper_armed() {
+            return CursorIcon::Crosshair;
         }
         if let Some(splitter) = self.splitter_at(self.cursor) {
             return splitter_cursor(splitter);

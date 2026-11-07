@@ -9,6 +9,7 @@ use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
 use crate::input::DragMode;
 use crate::state::State;
 use crate::fonts;
+use crate::layout::{PoolTab, TitleMenu};
 use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_INFO};
 use crate::title::{self, Title};
 use crate::timeline::{
@@ -97,6 +98,9 @@ impl State {
     /// each manage their own edit. Must be paired with `commit_edit`.
     pub(crate) fn begin_edit(&mut self) {
         if self.edit_depth == 0 {
+            // A visit to the colour picker is a step of its own, ahead of
+            // whatever comes next rather than folded into it.
+            self.close_color_picker();
             self.pending_edit = Some(self.edit_snapshot());
         }
         self.edit_depth += 1;
@@ -113,6 +117,11 @@ impl State {
         let Some(before) = self.pending_edit.take() else {
             return;
         };
+        self.push_step(before);
+    }
+
+    /// Make `before` an undo step, unless nothing has changed since it.
+    pub(crate) fn push_step(&mut self, before: EditSnapshot) {
         if before == self.edit_snapshot() {
             return;
         }
@@ -128,6 +137,7 @@ impl State {
     }
 
     pub(crate) fn undo(&mut self) {
+        self.close_color_picker();
         let Some(prev) = self.undo_stack.pop() else {
             return;
         };
@@ -141,6 +151,7 @@ impl State {
     }
 
     pub(crate) fn redo(&mut self) {
+        self.close_color_picker();
         let Some(next) = self.redo_stack.pop() else {
             return;
         };
@@ -165,6 +176,7 @@ impl State {
         // A step that predates this title, or removes it, leaves nothing to
         // type into.
         self.editing_title = None;
+        self.typing_before = None;
         // Recomputed from the timeline on the next render.
         self.last_playing_source = None;
         // Undoing a drop or a trim can shorten the timeline out from under
@@ -196,6 +208,27 @@ impl State {
             self.last_playing_source = None;
         }
         self.commit_edit();
+    }
+
+    /// Double-click on a clip: open it for editing. A compound clip opens to
+    /// its contents; any other clip is selected with the effects tab showing
+    /// its settings — and a text clip has its text box taking typing, so the
+    /// words can be changed straight away.
+    pub(crate) fn open_clip(&mut self, track: usize, idx: usize) {
+        let source = self.timeline.tracks[track].clips[idx].source;
+        if self.media.compound(source).is_some() {
+            self.open_compound(source);
+            return;
+        }
+        self.select_clip_at(track, idx);
+        if self.pool_tab != PoolTab::Effects {
+            self.pool_tab = PoolTab::Effects;
+            // Saved with the project's layout, as a click on the tab is.
+            self.dirty = true;
+        }
+        if self.media.title(source).is_some() {
+            self.begin_title_edit(source);
+        }
     }
 
     /// Select every clip on the timeline.
@@ -660,11 +693,14 @@ impl State {
             return;
         };
         self.finish_title_edit();
+        self.close_color_picker();
         self.title_caret = title.text.len();
         self.editing_title = Some((source, title));
         // One typing session is one undo step, however many keys it took —
-        // the same bargain a drag makes.
-        self.begin_edit();
+        // the same bargain a drag makes. Kept apart from the drag's own edit
+        // rather than nested in it: typing usually starts with a press, and
+        // the release that ends the press must not end the typing too.
+        self.typing_before = Some(self.edit_snapshot());
     }
 
     /// Start typing into the selected clip's title, for the keyboard. Does
@@ -684,7 +720,9 @@ impl State {
     /// Accept the text as it stands.
     pub(crate) fn finish_title_edit(&mut self) {
         if self.editing_title.take().is_some() {
-            self.commit_edit();
+            if let Some(before) = self.typing_before.take() {
+                self.push_step(before);
+            }
         }
     }
 
@@ -965,7 +1003,14 @@ impl State {
             .as_deref()
             .and_then(|f| fonts::families().iter().position(|n| n == f))
             .map_or(0, |i| i + 1);
-        self.font_menu = Some(current.saturating_sub(FONT_MENU_ROWS / 2));
+        self.font_menu = Some((TitleMenu::Font, current.saturating_sub(FONT_MENU_ROWS / 2)));
+    }
+
+    /// Drop the list of the weights the shown title's font comes in.
+    pub(crate) fn open_weight_menu(&mut self) {
+        if self.effects_title().is_some() {
+            self.font_menu = Some((TitleMenu::Weight, 0));
+        }
     }
 
     pub(crate) fn set_effect_param(&mut self, index: usize, param: usize, value: f32) {

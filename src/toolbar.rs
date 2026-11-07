@@ -361,7 +361,7 @@ impl State {
             (
                 self.timeline_select_all_btn,
                 ICON_SELECT_ALL,
-                "Select every clip (Ctrl+A)",
+                "Select every clip (A)",
                 avail(self.timeline.tracks.iter().any(|t| !t.clips.is_empty())),
             ),
             (
@@ -379,25 +379,25 @@ impl State {
             (
                 self.timeline_copy_btn,
                 ICON_COPY,
-                "Copy selected clips (Ctrl+C)",
+                "Copy selected clips (C)",
                 avail(self.has_selection()),
             ),
             (
                 self.timeline_paste_btn,
                 ICON_PASTE,
-                "Paste at the playhead (Ctrl+V)",
+                "Paste at the playhead (V)",
                 avail(!self.clipboard.is_empty()),
             ),
             (
                 self.timeline_combine_btn,
                 ICON_COMBINE,
-                "Combine selected clips into a compound clip (Ctrl+G)",
+                "Combine selected clips into a compound clip (G)",
                 avail(self.has_selection()),
             ),
             (
                 self.timeline_open_compound_btn,
                 ICON_EDIT,
-                "Open the selected compound clip to edit it (Enter)",
+                "Open the selected compound clip to edit it (E)",
                 avail(self.selected_compound().is_some()),
             ),
             (

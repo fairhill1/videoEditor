@@ -152,6 +152,21 @@ impl ApplicationHandler for App {
                 // Typing into a title takes the whole keyboard. Every bare
                 // letter below is a verb that edits, and they cannot both have
                 // the key — so while a title has the caret, nothing else does.
+                // The hex box, the same way.
+                if state.typing_hex() {
+                    match code {
+                        KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter => {
+                            state.finish_hex_edit()
+                        }
+                        KeyCode::Backspace => state.backspace_hex(),
+                        _ => {
+                            if let Some(text) = text.as_deref() {
+                                state.type_hex(text);
+                            }
+                        }
+                    }
+                    return;
+                }
                 if state.typing_title() {
                     match code {
                         KeyCode::Escape => state.finish_title_edit(),
@@ -212,12 +227,16 @@ impl ApplicationHandler for App {
                         if state.project_menu_open || state.font_menu.is_some() {
                             state.project_menu_open = false;
                             state.font_menu = None;
+                        } else if state.color_picker.is_some() {
+                            state.close_color_picker();
                         } else {
                             state.close_compound();
                         }
                     }
-                    KeyCode::KeyG if ctrl => state.combine_selected(),
-                    KeyCode::KeyA if ctrl => state.select_all(),
+                    // Bare letters, like the other clip verbs, with the
+                    // Ctrl versions every other program uses kept as well.
+                    KeyCode::KeyG => state.combine_selected(),
+                    KeyCode::KeyA => state.select_all(),
                     // Shift+Z rather than a bare key: it is the counterpart to
                     // the zoom pair above, and every bare letter it could have
                     // had is a verb that edits.
@@ -232,8 +251,10 @@ impl ApplicationHandler for App {
                     // Guarded on ctrl so the file-management combos above win
                     // rather than falling through to the bare-key action.
                     KeyCode::Space if !ctrl => state.toggle_playback(),
-                    KeyCode::KeyC if ctrl => state.copy_selected(),
-                    KeyCode::KeyV if ctrl => state.paste(),
+                    KeyCode::KeyC => state.copy_selected(),
+                    KeyCode::KeyV => state.paste(),
+                    // After Ctrl+E above, which is export.
+                    KeyCode::KeyE => state.open_selected_compound(),
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),
                     KeyCode::KeyN if !ctrl => {

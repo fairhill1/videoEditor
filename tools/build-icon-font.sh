@@ -43,6 +43,7 @@ ICONS=(
     pencil                    # timeline: open a compound clip to edit it
     arrow-left                # timeline: back out of a compound clip
     square-dashed             # timeline: select every clip
+    pipette                   # effects: pick a colour off the screen
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

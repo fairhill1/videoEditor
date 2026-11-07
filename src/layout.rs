@@ -539,6 +539,8 @@ pub(crate) enum TitleControl {
     Text,
     /// The face, in a box that opens the list of installed fonts.
     Font,
+    /// The weight, in a box that opens the list of the weights the font has.
+    Weight,
     Number(TitleNumber),
     Color(TitleColor),
     /// The on-off switch heading the outline's or shadow's rows.
@@ -591,8 +593,11 @@ pub(crate) enum EffectsHit {
     Param { index: usize, param: usize, slider: Rect },
     TitleText,
     TitleFont,
+    TitleWeight,
     TitleNumber { field: TitleNumber, slider: Rect },
     TitleSwatch { field: TitleColor, swatch: usize },
+    /// The chip showing a colour row's colour, which opens the picker.
+    TitleColorChip(TitleColor),
     TitleToggle(TitlePart),
 }
 
@@ -620,6 +625,113 @@ pub(crate) fn swatch_rects(field: Rect) -> [Rect; SWATCHES.len()] {
         w: side,
         h: side,
     })
+}
+
+/// The chip in a colour row's label column, under its label: the colour as
+/// it is, and the way into the picker for any other.
+pub(crate) fn color_chip_rect(row: Rect) -> Rect {
+    Rect {
+        x: row.x + EFFECT_PARAM_INDENT,
+        y: (row.y + row.h * 0.5 + 1.0).round(),
+        w: TITLE_CHIP_W,
+        h: TITLE_CHIP_H,
+    }
+}
+
+/// Where everything in the colour picker sits, dropped from `anchor` (the
+/// chip that opened it) inside a window `win` big.
+#[derive(Clone, Debug)]
+pub(crate) struct PickerLayout {
+    pub(crate) rect: Rect,
+    /// Saturation across, value down, for the picker's hue.
+    pub(crate) sv: Rect,
+    pub(crate) hue: Rect,
+    /// The colour as it stands, beside its hex code.
+    pub(crate) current: Rect,
+    pub(crate) hex: Rect,
+    pub(crate) eyedropper: Rect,
+    pub(crate) swatches: [Rect; SWATCHES.len()],
+    /// Slots for the recent colours, most recent first.
+    pub(crate) recent: [Rect; crate::color::RECENT_MAX],
+}
+
+pub(crate) fn color_picker(anchor: Rect, win: [f32; 2]) -> PickerLayout {
+    let cols = TITLE_SWATCH_COLUMNS as f32;
+    let inner_w = cols * PICKER_SWATCH + (cols - 1.0) * PICKER_SWATCH_GAP;
+    let swatch_rows = SWATCHES.len().div_ceil(TITLE_SWATCH_COLUMNS) as f32;
+    let swatches_h = swatch_rows * PICKER_SWATCH + (swatch_rows - 1.0) * PICKER_SWATCH_GAP;
+    let w = inner_w + MENU_PAD * 2.0;
+    let h = MENU_PAD * 2.0
+        + PICKER_SV_H
+        + PICKER_GAP
+        + PICKER_ROW_H
+        + PICKER_GAP
+        + swatches_h
+        + PICKER_GAP
+        + PICKER_SWATCH;
+    let below = anchor.y + anchor.h + MENU_GAP;
+    let y = if below + h <= win[1] - MENU_PAD { below } else { (anchor.y - MENU_GAP - h).max(MENU_PAD) };
+    let x = anchor.x.min(win[0] - w - MENU_PAD).max(MENU_PAD);
+    let rect = Rect { x: x.round(), y: y.round(), w, h };
+    let (ix, mut iy) = (rect.x + MENU_PAD, rect.y + MENU_PAD);
+    let sv = Rect { x: ix, y: iy, w: inner_w - PICKER_GAP - PICKER_HUE_W, h: PICKER_SV_H };
+    let hue = Rect { x: ix + inner_w - PICKER_HUE_W, y: iy, w: PICKER_HUE_W, h: PICKER_SV_H };
+    iy += PICKER_SV_H + PICKER_GAP;
+    let current = Rect { x: ix, y: iy, w: PICKER_ROW_H, h: PICKER_ROW_H };
+    let eyedropper = Rect { x: ix + inner_w - PICKER_ROW_H, y: iy, w: PICKER_ROW_H, h: PICKER_ROW_H };
+    let hex = Rect {
+        x: current.x + current.w + PICKER_SWATCH_GAP,
+        y: iy,
+        w: eyedropper.x - PICKER_SWATCH_GAP - (current.x + current.w + PICKER_SWATCH_GAP),
+        h: PICKER_ROW_H,
+    };
+    iy += PICKER_ROW_H + PICKER_GAP;
+    let at = |i: usize, top: f32| Rect {
+        x: ix + (i % TITLE_SWATCH_COLUMNS) as f32 * (PICKER_SWATCH + PICKER_SWATCH_GAP),
+        y: top + (i / TITLE_SWATCH_COLUMNS) as f32 * (PICKER_SWATCH + PICKER_SWATCH_GAP),
+        w: PICKER_SWATCH,
+        h: PICKER_SWATCH,
+    };
+    let swatches = std::array::from_fn(|i| at(i, iy));
+    iy += swatches_h + PICKER_GAP;
+    let recent = std::array::from_fn(|i| at(i, iy));
+    PickerLayout { rect, sv, hue, current, hex, eyedropper, swatches, recent }
+}
+
+/// What a press in the colour picker landed on.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum PickerHit {
+    Sv,
+    Hue,
+    Hex,
+    Eyedropper,
+    Swatch(usize),
+    Recent(usize),
+    /// Inside the picker, on nothing that does anything.
+    Body,
+}
+
+impl PickerLayout {
+    pub(crate) fn hit(&self, p: [f32; 2]) -> Option<PickerHit> {
+        if !self.rect.contains(p) {
+            return None;
+        }
+        Some(if self.sv.contains(p) {
+            PickerHit::Sv
+        } else if self.hue.contains(p) {
+            PickerHit::Hue
+        } else if self.hex.contains(p) {
+            PickerHit::Hex
+        } else if self.eyedropper.contains(p) {
+            PickerHit::Eyedropper
+        } else if let Some(i) = self.swatches.iter().position(|r| r.contains(p)) {
+            PickerHit::Swatch(i)
+        } else if let Some(i) = self.recent.iter().position(|r| r.contains(p)) {
+            PickerHit::Recent(i)
+        } else {
+            PickerHit::Body
+        })
+    }
 }
 
 /// A colour row: tall enough for every row of swatches, with the same margin
@@ -694,7 +806,14 @@ pub(crate) fn effects_panel(
         use TitleControl as C;
         let text_h = text_box_h(lines);
         let groups: [&[TitleControl]; 3] = [
-            &[C::Text, C::Font, C::Number(TitleNumber::Size), C::Color(TitleColor::Fill)],
+            &[
+                C::Text,
+                C::Font,
+                C::Weight,
+                C::Number(TitleNumber::Size),
+                C::Number(TitleNumber::LineSpacing),
+                C::Color(TitleColor::Fill),
+            ],
             &[
                 C::Toggle(TitlePart::Outline),
                 C::Number(TitleNumber::OutlineWidth),
@@ -725,7 +844,7 @@ pub(crate) fn effects_panel(
                     h: field_h,
                 };
                 let field = match control {
-                    C::Text | C::Font => boxed,
+                    C::Text | C::Font | C::Weight => boxed,
                     C::Number(_) => slider_in(row),
                     C::Color(_) => Rect { y: row.y, h: row.h, ..boxed },
                     C::Toggle(_) => toggle_in(row),
@@ -815,6 +934,7 @@ impl EffectsPanel {
             match r.control {
                 TitleControl::Text if r.field.contains(p) => return Some(EffectsHit::TitleText),
                 TitleControl::Font if r.field.contains(p) => return Some(EffectsHit::TitleFont),
+                TitleControl::Weight if r.field.contains(p) => return Some(EffectsHit::TitleWeight),
                 // The whole row past the label, as for an effect's slider.
                 TitleControl::Number(field)
                     if r.row.contains(p) && p[0] >= r.field.x - ZOOM_SLIDER_KNOB_W =>
@@ -822,6 +942,9 @@ impl EffectsPanel {
                     return Some(EffectsHit::TitleNumber { field, slider: r.field });
                 }
                 TitleControl::Color(field) => {
+                    if color_chip_rect(r.row).contains(p) {
+                        return Some(EffectsHit::TitleColorChip(field));
+                    }
                     if let Some(swatch) = swatch_rects(r.field).iter().position(|s| s.contains(p)) {
                         return Some(EffectsHit::TitleSwatch { field, swatch });
                     }
@@ -856,10 +979,21 @@ impl EffectsPanel {
         None
     }
 
-    /// The font box, for the list that drops from it.
-    pub(crate) fn font_field(&self) -> Option<Rect> {
-        self.title.iter().find(|r| r.control == TitleControl::Font).map(|r| r.field)
+    /// The box a title's list drops from: the font box or the weight box.
+    pub(crate) fn menu_field(&self, menu: TitleMenu) -> Option<Rect> {
+        let control = match menu {
+            TitleMenu::Font => TitleControl::Font,
+            TitleMenu::Weight => TitleControl::Weight,
+        };
+        self.title.iter().find(|r| r.control == control).map(|r| r.field)
     }
+}
+
+/// Which of a title's lists is open.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TitleMenu {
+    Font,
+    Weight,
 }
 
 /// The list of fonts dropped from the font box `anchor`: where it sits, and
@@ -1410,14 +1544,24 @@ impl State {
         self.media.title(source).map(|title| (source, title))
     }
 
-    /// The font list, laid out under the font box, while it is open.
-    pub(crate) fn font_menu(&self) -> Option<FontMenu> {
-        let scroll = self.font_menu?;
+    /// The title list that is open — fonts or weights — laid out under its
+    /// box.
+    pub(crate) fn font_menu(&self) -> Option<(TitleMenu, FontMenu)> {
+        let (kind, scroll) = self.font_menu?;
         if self.pool_tab != PoolTab::Effects {
             return None;
         }
-        let anchor = self.effects_panel().font_field()?;
-        Some(font_menu(anchor, self.logical_size(), fonts::choice_count(), scroll))
+        let anchor = self.effects_panel().menu_field(kind)?;
+        let n = match kind {
+            TitleMenu::Font => fonts::choice_count(),
+            TitleMenu::Weight => self.shown_weights().len(),
+        };
+        Some((kind, font_menu(anchor, self.logical_size(), n, scroll)))
+    }
+
+    /// The weights the shown title's font comes in.
+    pub(crate) fn shown_weights(&self) -> Vec<u16> {
+        fonts::weights(self.effects_title().and_then(|(_, t)| t.font.as_deref()))
     }
 
     pub(crate) fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
@@ -1696,7 +1840,7 @@ mod tests {
         stack.push(EffectKind::GaussianBlur.instance());
         let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(1), Some(&stack), 0.0);
         let controls: Vec<TitleControl> = panel.title.iter().map(|r| r.control).collect();
-        assert_eq!(controls.len(), 11);
+        assert_eq!(controls.len(), 13);
         assert_eq!(controls[0], TitleControl::Text);
         assert!(panel.title[0].row.y >= panel.clip_heading_y + EFFECTS_SECTION_H);
         let last = panel.title.last().unwrap().row;
@@ -1710,6 +1854,8 @@ mod tests {
         assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleText));
         let f = at(TitleControl::Font).field;
         assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleFont));
+        let f = at(TitleControl::Weight).field;
+        assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleWeight));
         let size = at(TitleControl::Number(TitleNumber::Size));
         assert_eq!(
             panel.hit([size.field.x + 4.0, size.row.y + 2.0]),
@@ -1719,6 +1865,15 @@ mod tests {
         assert_eq!(
             panel.hit([swatches[3].x + 2.0, swatches[3].y + 2.0]),
             Some(EffectsHit::TitleSwatch { field: TitleColor::Outline, swatch: 3 })
+        );
+        // The chip under the label opens the picker, and clears the swatches.
+        let fill = at(TitleControl::Color(TitleColor::Fill));
+        let chip = color_chip_rect(fill.row);
+        assert!(chip.x + chip.w < fill.field.x);
+        assert!(chip.y + chip.h <= fill.row.y + fill.row.h);
+        assert_eq!(
+            panel.hit([chip.x + 2.0, chip.y + 2.0]),
+            Some(EffectsHit::TitleColorChip(TitleColor::Fill))
         );
         let toggle = at(TitleControl::Toggle(TitlePart::Shadow)).row;
         assert_eq!(
@@ -1771,6 +1926,42 @@ mod tests {
         for (_, r) in &menu.rows {
             assert!(r.x + r.w <= 1200.0 && r.y + r.h <= 800.0);
         }
+    }
+
+    #[test]
+    fn the_colour_picker_stays_inside_the_window_and_hits_its_parts() {
+        let win = [1200.0, 800.0];
+        let anchor = Rect { x: 40.0, y: 200.0, w: TITLE_CHIP_W, h: TITLE_CHIP_H };
+        let p = color_picker(anchor, win);
+        assert!(p.rect.y >= anchor.y + anchor.h);
+        let inside = |r: Rect| {
+            r.x >= p.rect.x && r.y >= p.rect.y && r.x + r.w <= p.rect.x + p.rect.w && r.y + r.h <= p.rect.y + p.rect.h
+        };
+        let parts: Vec<Rect> = [p.sv, p.hue, p.current, p.hex, p.eyedropper]
+            .into_iter()
+            .chain(p.swatches)
+            .chain(p.recent)
+            .collect();
+        for (i, a) in parts.iter().enumerate() {
+            assert!(inside(*a), "part {i} is outside the picker");
+            for b in &parts[i + 1..] {
+                assert!(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+            }
+        }
+        let centre = |r: Rect| [r.x + r.w * 0.5, r.y + r.h * 0.5];
+        assert_eq!(p.hit(centre(p.sv)), Some(PickerHit::Sv));
+        assert_eq!(p.hit(centre(p.hue)), Some(PickerHit::Hue));
+        assert_eq!(p.hit(centre(p.hex)), Some(PickerHit::Hex));
+        assert_eq!(p.hit(centre(p.eyedropper)), Some(PickerHit::Eyedropper));
+        assert_eq!(p.hit(centre(p.swatches[9])), Some(PickerHit::Swatch(9)));
+        assert_eq!(p.hit(centre(p.recent[2])), Some(PickerHit::Recent(2)));
+        assert_eq!(p.hit([p.rect.x + 1.0, p.rect.y + 1.0]), Some(PickerHit::Body));
+        assert_eq!(p.hit([p.rect.x - 5.0, p.rect.y]), None);
+        // Near the bottom-right corner it opens upwards and shifts left.
+        let low = Rect { x: 1190.0, y: 780.0, ..anchor };
+        let up = color_picker(low, win);
+        assert!(up.rect.y + up.rect.h <= low.y);
+        assert!(up.rect.x + up.rect.w <= win[0]);
     }
 
     #[test]

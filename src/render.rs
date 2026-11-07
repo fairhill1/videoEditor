@@ -232,6 +232,12 @@ impl State {
             self.draw_project_menu(self.timeline_project_btn, w, h);
         }
         self.draw_font_menu();
+        // A picker whose clip is no longer the one shown closes, keeping
+        // what it picked.
+        if self.color_picker.is_some() && self.picker_layout().is_none() {
+            self.close_color_picker();
+        }
+        self.draw_color_picker();
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Ahead of the main pass, which samples what these write.
@@ -258,8 +264,67 @@ impl State {
         }
 
         self.queue.submit([encoder.finish()]);
+        if let Some(at) = self.eyedropper_pick.take() {
+            if let Some(color) = self.read_pixel(&surface_texture.texture, at) {
+                self.pick_color(color);
+            }
+        }
         self.window.pre_present_notify();
         surface_texture.present();
+    }
+
+    /// The colour of one pixel of the frame just drawn, for the eyedropper:
+    /// what is on screen there, as the UI's own sRGB values. Waits for the
+    /// GPU, which is fine once per click.
+    fn read_pixel(&self, texture: &wgpu::Texture, [x, y]: [u32; 2]) -> Option<[f32; 4]> {
+        if x >= texture.width() || y >= texture.height() {
+            return None;
+        }
+        let bgra = match texture.format().remove_srgb_suffix() {
+            wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::Rgba8Unorm => false,
+            other => {
+                log::warn!("eyedropper: can't read a {other:?} surface");
+                return None;
+            }
+        };
+        let row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eyedropper"),
+            size: row as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .ok()?;
+        rx.recv().ok()?.ok()?;
+        let px = buffer.slice(..4).get_mapped_range().to_vec();
+        let [r, g, b] = if bgra { [px[2], px[1], px[0]] } else { [px[0], px[1], px[2]] };
+        Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0])
     }
 
     /// The canvas, with every layer live at `t` composed onto it. Returns the

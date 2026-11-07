@@ -368,5 +368,8 @@ impl State {
         self.edit_depth = 0;
         // The title that had the caret belongs to the pool being replaced.
         self.editing_title = None;
+        self.typing_before = None;
+        self.color_picker = None;
+        self.eyedropper_pick = None;
     }
 }

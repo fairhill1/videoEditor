@@ -66,10 +66,26 @@ pub struct Title {
     /// updated or reinstalled; see [`crate::fonts::face`] for a missing one.
     #[serde(default)]
     pub font: Option<String>,
+    /// How heavy the letters are, 100 (thin) to 900 (black). The font draws
+    /// the nearest weight it has.
+    #[serde(default = "regular")]
+    pub weight: u16,
     #[serde(default)]
     pub outline: Outline,
     #[serde(default)]
     pub shadow: Shadow,
+    /// The distance from one line to the next, as a multiple of the font's
+    /// own: 1 is the face as designed, with a little air.
+    #[serde(default = "normal_spacing")]
+    pub line_spacing: f32,
+}
+
+fn normal_spacing() -> f32 {
+    1.0
+}
+
+fn regular() -> u16 {
+    fonts::REGULAR
 }
 
 /// A line of colour around every letter.
@@ -195,6 +211,7 @@ pub const SWATCHES: [[f32; 4]; 16] = [
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TitleNumber {
     Size,
+    LineSpacing,
     OutlineWidth,
     ShadowDistance,
     ShadowSoftness,
@@ -205,6 +222,7 @@ impl TitleNumber {
     pub fn spec(self) -> ParamSpec {
         let (name, min, max, default, unit) = match self {
             Self::Size => ("Size", 0.02, 0.4, DEFAULT_SIZE, Unit::CanvasHeight),
+            Self::LineSpacing => ("Line spacing", 0.5, 3.0, 1.0, Unit::Percent),
             Self::OutlineWidth => ("Thickness", 0.0, 0.02, 0.004, Unit::CanvasHeight),
             Self::ShadowDistance => ("Distance", 0.0, 0.04, 0.006, Unit::CanvasHeight),
             Self::ShadowSoftness => ("Softness", 0.0, 0.03, 0.006, Unit::CanvasHeight),
@@ -216,6 +234,7 @@ impl TitleNumber {
     pub fn get(self, title: &Title) -> f32 {
         match self {
             Self::Size => title.size,
+            Self::LineSpacing => title.line_spacing,
             Self::OutlineWidth => title.outline.width,
             Self::ShadowDistance => title.shadow.distance,
             Self::ShadowSoftness => title.shadow.softness,
@@ -228,6 +247,7 @@ impl TitleNumber {
         let value = value.clamp(spec.min, spec.max);
         match self {
             Self::Size => title.size = value,
+            Self::LineSpacing => title.line_spacing = value,
             Self::OutlineWidth => title.outline.width = value,
             Self::ShadowDistance => title.shadow.distance = value,
             Self::ShadowSoftness => title.shadow.softness = value,
@@ -296,8 +316,10 @@ impl Default for Title {
             size: DEFAULT_SIZE,
             color: [1.0, 1.0, 1.0, 1.0],
             font: None,
+            weight: fonts::REGULAR,
             outline: Outline::default(),
             shadow: Shadow::default(),
+            line_spacing: 1.0,
         }
     }
 }
@@ -338,8 +360,8 @@ pub fn rasterize(title: &Title, width: u32, height: u32) -> Mask {
         return mask;
     }
     let px = (title.size * height as f32).max(1.0);
-    let picked = fonts::face(title.font.as_deref());
-    let fallback = fonts::face(None);
+    let picked = fonts::face(title.font.as_deref(), title.weight);
+    let fallback = fonts::face(None, fonts::REGULAR);
     // A letter the picked face does not have comes from the default one,
     // rather than as the face's empty box.
     let face_for = |ch: char| {
@@ -353,7 +375,7 @@ pub fn rasterize(title: &Title, width: u32, height: u32) -> Mask {
     let metrics = font
         .horizontal_line_metrics(px)
         .expect("font has no horizontal line metrics");
-    let line_h = (metrics.ascent - metrics.descent) * (1.0 + LINE_GAP);
+    let line_h = (metrics.ascent - metrics.descent) * (1.0 + LINE_GAP) * title.line_spacing;
 
     // Split rather than `lines`, which drops a blank last line: a line left
     // empty at the end is space the text box shows, so the title keeps it.
@@ -741,6 +763,20 @@ mod tests {
                 .fold(f32::INFINITY, f32::min);
             assert_eq!(*g, want, "at {p}");
         }
+    }
+
+    #[test]
+    fn line_spacing_spreads_the_lines_apart() {
+        let rows = |spacing: f32| {
+            let title = Title { text: "I\nI".into(), line_spacing: spacing, ..Title::default() };
+            let mask = rasterize(&title, 320, 360);
+            let w = mask.width as usize;
+            let inked: Vec<usize> =
+                (0..mask.height as usize).filter(|y| mask.coverage[y * w..(y + 1) * w].iter().any(|&c| c > 128)).collect();
+            inked.last().unwrap() - inked.first().unwrap()
+        };
+        assert!(rows(2.0) > rows(1.0) + 30, "{} vs {}", rows(2.0), rows(1.0));
+        assert!(rows(0.6) < rows(1.0));
     }
 
     #[test]

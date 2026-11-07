@@ -8,7 +8,8 @@
 use crate::effects::EffectKind;
 use crate::fonts;
 use crate::layout::{
-    resolve_split, track_header_button, y_to_gain, y_to_opacity, EffectsHit, PoolTab, PoolView,
+    resolve_split, track_header_button, y_to_gain, y_to_opacity, EffectsHit, PickerHit, PoolTab,
+    PoolView, TitleMenu,
     TitleControl,
     PreviewHit, Splitter, TimelineHit,
 };
@@ -32,6 +33,9 @@ pub(crate) enum DragMode {
     /// Dragging one of a title's sliders on the effects tab. One undo step,
     /// opened at the press and closed in `end_drag`, as for an effect's.
     TitleNumber { field: TitleNumber, slider: Rect },
+    /// Dragging in the colour picker's square, or along its hue strip.
+    PickerSv,
+    PickerHue,
     /// Moving a clip along the timeline. `group` when it was pressed as one
     /// of several selected clips: then every selected clip moves with it, and
     /// it stays on its track. `moved` turns true at the first step, so a
@@ -120,13 +124,58 @@ impl State {
             self.project_menu_open = true;
             return;
         }
+        // The colour picker, over everything below it. An armed eyedropper
+        // takes the press wherever it lands, the picker's own button aside.
+        if self.color_picker.is_some() {
+            let layout = self.picker_layout();
+            let hit = layout.as_ref().and_then(|l| l.hit([cx, cy]));
+            if self.eyedropper_armed() && hit != Some(PickerHit::Eyedropper) {
+                self.eyedrop_at_cursor();
+                return;
+            }
+            if hit != Some(PickerHit::Hex) {
+                self.finish_hex_edit();
+            }
+            match hit {
+                Some(PickerHit::Sv) => {
+                    self.drag = DragMode::PickerSv;
+                    self.drag_picker_sv();
+                }
+                Some(PickerHit::Hue) => {
+                    self.drag = DragMode::PickerHue;
+                    self.drag_picker_hue();
+                }
+                Some(PickerHit::Hex) => self.begin_hex_edit(),
+                Some(PickerHit::Eyedropper) => self.toggle_eyedropper(),
+                Some(PickerHit::Swatch(i)) => self.pick_color(SWATCHES[i]),
+                Some(PickerHit::Recent(i)) => {
+                    if let Some(&c) = self.recent_colors.get(i) {
+                        self.pick_color(c);
+                    }
+                }
+                Some(PickerHit::Body) => {}
+                // A press anywhere else closes it, and goes no further, as
+                // for the other popups.
+                None => self.close_color_picker(),
+            }
+            return;
+        }
         // The font list, the same way: a pick, or a press anywhere else that
         // only closes it.
-        if let Some(menu) = self.font_menu() {
+        if let Some((kind, menu)) = self.font_menu() {
             self.font_menu = None;
             if let Some(&(i, _)) = menu.rows.iter().find(|(_, r)| r.contains([cx, cy])) {
-                let family = fonts::choice(i).map(str::to_string);
-                self.change_shown_title(|t| t.font = family);
+                match kind {
+                    TitleMenu::Font => {
+                        let family = fonts::choice(i).map(str::to_string);
+                        self.change_shown_title(|t| t.font = family);
+                    }
+                    TitleMenu::Weight => {
+                        if let Some(&weight) = self.shown_weights().get(i) {
+                            self.change_shown_title(|t| t.weight = weight);
+                        }
+                    }
+                }
             }
             return;
         }
@@ -341,11 +390,13 @@ impl State {
                         }
                     }
                     Some(EffectsHit::TitleFont) => self.open_font_menu(),
+                    Some(EffectsHit::TitleWeight) => self.open_weight_menu(),
                     Some(EffectsHit::TitleNumber { field, slider }) => {
                         self.begin_edit();
                         self.drag = DragMode::TitleNumber { field, slider };
                         self.update_drag();
                     }
+                    Some(EffectsHit::TitleColorChip(field)) => self.open_color_picker(field),
                     Some(EffectsHit::TitleSwatch { field, swatch }) => {
                         self.change_shown_title(|t| field.set(t, SWATCHES[swatch]));
                     }
@@ -427,9 +478,18 @@ impl State {
                 self.drag = DragMode::ClipTrimRight { track, idx };
             }
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
+                let id = self.timeline.tracks[track].clips[idx].id;
+                let now = std::time::Instant::now();
+                let double = self.last_clip_click.is_some_and(|(last, at)| {
+                    last == id && now.duration_since(at).as_millis() <= DOUBLE_CLICK_MS
+                });
+                self.last_clip_click = (!double).then_some((id, now));
+                if double {
+                    self.open_clip(track, idx);
+                    return;
+                }
                 // A press on one of several selected clips keeps them all
                 // selected, so the drag that follows takes the group.
-                let id = self.timeline.tracks[track].clips[idx].id;
                 let group = self.is_selected(id) && self.selection_with_links().len()
                     > self.linked_siblings(track, idx).len();
                 if !group {
@@ -486,6 +546,8 @@ impl State {
                 let value = spec.at(slider_fraction(slider, self.cursor[0]) as f32);
                 self.set_effect_param(index, param, value);
             }
+            DragMode::PickerSv => self.drag_picker_sv(),
+            DragMode::PickerHue => self.drag_picker_hue(),
             DragMode::TitleNumber { field, slider } => {
                 let value = field.spec().at(slider_fraction(slider, self.cursor[0]) as f32);
                 self.edit_shown_title(|t| field.set(t, value));
@@ -820,10 +882,11 @@ impl State {
     pub(crate) fn wheel(&mut self, dx: f32, dy: f32) {
         // The font list first: it is drawn over the panels, so the wheel over
         // it means it.
-        if let Some(menu) = self.font_menu() {
+        if let Some((kind, menu)) = self.font_menu() {
             if menu.rect.contains(self.cursor) {
-                let rows = self.font_menu.unwrap_or(0).min(menu.max_scroll) as f32 - dy.round();
-                self.font_menu = Some((rows.max(0.0) as usize).min(menu.max_scroll));
+                let scroll = self.font_menu.map_or(0, |(_, s)| s);
+                let rows = scroll.min(menu.max_scroll) as f32 - dy.round();
+                self.font_menu = Some((kind, (rows.max(0.0) as usize).min(menu.max_scroll)));
                 return;
             }
         }

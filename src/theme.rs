@@ -46,6 +46,7 @@ pub(crate) const ICON_COMBINE: char = '\u{E464}'; // group
 pub(crate) const ICON_EDIT: char = '\u{E1F9}'; // pencil
 pub(crate) const ICON_BACK: char = '\u{E048}'; // arrow-left
 pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
+pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -195,6 +196,8 @@ pub(crate) const CLIP_LABEL_SIZE: f32 = TYPE_SM;
 pub(crate) const LABEL_PAD: f32 = 10.0;
 pub(crate) const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 pub(crate) const PLAYHEAD_WIDTH: f32 = 2.0;
+/// Two presses on the same clip at most this far apart are a double-click.
+pub(crate) const DOUBLE_CLICK_MS: u128 = 400;
 /// The timeline's label while a compound clip is open: its name, in the
 /// selection accent, so the timeline says plainly that it is not the edit.
 pub(crate) const COMPOUND_LABEL_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
@@ -451,7 +454,7 @@ pub(crate) const EFFECT_META_COLOR: [f32; 4] = LABEL_COLOR;
 pub(crate) const EFFECT_OFF_COLOR: [f32; 4] = [0.50, 0.50, 0.56, 1.0];
 /// The square on-off and remove buttons of an applied effect.
 pub(crate) const EFFECT_SMALL_BTN: f32 = 22.0;
-pub(crate) const EFFECT_PARAM_LABEL_W: f32 = 64.0;
+pub(crate) const EFFECT_PARAM_LABEL_W: f32 = 82.0;
 pub(crate) const EFFECT_PARAM_VALUE_W: f32 = 52.0;
 /// The parameter rows sit under their effect's name, indented to say so.
 pub(crate) const EFFECT_PARAM_INDENT: f32 = 10.0;
@@ -486,6 +489,24 @@ pub(crate) const TITLE_CARET_COLOR: [f32; 4] = CLIP_LABEL_COLOR;
 pub(crate) const TITLE_SWATCH: f32 = 16.0;
 pub(crate) const TITLE_SWATCH_GAP: f32 = 4.0;
 pub(crate) const TITLE_SWATCH_COLUMNS: usize = 8;
+/// The chip under a colour row's label: the colour in use, which opens the
+/// picker.
+pub(crate) const TITLE_CHIP_W: f32 = 36.0;
+pub(crate) const TITLE_CHIP_H: f32 = 18.0;
+
+// The colour picker.
+pub(crate) const PICKER_SV_H: f32 = 132.0;
+pub(crate) const PICKER_HUE_W: f32 = 16.0;
+pub(crate) const PICKER_GAP: f32 = 8.0;
+pub(crate) const PICKER_ROW_H: f32 = 22.0;
+pub(crate) const PICKER_SWATCH: f32 = 20.0;
+pub(crate) const PICKER_SWATCH_GAP: f32 = 4.0;
+/// The marker on the square and the hue strip.
+pub(crate) const PICKER_MARK: f32 = 8.0;
+pub(crate) const PICKER_MARK_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+pub(crate) const PICKER_MARK_EDGE: [f32; 4] = [0.0, 0.0, 0.0, 0.8];
+/// An empty recent-colour slot.
+pub(crate) const PICKER_EMPTY_SLOT: [f32; 4] = [0.20, 0.20, 0.24, 1.0];
 pub(crate) const TITLE_SWATCH_EDGE: [f32; 4] = [0.40, 0.40, 0.46, 1.0];
 pub(crate) const TITLE_SWATCH_RING: [f32; 4] = CLIP_LABEL_COLOR;
 pub(crate) const TITLE_SWATCH_RING_PX: f32 = 2.0;

@@ -8,7 +8,7 @@ use crate::fmt::truncate_to_width;
 use crate::fonts;
 use crate::input::DragMode;
 use crate::effects::EffectKind;
-use crate::layout::{swatch_rects, EffectsPanel, PoolCell, TitleControl, TitleRow};
+use crate::layout::{color_chip_rect, TitleMenu, swatch_rects, EffectsPanel, PoolCell, TitleControl, TitleRow};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::theme::*;
@@ -26,6 +26,7 @@ impl State {
         let [top, bottom] = panel.visible;
         let idle = matches!(self.drag, DragMode::None)
             && self.font_menu.is_none()
+            && self.color_picker.is_none()
             && (top..bottom).contains(&self.cursor[1]);
         self.quads.set_clip_y(top, bottom);
 
@@ -299,12 +300,18 @@ impl State {
             let label = match control {
                 TitleControl::Text => Some("Text"),
                 TitleControl::Font => Some("Font"),
+                TitleControl::Weight => Some("Weight"),
                 TitleControl::Number(n) => Some(n.spec().name),
                 TitleControl::Color(_) => Some("Colour"),
                 TitleControl::Toggle(_) => None,
             };
             if let Some(label) = label {
-                let baseline = self.centred_baseline(row, EFFECT_META_SIZE);
+                // A colour row's label sits in its top half, over the chip.
+                let band = match control {
+                    TitleControl::Color(_) => Rect { h: row.h * 0.5, ..row },
+                    _ => row,
+                };
+                let baseline = self.centred_baseline(band, EFFECT_META_SIZE);
                 self.text.draw(
                     &self.queue,
                     &mut self.quads,
@@ -324,9 +331,16 @@ impl State {
                         *tooltip = Some((field, "Click to type"));
                     }
                 }
+                TitleControl::Weight => {
+                    let weight = fonts::shown_weight(title.font.as_deref(), title.weight);
+                    let name = fonts::weight_name(weight);
+                    let open = matches!(self.font_menu, Some((TitleMenu::Weight, _)));
+                    let field_hovered = idle && field.contains(self.cursor);
+                    self.draw_field(field, &name, field_hovered, open, Some(ICON_CHEVRON_DOWN));
+                }
                 TitleControl::Font => {
                     let name = title.font.as_deref().unwrap_or("Default");
-                    let open = self.font_menu.is_some();
+                    let open = matches!(self.font_menu, Some((TitleMenu::Font, _)));
                     let field_hovered = idle && field.contains(self.cursor);
                     self.draw_field(field, name, field_hovered, open, Some(ICON_CHEVRON_DOWN));
                 }
@@ -359,6 +373,13 @@ impl State {
                 }
                 TitleControl::Color(c) => {
                     let current = c.get(title);
+                    let chip = color_chip_rect(row);
+                    let open = self.color_picker.as_ref().is_some_and(|p| p.field == c);
+                    let chip_hovered = idle && chip.contains(self.cursor);
+                    self.draw_color_chip(chip, current, chip_hovered, open);
+                    if chip_hovered {
+                        *tooltip = Some((chip, "Pick any colour"));
+                    }
                     for (swatch, rect) in SWATCHES.iter().zip(swatch_rects(field)) {
                         let chosen = swatch[..3]
                             .iter()
@@ -557,10 +578,14 @@ impl State {
     /// The list of installed fonts, dropped from the font box: over
     /// everything, like the project popup.
     pub(crate) fn draw_font_menu(&mut self) {
-        let Some(menu) = State::font_menu(self) else {
+        let Some((kind, menu)) = State::font_menu(self) else {
             return;
         };
-        let current = self.effects_title().and_then(|(_, t)| t.font.clone());
+        let (current, weight) = self
+            .effects_title()
+            .map(|(_, t)| (t.font.clone(), fonts::shown_weight(t.font.as_deref(), t.weight)))
+            .unwrap_or((None, fonts::REGULAR));
+        let weights = self.shown_weights();
         let Rect { x, y, w, h } = menu.rect;
         for step in (1..=MENU_SHADOW_STEPS).rev() {
             let g = step as f32;
@@ -569,20 +594,32 @@ impl State {
         self.quads.push(Quad::colored([x - 1.0, y - 1.0], [w + 2.0, h + 2.0], MENU_BORDER));
         self.quads.push(Quad::colored([x, y], [w, h], MENU_BG));
         for &(i, rect) in &menu.rows {
-            let family = fonts::choice(i);
+            let (label, chosen) = match kind {
+                TitleMenu::Font => {
+                    let family = fonts::choice(i);
+                    (family.unwrap_or("Default").to_string(), family.map(str::to_string) == current)
+                }
+                TitleMenu::Weight => {
+                    let w = weights.get(i).copied().unwrap_or(fonts::REGULAR);
+                    (fonts::weight_name(w), w == weight)
+                }
+            };
             draw_menu_row(
                 &mut self.quads,
                 &mut self.text,
                 &self.queue,
                 rect,
-                family.unwrap_or("Default"),
+                &label,
                 MENU_ROW_SIZE,
                 rect.contains(self.cursor),
-                family.map(str::to_string) == current,
+                chosen,
             );
         }
         // Where in the whole list the rows shown are, along the right edge.
-        let n = fonts::choice_count();
+        let n = match kind {
+            TitleMenu::Font => fonts::choice_count(),
+            TitleMenu::Weight => weights.len(),
+        };
         if menu.max_scroll > 0 {
             let first = menu.rows.first().map_or(0, |r| r.0);
             let track_h = h - MENU_PAD * 2.0;
@@ -594,6 +631,184 @@ impl State {
                 SCROLLBAR_THUMB_COLOR,
             ));
         }
+    }
+
+    /// A colour shown as a chip: a framed square of it. `active` when it is
+    /// what the picker is open on.
+    fn draw_color_chip(&mut self, r: Rect, color: [f32; 4], hovered: bool, active: bool) {
+        let border = if active {
+            TITLE_FIELD_ACTIVE_BORDER
+        } else if hovered {
+            TITLE_FIELD_HOVER_BORDER
+        } else {
+            TITLE_FIELD_BORDER
+        };
+        self.quads.push(Quad::colored([r.x, r.y], [r.w, r.h], border));
+        self.quads.push(Quad::colored([r.x + 1.0, r.y + 1.0], [r.w - 2.0, r.h - 2.0], TITLE_SWATCH_EDGE));
+        self.quads.push(Quad::colored(
+            [r.x + 2.0, r.y + 2.0],
+            [r.w - 4.0, r.h - 4.0],
+            [color[0], color[1], color[2], 1.0],
+        ));
+    }
+
+    /// The colour picker, over everything, like the other popups.
+    pub(crate) fn draw_color_picker(&mut self) {
+        let Some(layout) = self.picker_layout() else {
+            return;
+        };
+        let Some(current) = self.picker_color() else {
+            return;
+        };
+        let Some(picker) = self.color_picker.as_ref() else {
+            return;
+        };
+        let [hue, s, v] = picker.hsv;
+        let hex = picker.hex.clone();
+        let armed = picker.eyedropper;
+        let idle = matches!(self.drag, DragMode::None) && !armed;
+        let cursor = self.cursor;
+
+        let Rect { x, y, w, h } = layout.rect;
+        for step in (1..=MENU_SHADOW_STEPS).rev() {
+            let g = step as f32;
+            self.quads.push(Quad::colored([x - g, y - g + 1.0], [w + g * 2.0, h + g * 2.0], MENU_SHADOW));
+        }
+        self.quads.push(Quad::colored([x - 1.0, y - 1.0], [w + 2.0, h + 2.0], MENU_BORDER));
+        self.quads.push(Quad::colored([x, y], [w, h], MENU_BG));
+
+        // The two gradients, each in a hairline frame, sampled from texel
+        // centre to texel centre so the ends are the colours they claim.
+        for r in [layout.sv, layout.hue] {
+            self.quads.push(Quad::colored([r.x - 1.0, r.y - 1.0], [r.w + 2.0, r.h + 2.0], TITLE_FIELD_BORDER));
+        }
+        let (sv_rect, hue_rect) = (layout.sv, layout.hue);
+        if self.picker_textures().is_some() {
+            let inset = |n: u32| 0.5 / n as f32;
+            let (a, b) = (inset(crate::picker::SV_TEXELS), inset(crate::picker::HUE_TEXELS));
+            let sv_quad = Quad {
+                uv: [a, a, 1.0 - a, 1.0 - a],
+                ..Quad::textured([sv_rect.x, sv_rect.y], [sv_rect.w, sv_rect.h])
+            };
+            let hue_quad = Quad {
+                uv: [0.0, b, 1.0, 1.0 - b],
+                ..Quad::textured([hue_rect.x, hue_rect.y], [hue_rect.w, hue_rect.h])
+            };
+            if let Some(tex) = &self.picker_tex {
+                self.quads.push_with(sv_quad, Some(&tex.sv));
+                self.quads.push_with(hue_quad, Some(&tex.hue));
+            }
+        }
+
+        // Where the colour is on the square: a ring of white in a ring of
+        // black, which reads on any colour, around the colour itself.
+        let mx = (sv_rect.x + s * sv_rect.w).round();
+        let my = (sv_rect.y + (1.0 - v) * sv_rect.h).round();
+        let m = PICKER_MARK;
+        self.quads.push(Quad::colored([mx - m * 0.5 - 1.0, my - m * 0.5 - 1.0], [m + 2.0, m + 2.0], PICKER_MARK_EDGE));
+        self.quads.push(Quad::colored([mx - m * 0.5, my - m * 0.5], [m, m], PICKER_MARK_COLOR));
+        self.quads.push(Quad::colored(
+            [mx - m * 0.5 + 2.0, my - m * 0.5 + 2.0],
+            [m - 4.0, m - 4.0],
+            [current[0], current[1], current[2], 1.0],
+        ));
+        let hy = (hue_rect.y + hue * hue_rect.h).round();
+        self.quads.push(Quad::colored([hue_rect.x - 2.0, hy - 2.5], [hue_rect.w + 4.0, 5.0], PICKER_MARK_EDGE));
+        self.quads.push(Quad::colored([hue_rect.x - 1.0, hy - 1.5], [hue_rect.w + 2.0, 3.0], PICKER_MARK_COLOR));
+
+        // The colour as it is, its hex code, and the eyedropper.
+        self.draw_color_chip(layout.current, current, false, false);
+        let typing = hex.is_some();
+        let shown = format!("#{}", hex.unwrap_or_else(|| crate::color::to_hex(current)));
+        let hex_hovered = idle && layout.hex.contains(cursor);
+        self.draw_field(layout.hex, &shown, hex_hovered, typing, None);
+        if typing {
+            let tw = self.text.measure_width(&shown, TITLE_FIELD_SIZE);
+            let caret_x = (layout.hex.x + TITLE_FIELD_PAD + tw + 1.0).round();
+            let pad = (layout.hex.h - TITLE_TEXT_LINE_H) * 0.5;
+            self.quads.push(Quad::colored(
+                [caret_x, layout.hex.y + pad],
+                [TITLE_CARET_W, TITLE_TEXT_LINE_H],
+                TITLE_CARET_COLOR,
+            ));
+        }
+        let dropper_hovered = layout.eyedropper.contains(cursor) && matches!(self.drag, DragMode::None);
+        let dropper_state = if self.surface_copy_src { BtnState::Toggle(armed) } else { BtnState::Disabled };
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            layout.eyedropper,
+            ICON_PIPETTE,
+            TRANSPORT_ICON_SIZE,
+            dropper_hovered,
+            dropper_state,
+        );
+
+        for (i, r) in layout.swatches.iter().enumerate() {
+            let fill = SWATCHES[i];
+            let hovered = idle && r.contains(cursor);
+            self.draw_swatch(*r, fill, crate::color::same(fill, current), hovered);
+        }
+        for (i, r) in layout.recent.iter().enumerate() {
+            match self.recent_colors.get(i).copied() {
+                Some(fill) => {
+                    let hovered = idle && r.contains(cursor);
+                    self.draw_swatch(*r, fill, false, hovered);
+                }
+                None => self.quads.push(Quad::colored([r.x, r.y], [r.w, r.h], PICKER_EMPTY_SLOT)),
+            }
+        }
+
+        let tooltip = if dropper_hovered {
+            Some((
+                layout.eyedropper,
+                if !self.surface_copy_src {
+                    "Picking from the screen isn't supported here"
+                } else if armed {
+                    "Click anywhere to take its colour"
+                } else {
+                    "Pick a colour from the screen"
+                },
+            ))
+        } else if hex_hovered && !typing {
+            Some((layout.hex, "Click to type a hex code"))
+        } else if idle && layout.recent.iter().take(self.recent_colors.len()).any(|r| r.contains(cursor)) {
+            Some((layout.rect, "Recent colours"))
+        } else {
+            None
+        };
+        if let Some((anchor, label)) = tooltip {
+            let [win_w, _] = self.logical_size();
+            draw_tooltip(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                anchor,
+                label,
+                TRANSPORT_TOOLTIP_SIZE,
+                TooltipSide::Below,
+                win_w,
+            );
+        }
+    }
+
+    /// One colour swatch: a hairline edge so black reads on the dark
+    /// panel, and a ring when it is the colour in use or under the cursor.
+    fn draw_swatch(&mut self, r: Rect, fill: [f32; 4], chosen: bool, hovered: bool) {
+        let ring = if chosen {
+            Some(TITLE_SWATCH_RING)
+        } else if hovered {
+            Some(TITLE_FIELD_HOVER_BORDER)
+        } else {
+            None
+        };
+        if let Some(ring) = ring {
+            let g = TITLE_SWATCH_RING_PX;
+            self.quads.push(Quad::colored([r.x - g, r.y - g], [r.w + g * 2.0, r.h + g * 2.0], ring));
+        }
+        self.quads.push(Quad::colored([r.x, r.y], [r.w, r.h], TITLE_SWATCH_EDGE));
+        self.quads.push(Quad::colored([r.x + 1.0, r.y + 1.0], [r.w - 2.0, r.h - 2.0], fill));
     }
 
     fn section_baseline(&self, top: f32) -> f32 {
