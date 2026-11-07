@@ -276,6 +276,9 @@ impl ApplicationHandler for App {
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),
                     KeyCode::KeyF if !ctrl => state.freeze_frame(),
+                    KeyCode::KeyR if !ctrl => {
+                        state.ripple_enabled = !state.ripple_enabled;
+                    }
                     KeyCode::KeyN if !ctrl => {
                         state.snap_enabled = !state.snap_enabled;
                     }

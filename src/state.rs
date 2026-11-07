@@ -123,6 +123,7 @@ pub(crate) struct State {
     pub(crate) timeline_undo_btn: Rect,
     pub(crate) timeline_redo_btn: Rect,
     pub(crate) timeline_snap_btn: Rect,
+    pub(crate) timeline_ripple_btn: Rect,
     pub(crate) timeline_zoom_out_btn: Rect,
     /// The whole zoom slider, groove and knob: a press anywhere along it
     /// takes hold.
@@ -171,6 +172,12 @@ pub(crate) struct State {
     /// is zoomed, and without an escape hatch a clip could not be parked near
     /// a neighbour without latching onto it.
     pub(crate) snap_enabled: bool,
+    /// Whether trimming a clip moves everything after it along with its end,
+    /// so lengthening one pushes the rest of the edit later instead of over
+    /// the next clip. Off to start with: a plain trim is the safer surprise.
+    pub(crate) ripple_enabled: bool,
+    /// The trim in flight, when it ripples.
+    pub(crate) ripple_trim: Option<crate::edit::RippleTrim>,
     /// The timeline's visible window: the time at the left edge of the clip
     /// area, and the span it covers.
     ///
@@ -332,6 +339,7 @@ impl State {
             timeline_undo_btn: Rect::default(),
             timeline_redo_btn: Rect::default(),
             timeline_snap_btn: Rect::default(),
+            timeline_ripple_btn: Rect::default(),
             timeline_zoom_out_btn: Rect::default(),
             timeline_zoom_slider: Rect::default(),
             timeline_zoom_in_btn: Rect::default(),
@@ -354,6 +362,8 @@ impl State {
             export: None,
             status: None,
             snap_enabled: true,
+            ripple_enabled: false,
+            ripple_trim: None,
             view_start: 0.0,
             view_dur: f64::INFINITY,
             pool_open_btn: Rect::default(),
@@ -451,9 +461,9 @@ impl State {
         match self.drag {
             DragMode::Splitter(s) => splitter_cursor(s),
             DragMode::ClipLevel { .. } => CursorIcon::RowResize,
-            DragMode::ClipTrimLeft { .. }
-            | DragMode::ClipTrimRight { .. }
-            | DragMode::ClipFade { .. } => CursorIcon::ColResize,
+            DragMode::ClipTrimLeft { .. } => CursorIcon::WResize,
+            DragMode::ClipTrimRight { .. } => CursorIcon::EResize,
+            DragMode::ClipFade { .. } => CursorIcon::ColResize,
             DragMode::ClipMoveOnCanvas { .. } | DragMode::Pan { .. } => CursorIcon::Grabbing,
             DragMode::ClipScaleOnCanvas { corner, .. } => {
                 if corner[0] == corner[1] {
@@ -468,6 +478,7 @@ impl State {
             | DragMode::EffectDrag { .. }
             | DragMode::EffectParam { .. }
             | DragMode::TitleNumber { .. }
+            | DragMode::Transform { .. }
             | DragMode::PickerSv
             | DragMode::PickerHue
             | DragMode::Scrollbar { .. }
@@ -518,9 +529,11 @@ impl State {
         match self.timeline_hit(self.cursor[0], self.cursor[1]) {
             // The level line is the one handle that travels vertically.
             TimelineHit::ClipLevel { .. } => CursorIcon::RowResize,
-            TimelineHit::ClipTrimLeft { .. }
-            | TimelineHit::ClipTrimRight { .. }
-            | TimelineHit::ClipFade { .. } => CursorIcon::ColResize,
+            // Which side of the join is about to move: the bar on the left
+            // is a clip's start, on the right its end.
+            TimelineHit::ClipTrimLeft { .. } => CursorIcon::WResize,
+            TimelineHit::ClipTrimRight { .. } => CursorIcon::EResize,
+            TimelineHit::ClipFade { .. } => CursorIcon::ColResize,
             _ => CursorIcon::Default,
         }
     }
@@ -532,7 +545,21 @@ impl State {
     /// Undoable: an import only adds a pool row, so undo hides it again.
     /// Callers importing a batch should wrap the whole batch in their own
     /// begin/commit pair to get one step for the batch.
+    ///
+    /// A file already in the pool is not added twice. One that was removed
+    /// from it is listed again as it was, rather than opened afresh.
     pub(crate) fn import_file(&mut self, path: &str) {
+        if let Some(id) = self.media.find_path(path) {
+            if self.media.is_shown(id) {
+                let name = self.media.get(id).map_or(String::new(), |s| s.name.clone());
+                self.set_status(format!("{name} is already in the pool"), STATUS_INFO);
+                return;
+            }
+            self.begin_edit();
+            self.media.show(id);
+            self.commit_edit();
+            return;
+        }
         self.begin_edit();
         import_source(&mut self.media, path, &self.device, &self.queue, &self.quads);
         self.commit_edit();

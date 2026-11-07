@@ -8,14 +8,14 @@
 use crate::effects::EffectKind;
 use crate::fonts;
 use crate::layout::{
-    resolve_split, track_header_button, y_to_gain, y_to_opacity, EffectsHit, PickerHit, PoolTab,
-    PoolView, TitleMenu,
+    resolve_split, track_header_button, transform_fraction, transform_value, y_to_gain,
+    y_to_opacity, EffectsHit, PickerHit, PoolTab, PoolView, TitleMenu,
     TitleControl,
     PreviewHit, Splitter, TimelineHit,
 };
 use crate::state::State;
 use crate::theme::*;
-use crate::timeline::{Clip, FadeSide, SourceId, TrackKind, Transform};
+use crate::timeline::{Clip, FadeSide, SourceId, TrackKind, Transform, TransformField};
 use crate::title::{TitleNumber, SWATCHES};
 use crate::ui::Rect;
 
@@ -33,6 +33,9 @@ pub(crate) enum DragMode {
     /// Dragging one of a title's sliders on the effects tab. One undo step,
     /// opened at the press and closed in `end_drag`, as for an effect's.
     TitleNumber { field: TitleNumber, slider: Rect },
+    /// Dragging one of the placement sliders, for every selected picture.
+    /// One undo step, as for the others.
+    Transform { field: TransformField, slider: Rect },
     /// Selecting in a title's text box by dragging across it. `field` is the
     /// box as the press found it.
     TextSelect { field: Rect },
@@ -272,6 +275,10 @@ impl State {
             self.snap_enabled = !self.snap_enabled;
             return;
         }
+        if self.timeline_ripple_btn.contains([cx, cy]) {
+            self.ripple_enabled = !self.ripple_enabled;
+            return;
+        }
         if self.timeline_zoom_out_btn.contains([cx, cy]) {
             self.zoom_at_playhead(-1.0);
             return;
@@ -426,6 +433,12 @@ impl State {
                         self.drag = DragMode::TitleNumber { field, slider };
                         self.update_drag();
                     }
+                    Some(EffectsHit::Transform { field, slider }) => {
+                        self.begin_edit();
+                        self.drag = DragMode::Transform { field, slider };
+                        self.update_drag();
+                    }
+                    Some(EffectsHit::TransformReset) => self.reset_selected_transform(),
                     Some(EffectsHit::TitleColorChip(field)) => self.open_color_picker(field),
                     Some(EffectsHit::TitleSwatch { field, swatch }) => {
                         self.change_shown_title(|t| field.set(t, SWATCHES[swatch]));
@@ -504,11 +517,13 @@ impl State {
             TimelineHit::ClipTrimLeft { track, idx } => {
                 self.select_clip_at(track, idx);
                 self.begin_edit();
+                self.begin_ripple_trim(track, idx);
                 self.drag = DragMode::ClipTrimLeft { track, idx };
             }
             TimelineHit::ClipTrimRight { track, idx } => {
                 self.select_clip_at(track, idx);
                 self.begin_edit();
+                self.begin_ripple_trim(track, idx);
                 self.drag = DragMode::ClipTrimRight { track, idx };
             }
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
@@ -599,6 +614,25 @@ impl State {
                 let value = field.spec().at(slider_fraction(slider, self.cursor[0]) as f32);
                 self.edit_shown_title(|t| field.set(t, value));
             }
+            DragMode::Transform { field, slider } => {
+                let Some((track, idx)) = self.effects_target() else {
+                    return;
+                };
+                let clip = self.timeline.tracks[track].clips[idx];
+                let reach = self.transform_reach(&clip);
+                let fraction = slider_fraction(slider, self.cursor[0]) as f32;
+                // Centred, and 100%, are where a placement most often wants
+                // to be put back to, and a slider is hard to stop on exactly.
+                let rest = if field == TransformField::Zoom { 1.0 } else { 0.0 };
+                let value = if self.snap_enabled
+                    && (fraction - transform_fraction(field, rest, reach)).abs() < TRANSFORM_SLIDER_SNAP
+                {
+                    rest
+                } else {
+                    transform_value(field, fraction, reach)
+                };
+                self.set_selected_transform(field, value);
+            }
             DragMode::Scrub => self.apply_scrub(),
             DragMode::Pan { grab_x, start } => {
                 let px_per_sec = self.timeline_layout().px_per_sec();
@@ -684,6 +718,10 @@ impl State {
             DragMode::ClipTrimLeft { track, idx } => {
                 let layout = self.timeline_layout();
                 let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                if self.ripple_trim.is_some() {
+                    self.apply_ripple_trim_left(track, idx, cursor_t);
+                    return;
+                }
                 let current_start = self.timeline.tracks[track].clips[idx].timeline_start;
                 let desired_delta = cursor_t - current_start;
                 self.apply_trim_left_delta(track, idx, desired_delta);
@@ -785,6 +823,7 @@ impl State {
     }
 
     pub(crate) fn end_drag(&mut self) {
+        self.ripple_trim = None;
         // A click on one of several selected clips that never became a drag
         // picks that clip alone, as a click on any other clip does.
         if let DragMode::ClipMove { track, idx, group: true, moved: false, .. } = self.drag {

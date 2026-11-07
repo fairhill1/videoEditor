@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::effects::EffectStack;
@@ -15,11 +17,16 @@ pub const MIN_OPACITY: f32 = 0.0;
 pub const MAX_OPACITY: f32 = 1.0;
 
 /// How far a clip's picture may be scaled off its default fit. The floor keeps
-/// a clip that has been shrunk to nothing still grabbable; the ceiling is what
-/// bounds the intermediate the export scales through, which is why it is a
-/// constant here rather than a number the drag happens to stop at.
+/// a clip that has been shrunk to nothing still grabbable. The ceiling leaves
+/// room to zoom well into footage cropped to another shape — landscape into a
+/// vertical canvas fills it at about 316% before any zoom of its own — and
+/// costs nothing in the renderers: the export cuts out the part on canvas
+/// before it scales, and blurs at the source's own size, so neither works on
+/// a picture bigger than the source or the canvas however far in this goes.
+/// Kept a constant here rather than a number the drag happens to stop at, and
+/// 0.05 to 20 puts 100% in the middle of the zoom slider's log scale.
 pub const MIN_SCALE: f32 = 0.05;
-pub const MAX_SCALE: f32 = 4.0;
+pub const MAX_SCALE: f32 = 20.0;
 
 /// The level line's range, in decibels. The bottom is a floor rather than true
 /// silence: it keeps the dB mapping finite, and a clip you want actually silent
@@ -69,6 +76,42 @@ pub struct Transform {
 impl Default for Transform {
     fn default() -> Self {
         Self { x: 0.0, y: 0.0, scale: 1.0 }
+    }
+}
+
+/// One of a placement's numbers, as the effects tab's sliders set them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TransformField {
+    Zoom,
+    X,
+    Y,
+}
+
+impl TransformField {
+    pub const ALL: [TransformField; 3] = [Self::Zoom, Self::X, Self::Y];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Zoom => "Zoom",
+            Self::X => "Position X",
+            Self::Y => "Position Y",
+        }
+    }
+
+    pub fn get(self, t: &Transform) -> f32 {
+        match self {
+            Self::Zoom => t.scale,
+            Self::X => t.x,
+            Self::Y => t.y,
+        }
+    }
+
+    pub fn set(self, t: &mut Transform, value: f32) {
+        match self {
+            Self::Zoom => t.scale = value,
+            Self::X => t.x = value,
+            Self::Y => t.y = value,
+        }
     }
 }
 
@@ -600,6 +643,49 @@ impl Timeline {
 }
 
 impl Timeline {
+    /// The clips a ripple from `t` carries: every one starting at or after
+    /// it, on every track, but those in `skip` — the clip being trimmed and
+    /// what is linked to it, whose ends move by trimming instead.
+    pub fn followers(&self, t: f64, skip: &HashSet<u32>) -> HashSet<u32> {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .filter(|c| c.timeline_start >= t - EDIT_POINT_EPS && !skip.contains(&c.id))
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// How far `followers` can move earlier together: until one of them runs
+    /// into a clip that stays where it is on its own track, or into the start
+    /// of the timeline. Clips in `trimmed` stay at their start but take their
+    /// end along with the followers, so they never close in on one.
+    pub fn ripple_room(&self, followers: &HashSet<u32>, trimmed: &HashSet<u32>) -> f64 {
+        let mut room = f64::INFINITY;
+        for track in &self.tracks {
+            for f in track.clips.iter().filter(|c| followers.contains(&c.id)) {
+                room = room.min(f.timeline_start);
+                for s in &track.clips {
+                    if followers.contains(&s.id) || trimmed.contains(&s.id) {
+                        continue;
+                    }
+                    if s.timeline_end() <= f.timeline_start + EDIT_POINT_EPS {
+                        room = room.min(f.timeline_start - s.timeline_end());
+                    }
+                }
+            }
+        }
+        room.max(0.0)
+    }
+
+    /// Move the clips called `ids` by `delta` seconds.
+    pub fn shift_clips(&mut self, ids: &HashSet<u32>, delta: f64) {
+        for track in &mut self.tracks {
+            for clip in track.clips.iter_mut().filter(|c| ids.contains(&c.id)) {
+                clip.timeline_start += delta;
+            }
+        }
+    }
+
     /// Make room for `len` seconds at `t`: cut the clips `which` picks where
     /// they cross `t`, then move every clip starting at or after `t` that much
     /// later, on every track, so the rest of the edit keeps its timing against
@@ -751,6 +837,34 @@ mod tests {
         let from_compound = all.iter().find(|c| c.source == SourceId(3)).unwrap();
         assert_eq!(from_compound.timeline_start, 11.0);
         assert!(all.iter().any(|c| c.source == SourceId(4)));
+    }
+
+    #[test]
+    fn a_ripple_carries_what_follows_and_stops_short_of_what_stays() {
+        let mut tl = Timeline::new();
+        tl.push_track(TrackKind::Video);
+        tl.push_track(TrackKind::Audio);
+        let freeze = Clip { id: tl.new_clip_id(), ..clip(4.0, 2.0) };
+        let after = Clip { id: tl.new_clip_id(), ..clip(6.0, 4.0) };
+        let before = Clip { id: tl.new_clip_id(), ..clip(0.0, 4.0) };
+        // Music: one clip across the edit, which stays, and one after it
+        // with a second's gap, which follows.
+        let bed = Clip { id: tl.new_clip_id(), ..clip(0.0, 7.0) };
+        let next = Clip { id: tl.new_clip_id(), ..clip(8.0, 2.0) };
+        tl.tracks[0].clips = vec![before, freeze, after];
+        tl.tracks[1].clips = vec![bed, next];
+
+        let trimmed: HashSet<u32> = [freeze.id].into();
+        let followers = tl.followers(freeze.timeline_end(), &trimmed);
+        assert_eq!(followers, [after.id, next.id].into());
+        // The freeze's own end goes with `after`, so only the music's gap
+        // limits a shortening.
+        assert_eq!(tl.ripple_room(&followers, &trimmed), 1.0);
+        tl.shift_clips(&followers, 3.0);
+        let (t, i) = tl.find(after.id).unwrap();
+        assert_eq!(tl.tracks[t].clips[i].timeline_start, 9.0);
+        let (t, i) = tl.find(next.id).unwrap();
+        assert_eq!(tl.tracks[t].clips[i].timeline_start, 11.0);
     }
 
     #[test]

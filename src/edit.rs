@@ -5,6 +5,8 @@
 //! deltas. That split is what lets a keyboard shortcut and a drag share one
 //! implementation of "move this clip".
 
+use std::collections::HashSet;
+
 use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
 use crate::input::DragMode;
 use crate::state::State;
@@ -16,8 +18,18 @@ use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_INFO};
 use crate::title::Title;
 use crate::timeline::{
     db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Tracks, Transform,
+    TransformField,
     MAX_GAIN_DB, MAX_OPACITY, MAX_SCALE, MIN_GAIN_DB, MIN_OPACITY, MIN_SCALE,
 };
+
+/// A trim that ripples, as its press found things.
+pub(crate) struct RippleTrim {
+    /// Every clip after the trimmed one, which moves with its end.
+    pub(crate) followers: HashSet<u32>,
+    /// Where the trimmed clip started, and where in its source.
+    pub(crate) start: f64,
+    pub(crate) source_in: f64,
+}
 
 /// Keyboard steps for the level line, coarse and fine. Audio moves in decibels
 /// and the picture in opacity, so the two have their own pairs rather than one
@@ -350,7 +362,13 @@ impl State {
     /// snap target, as a moved clip's edges do. `start` says which edge: the
     /// left trim moves starts, the right trim ends. Every linked sibling's edge
     /// competes, since the same delta moves them all.
-    fn snap_trim_delta(&self, siblings: &[(usize, usize)], delta: f64, start: bool) -> f64 {
+    fn snap_trim_delta(
+        &self,
+        siblings: &[(usize, usize)],
+        exclude: &[(usize, usize)],
+        delta: f64,
+        start: bool,
+    ) -> f64 {
         let Some(threshold) = self.timeline_snap_threshold() else {
             return delta;
         };
@@ -361,7 +379,7 @@ impl State {
                 delta + if start { c.timeline_start } else { c.timeline_end() }
             })
             .collect();
-        let targets = self.snap_targets(siblings);
+        let targets = self.snap_targets(exclude);
         delta + nearest_snap(&edges, &targets, threshold).unwrap_or(0.0)
     }
 
@@ -429,7 +447,7 @@ impl State {
         // Snapped first, then held to the limits: a target past the start of
         // the source or through the clip's own end is not one it can reach.
         let delta = self
-            .snap_trim_delta(&siblings, desired_delta, true)
+            .snap_trim_delta(&siblings, &siblings, desired_delta, true)
             .clamp(min_delta, max_delta);
         for (ti, ci) in siblings {
             let c = &mut self.timeline.tracks[ti].clips[ci];
@@ -455,14 +473,84 @@ impl State {
             };
             max_delta = max_delta.min(src_dur - c.source_out);
         }
+        // Rippling, what follows moves with the end: it can shorten only as
+        // far as they can move back, and the followers' own edges, which
+        // travel with it, are nothing to snap to.
+        let mut exclude = siblings.clone();
+        let followers = self.ripple_trim.as_ref().map(|r| r.followers.clone());
+        if let Some(followers) = &followers {
+            min_delta = min_delta.max(-self.timeline.ripple_room(followers, &self.ids_of(&siblings)));
+            exclude.extend(self.positions_of(followers));
+        }
         let delta = self
-            .snap_trim_delta(&siblings, desired_delta, false)
+            .snap_trim_delta(&siblings, &exclude, desired_delta, false)
             .clamp(min_delta, max_delta);
         for (ti, ci) in siblings {
             let c = &mut self.timeline.tracks[ti].clips[ci];
             c.source_out += delta;
             c.clamp_fades();
         }
+        if let Some(followers) = &followers {
+            self.timeline.shift_clips(followers, delta);
+        }
+    }
+
+    /// Start a trim of `(track, idx)` that ripples, when rippling is on:
+    /// note the clips after it, which move with its end for the whole drag,
+    /// and where its head was, which a ripple from the start measures from.
+    pub(crate) fn begin_ripple_trim(&mut self, track: usize, idx: usize) {
+        self.ripple_trim = None;
+        if !self.ripple_enabled {
+            return;
+        }
+        let siblings = self.linked_siblings(track, idx);
+        let trimmed = self.ids_of(&siblings);
+        let clip = self.timeline.tracks[track].clips[idx];
+        let end = siblings
+            .iter()
+            .map(|&(t, i)| self.timeline.tracks[t].clips[i].timeline_end())
+            .fold(clip.timeline_end(), f64::max);
+        self.ripple_trim = Some(RippleTrim {
+            followers: self.timeline.followers(end, &trimmed),
+            start: clip.timeline_start,
+            source_in: clip.source_in,
+        });
+    }
+
+    /// Trim the head of `(track, idx)` to the cursor at `cursor_t`, rippling:
+    /// the clip stays where it starts and shows more or less of its source
+    /// from there, and everything after it moves to keep up.
+    pub(crate) fn apply_ripple_trim_left(&mut self, track: usize, idx: usize, cursor_t: f64) {
+        let Some(ripple) = &self.ripple_trim else {
+            return;
+        };
+        let followers = ripple.followers.clone();
+        let target = ripple.source_in + (cursor_t - ripple.start);
+        let siblings = self.linked_siblings(track, idx);
+        let mut delta = target - self.timeline.tracks[track].clips[idx].source_in;
+        let room = self.timeline.ripple_room(&followers, &self.ids_of(&siblings));
+        let mut max_delta = room;
+        let mut min_delta = f64::NEG_INFINITY;
+        for &(ti, ci) in &siblings {
+            let c = &self.timeline.tracks[ti].clips[ci];
+            min_delta = min_delta.max(-c.source_in);
+            max_delta = max_delta.min(c.duration() - MIN_CLIP_DURATION);
+        }
+        delta = delta.clamp(min_delta, max_delta.max(min_delta));
+        for (ti, ci) in siblings {
+            let c = &mut self.timeline.tracks[ti].clips[ci];
+            c.source_in += delta;
+            c.clamp_fades();
+        }
+        self.timeline.shift_clips(&followers, -delta);
+    }
+
+    fn ids_of(&self, at: &[(usize, usize)]) -> HashSet<u32> {
+        at.iter().map(|&(t, i)| self.timeline.tracks[t].clips[i].id).collect()
+    }
+
+    fn positions_of(&self, ids: &HashSet<u32>) -> Vec<(usize, usize)> {
+        ids.iter().filter_map(|id| self.timeline.find(*id)).collect()
     }
 
     /// Set a clip's level.
@@ -484,11 +572,8 @@ impl State {
         clip.opacity = opacity.clamp(MIN_OPACITY, MAX_OPACITY);
     }
 
-    /// Replace a clip's transform, clamped to what can be rendered.
-    ///
-    /// The scale bound is not cosmetic: it is what caps the intermediate the
-    /// export scales a placed clip through, so a stray drag cannot ask the
-    /// renderer for a picture the size of a wall.
+    /// Replace a clip's transform, its zoom held to [`MIN_SCALE`] and
+    /// [`MAX_SCALE`].
     pub(crate) fn set_clip_transform(&mut self, track: usize, idx: usize, transform: Transform) {
         let clip = &mut self.timeline.tracks[track].clips[idx];
         clip.transform = Transform {
@@ -673,6 +758,40 @@ impl State {
                     self.set_clip_opacity(track, idx, clip.opacity + dir * step);
                 }
             }
+        }
+        self.commit_edit();
+    }
+
+    /// The pictures of the selected clips, each once: what the transform
+    /// sliders act on, so a recording split into pieces can be placed once
+    /// for all of them.
+    pub(crate) fn selected_pictures(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for id in &self.selected {
+            if let Some(p) = self.timeline.find(*id).and_then(|(t, i)| self.effects_clip_for(t, i)) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// Set `field` of the placement on every selected picture to `value`.
+    /// Part of whatever edit is open; the slider opens one per drag.
+    pub(crate) fn set_selected_transform(&mut self, field: TransformField, value: f32) {
+        for (t, i) in self.selected_pictures() {
+            let mut transform = self.timeline.tracks[t].clips[i].transform;
+            field.set(&mut transform, value);
+            self.set_clip_transform(t, i, transform);
+        }
+    }
+
+    /// Put every selected picture back centred and fitted.
+    pub(crate) fn reset_selected_transform(&mut self) {
+        self.begin_edit();
+        for (t, i) in self.selected_pictures() {
+            self.set_clip_transform(t, i, Transform::default());
         }
         self.commit_edit();
     }

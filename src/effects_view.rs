@@ -8,11 +8,15 @@ use crate::fmt::truncate_to_width;
 use crate::fonts;
 use crate::input::DragMode;
 use crate::effects::EffectKind;
-use crate::layout::{color_chip_rect, TitleMenu, swatch_rects, EffectsPanel, PoolCell, TitleControl, TitleRow};
+use crate::layout::{
+    color_chip_rect, swatch_rects, transform_fraction, EffectsPanel, PoolCell, TitleControl, TitleMenu,
+    TitleRow,
+};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::textedit::Cursor;
 use crate::theme::*;
+use crate::timeline::Clip;
 use crate::title::{self, Title, TitleColor, TitleNumber, TitlePart, SWATCHES};
 use crate::ui::{
     draw_button, draw_menu_row, draw_slider, draw_tooltip, BtnState, Rect, TooltipSide,
@@ -115,13 +119,17 @@ impl State {
         let clip = self.timeline.tracks[track].clips[idx];
         if let Some(src) = self.media.get(clip.source) {
             let x = LABEL_PAD + heading_w + 8.0;
-            // Several titles selected are styled together; the heading says
-            // so, since the panel shows only the first of them.
-            let others = self.styled_titles().len().saturating_sub(1);
-            let label = match others {
-                0 => src.name.clone(),
-                1 => format!("{} + 1 more title", src.name),
-                n => format!("{} + {n} more titles", src.name),
+            // Several titles selected are styled together, and several
+            // clips placed together; the heading says so, since the panel
+            // shows only the first of them.
+            let titles = self.styled_titles().len().saturating_sub(1);
+            let clips = self.selected_pictures().len().saturating_sub(1);
+            let label = match (titles, clips) {
+                (0, 0) => src.name.clone(),
+                (1, _) => format!("{} + 1 more title", src.name),
+                (n, _) if n > 1 => format!("{} + {n} more titles", src.name),
+                (_, 1) => format!("{} + 1 more clip", src.name),
+                (_, n) => format!("{} + {n} more clips", src.name),
             };
             let name = truncate_to_width(&self.text, &label, EFFECTS_SECTION_SIZE, pool_right - x);
             let baseline = self.section_baseline(panel.clip_heading_y);
@@ -138,6 +146,7 @@ impl State {
             let title = title.clone();
             self.draw_title_settings(panel, &title, idle, tooltip);
         }
+        self.draw_transform(panel, &clip, idle, tooltip);
         if clip.effects.is_empty() {
             self.draw_hint(panel.hint_y, "No effects yet. Drag one onto the clip, or press +.");
             return;
@@ -228,6 +237,79 @@ impl State {
                     color,
                 );
             }
+        }
+    }
+
+    /// Where the clip sits on the canvas: its zoom and its position, each a
+    /// slider, under a heading with a button that puts it back.
+    fn draw_transform(
+        &mut self,
+        panel: &EffectsPanel,
+        clip: &Clip,
+        idle: bool,
+        tooltip: &mut Option<(Rect, &'static str)>,
+    ) {
+        let Some(t) = &panel.transform else {
+            return;
+        };
+        let g = t.group;
+        self.quads.push(Quad::colored([g.x, g.y], [g.w, g.h], POOL_ROW_COLOR));
+        let baseline = self.centred_baseline(t.heading, EFFECT_NAME_SIZE);
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [t.heading.x + EFFECT_PARAM_INDENT, baseline],
+            "Transform",
+            EFFECT_NAME_SIZE,
+            CLIP_LABEL_COLOR,
+        );
+        let placed = clip.transform != crate::timeline::Transform::default();
+        let reset_hovered = idle && t.reset.contains(self.cursor);
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            t.reset,
+            ICON_RESET,
+            TRANSPORT_ICON_SIZE,
+            reset_hovered,
+            if placed { BtnState::Normal } else { BtnState::Disabled },
+        );
+        if reset_hovered {
+            *tooltip = Some((t.reset, "Reset: centred, at 100%"));
+        }
+
+        let reach = self.transform_reach(clip);
+        for r in &t.rows {
+            let value = r.field.get(&clip.transform);
+            let baseline = self.centred_baseline(r.row, EFFECT_META_SIZE);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [r.row.x + EFFECT_PARAM_INDENT, baseline],
+                r.field.name(),
+                EFFECT_META_SIZE,
+                EFFECT_META_COLOR,
+            );
+            let dragging = matches!(self.drag, DragMode::Transform { field, .. } if field == r.field);
+            let knob = if dragging {
+                SCROLLBAR_THUMB_ACTIVE_COLOR
+            } else if idle && r.row.contains(self.cursor) {
+                SCROLLBAR_THUMB_HOVER_COLOR
+            } else {
+                SCROLLBAR_THUMB_COLOR
+            };
+            draw_slider(&mut self.quads, r.slider, transform_fraction(r.field, value, reach), knob);
+            let text = self.format_transform(r.field, value);
+            let tw = self.text.measure_width(&text, EFFECT_META_SIZE);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [(r.row.x + r.row.w - POOL_ROW_PAD - tw).round(), baseline],
+                &text,
+                EFFECT_META_SIZE,
+                CLIP_LABEL_COLOR,
+            );
         }
     }
 

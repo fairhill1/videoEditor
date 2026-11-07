@@ -49,6 +49,8 @@ pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
 pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
 pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
 pub(crate) const ICON_FREEZE: char = '\u{E165}'; // snowflake
+pub(crate) const ICON_RESET: char = '\u{E148}'; // rotate-ccw
+pub(crate) const ICON_RIPPLE: char = '\u{E458}'; // arrow-right-from-line
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -113,6 +115,9 @@ pub(crate) const CANVAS_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 pub(crate) const TRANSFORM_OUTLINE_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
 pub(crate) const TRANSFORM_OUTLINE_PX: f32 = 1.0;
 pub(crate) const TRANSFORM_HANDLE_BOX: f32 = 10.0;
+/// How near, as a fraction of the slider, a transform slider has to come to
+/// centred (or to 100% zoom) to land on it while snapping is on.
+pub(crate) const TRANSFORM_SLIDER_SNAP: f32 = 0.015;
 pub(crate) const TIMELINE_COLOR: [f32; 4] = SURFACE_BASE;
 pub(crate) const LANE_COLOR: [f32; 4] = SURFACE_LANE;
 // Edge between two panels, lighter than both — the flat-UI way to define a

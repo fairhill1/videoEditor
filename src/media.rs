@@ -355,6 +355,34 @@ impl MediaPool {
             .collect();
     }
 
+    /// The source opened from the file at `path`, shown in the pool or not.
+    /// Paths are compared as the files they name, so the same file reached
+    /// through a symlink or a `..` is still the same file.
+    pub fn find_path(&self, path: &str) -> Option<SourceId> {
+        let same = |a: &str| {
+            a == path
+                || matches!(
+                    (std::fs::canonicalize(a), std::fs::canonicalize(path)),
+                    (Ok(x), Ok(y)) if x == y
+                )
+        };
+        self.all_ids()
+            .into_iter()
+            .find(|id| self.sources.get(id).is_some_and(|s| !s.path.is_empty() && same(&s.path)))
+    }
+
+    /// Whether `id` is listed in the pool, rather than held back for undo.
+    pub fn is_shown(&self, id: SourceId) -> bool {
+        self.order.contains(&id)
+    }
+
+    /// List `id` in the pool again, at the end, after a removal hid it.
+    pub fn show(&mut self, id: SourceId) {
+        if self.sources.contains_key(&id) && !self.order.contains(&id) {
+            self.order.push(id);
+        }
+    }
+
     pub fn get(&self, id: SourceId) -> Option<&Source> {
         self.sources.get(&id)
     }
@@ -434,4 +462,39 @@ fn file_name(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_found_by_any_path_to_it_shown_or_not() {
+        let dir = std::env::temp_dir().join(format!("ruve_find_path_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.join("link.mp4");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let path = file.to_str().unwrap();
+
+        let mut pool = MediaPool::new();
+        pool.add_title(Title::default());
+        let id = pool.insert(Source::empty("clip.mp4".into(), path.to_string()));
+        assert_eq!(pool.find_path(path), Some(id));
+        assert_eq!(pool.find_path(link.to_str().unwrap()), Some(id));
+        let dotted = dir.join("..").join(dir.file_name().unwrap()).join("clip.mp4");
+        assert_eq!(pool.find_path(dotted.to_str().unwrap()), Some(id));
+        assert_eq!(pool.find_path(dir.join("other.mp4").to_str().unwrap()), None);
+
+        // Removed, it is still found, and showing it lists it once.
+        pool.remove(id);
+        assert!(!pool.is_shown(id));
+        assert_eq!(pool.find_path(path), Some(id));
+        pool.show(id);
+        pool.show(id);
+        assert_eq!(pool.ids().iter().filter(|x| **x == id).count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

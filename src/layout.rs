@@ -12,8 +12,8 @@ use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::*;
 use crate::timeline::{
-    db_to_gain, gain_to_db, Clip, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MAX_OPACITY,
-    MIN_GAIN_DB, MIN_OPACITY,
+    db_to_gain, gain_to_db, Clip, FadeSide, SourceId, TrackKind, TransformField, MAX_GAIN_DB,
+    MAX_OPACITY, MIN_GAIN_DB, MIN_OPACITY, MAX_SCALE, MIN_SCALE,
 };
 use crate::title::{Title, TitleColor, TitleNumber, TitlePart, SWATCHES};
 use crate::ui::Rect;
@@ -556,6 +556,83 @@ pub(crate) struct TitleRow {
     pub(crate) field: Rect,
 }
 
+/// The selected clip's placement on the effects tab: a heading with a reset
+/// button, then a slider for each of its numbers.
+#[derive(Clone, Debug)]
+pub(crate) struct TransformRows {
+    /// The whole block, heading and sliders.
+    pub(crate) group: Rect,
+    pub(crate) heading: Rect,
+    pub(crate) reset: Rect,
+    pub(crate) rows: Vec<TransformRow>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct TransformRow {
+    pub(crate) field: TransformField,
+    pub(crate) row: Rect,
+    pub(crate) slider: Rect,
+}
+
+/// How far a position slider reaches either way, in canvas widths (or
+/// heights) for a picture `extent` of them across: to where the picture just
+/// leaves the canvas, and never less than half a canvas, so a small overlay
+/// can still be put in a corner.
+pub(crate) fn offset_reach(extent: f32) -> f32 {
+    ((extent + 1.0) * 0.5).max(0.5)
+}
+
+/// Where `value` sits along `field`'s slider, 0 to 1. `reach` is how far the
+/// position sliders go, across and down; see [`offset_reach`].
+///
+/// Zoom runs on a log scale: halving and doubling are the same distance
+/// along it, which is how a zoom is judged by eye, and a straight scale
+/// would squeeze everything under 100% into the slider's first quarter.
+pub(crate) fn transform_fraction(field: TransformField, value: f32, reach: [f32; 2]) -> f32 {
+    let f = match field {
+        TransformField::Zoom => (value / MIN_SCALE).ln() / (MAX_SCALE / MIN_SCALE).ln(),
+        TransformField::X => (value + reach[0]) / (2.0 * reach[0]),
+        TransformField::Y => (value + reach[1]) / (2.0 * reach[1]),
+    };
+    f.clamp(0.0, 1.0)
+}
+
+/// The inverse of [`transform_fraction`].
+pub(crate) fn transform_value(field: TransformField, fraction: f32, reach: [f32; 2]) -> f32 {
+    let f = fraction.clamp(0.0, 1.0);
+    match field {
+        TransformField::Zoom => MIN_SCALE * (MAX_SCALE / MIN_SCALE).powf(f),
+        TransformField::X => (f * 2.0 - 1.0) * reach[0],
+        TransformField::Y => (f * 2.0 - 1.0) * reach[1],
+    }
+}
+
+/// The clip edge a press at `x` trims, among clips spanning `spans` (start
+/// and end, across): which clip, and its start (`In`) or its end (`Out`).
+///
+/// Where two clips meet, each edge's grab reaches over into the other clip,
+/// so the clip the cursor is in wins: left of the join trims the clip on the
+/// left, right of it the one on the right — whichever of the two comes first
+/// in the track.
+pub(crate) fn trim_edge_at(
+    x: f32,
+    spans: impl IntoIterator<Item = (f32, f32)>,
+) -> Option<(usize, FadeSide)> {
+    let mut best: Option<(bool, usize, FadeSide)> = None;
+    for (i, (x0, x1)) in spans.into_iter().enumerate() {
+        let (to_start, to_end) = ((x - x0).abs(), (x - x1).abs());
+        if to_start.min(to_end) > CLIP_EDGE_GRAB_PX {
+            continue;
+        }
+        let side = if to_start <= to_end { FadeSide::In } else { FadeSide::Out };
+        let inside = x >= x0 && x <= x1;
+        if best.is_none_or(|(was_inside, ..)| inside && !was_inside) {
+            best = Some((inside, i, side));
+        }
+    }
+    best.map(|(_, i, side)| (i, side))
+}
+
 /// Where everything on the effects tab sits. Like [`pool_cells`], the one
 /// place this is worked out, for drawing and hit testing alike.
 ///
@@ -571,6 +648,8 @@ pub(crate) struct EffectsPanel {
     /// are grouped into: the words and their look, the outline, the shadow.
     pub(crate) title: Vec<TitleRow>,
     pub(crate) title_groups: Vec<Rect>,
+    /// Where the clip sits on the canvas, for any video clip.
+    pub(crate) transform: Option<TransformRows>,
     /// Top of the line that stands in for the stack when it has nothing to
     /// list — no clip picked, or a clip with no effects yet.
     pub(crate) hint_y: f32,
@@ -599,6 +678,8 @@ pub(crate) enum EffectsHit {
     /// The chip showing a colour row's colour, which opens the picker.
     TitleColorChip(TitleColor),
     TitleToggle(TitlePart),
+    Transform { field: TransformField, slider: Rect },
+    TransformReset,
 }
 
 /// How tall the text box is for `lines` lines: every one of them, blank ones
@@ -857,6 +938,25 @@ pub(crate) fn effects_panel(
         }
         y += EFFECTS_SECTION_GAP - EFFECT_ROW_GAP;
     }
+
+    // Every video clip has a placement, so every clip shown gets these.
+    let mut transform = stack.is_some().then(|| {
+        let top = y;
+        let heading = Rect { x, y, w, h: EFFECT_ROW_H };
+        let reset = Rect { x: x + w - POOL_ROW_PAD - EFFECT_SMALL_BTN, ..toggle_in(heading) };
+        y += EFFECT_ROW_H;
+        let rows = TransformField::ALL
+            .iter()
+            .map(|&field| {
+                let row = Rect { x, y, w, h: EFFECT_PARAM_H };
+                y += EFFECT_PARAM_H;
+                TransformRow { field, row, slider: slider_in(row) }
+            })
+            .collect();
+        let group = Rect { x, y: top, w, h: y - top };
+        y += EFFECTS_SECTION_GAP;
+        TransformRows { group, heading, reset, rows }
+    });
     let hint_y = y;
 
     let mut rows = Vec::new();
@@ -893,6 +993,15 @@ pub(crate) fn effects_panel(
     for g in &mut title_groups {
         *g = up(*g);
     }
+    if let Some(t) = &mut transform {
+        t.group = up(t.group);
+        t.heading = up(t.heading);
+        t.reset = up(t.reset);
+        for r in &mut t.rows {
+            r.row = up(r.row);
+            r.slider = up(r.slider);
+        }
+    }
     for r in &mut rows {
         r.row = up(r.row);
         r.toggle = up(r.toggle);
@@ -908,6 +1017,7 @@ pub(crate) fn effects_panel(
         clip_heading_y: clip_heading_y - scroll,
         title: title_rows,
         title_groups,
+        transform,
         hint_y: hint_y - scroll,
         stack: rows,
         visible: [POOL_LIST_TOP, pool_h],
@@ -955,6 +1065,16 @@ impl EffectsPanel {
                     return Some(EffectsHit::TitleToggle(part));
                 }
                 _ => {}
+            }
+        }
+        if let Some(t) = &self.transform {
+            if t.reset.contains(p) {
+                return Some(EffectsHit::TransformReset);
+            }
+            for r in &t.rows {
+                if r.row.contains(p) && p[0] >= r.slider.x - ZOOM_SLIDER_KNOB_W {
+                    return Some(EffectsHit::Transform { field: r.field, slider: r.slider });
+                }
             }
         }
         for row in &self.stack {
@@ -1394,11 +1514,9 @@ impl State {
                     };
                 }
             }
-            if cursor_x >= x0 - CLIP_EDGE_GRAB_PX && cursor_x <= x0 + CLIP_EDGE_GRAB_PX {
-                return TimelineHit::ClipTrimLeft { track: track_idx, idx: i };
-            }
-            if cursor_x >= x1 - CLIP_EDGE_GRAB_PX && cursor_x <= x1 + CLIP_EDGE_GRAB_PX {
-                return TimelineHit::ClipTrimRight { track: track_idx, idx: i };
+            // Near an edge is a trim, settled once every clip has been seen.
+            if (cursor_x - x0).abs().min((cursor_x - x1).abs()) <= CLIP_EDGE_GRAB_PX {
+                continue;
             }
             if cursor_x >= x0 && cursor_x <= x1 {
                 // The level line runs the whole width of the clip, so making it
@@ -1419,7 +1537,15 @@ impl State {
                 };
             }
         }
-        TimelineHit::Lane
+        let spans = track
+            .clips
+            .iter()
+            .map(|c| (layout.t_to_x(c.timeline_start), layout.t_to_x(c.timeline_end())));
+        match trim_edge_at(cursor_x, spans) {
+            Some((idx, FadeSide::In)) => TimelineHit::ClipTrimLeft { track: track_idx, idx },
+            Some((idx, FadeSide::Out)) => TimelineHit::ClipTrimRight { track: track_idx, idx },
+            None => TimelineHit::Lane,
+        }
     }
 
     /// The selected clip's picture on the canvas: which clip it is, and where
@@ -1534,6 +1660,31 @@ impl State {
             target.map(|c| &c.effects),
             self.effects_scroll,
         )
+    }
+
+    /// How far the position sliders reach for `clip`: see [`offset_reach`].
+    pub(crate) fn transform_reach(&self, clip: &Clip) -> [f32; 2] {
+        let canvas = self.canvas();
+        let (cw, ch) = (canvas.width.max(1) as f32, canvas.height.max(1) as f32);
+        let (sw, sh) = self.source_size(clip.source, canvas).unwrap_or((canvas.width, canvas.height));
+        let (_, _, fw, fh) = canvas.fit(sw as f32, sh as f32);
+        let scale = clip.transform.scale;
+        [offset_reach(fw / cw * scale), offset_reach(fh / ch * scale)]
+    }
+
+    /// `field`'s value as the panel shows it: the zoom against the fit, a
+    /// position in pixels of the canvas from centred.
+    pub(crate) fn format_transform(&self, field: TransformField, value: f32) -> String {
+        let canvas = self.canvas();
+        let px = |v: f32| match v.round() as i64 {
+            0 => "0 px".to_string(),
+            n => format!("{n:+} px"),
+        };
+        match field {
+            TransformField::Zoom => format!("{}%", (value * 100.0).round()),
+            TransformField::X => px(value * canvas.width as f32),
+            TransformField::Y => px(value * canvas.height as f32),
+        }
     }
 
     /// The title the effects tab is showing the settings of, when the clip it
@@ -1808,6 +1959,63 @@ mod tests {
             Some(EffectsHit::Apply(EffectKind::GaussianBlur)));
         let toggle = panel.stack[1].toggle;
         assert_eq!(panel.hit([toggle.x + 2.0, toggle.y + 2.0]), Some(EffectsHit::Toggle { index: 1 }));
+    }
+
+    #[test]
+    fn at_a_join_each_side_trims_the_clip_it_is_in() {
+        // The clip on the right comes first in the track, as a freeze frame
+        // pushed in after the cut leaves it.
+        let spans = [(100.0, 200.0), (40.0, 100.0)];
+        assert_eq!(trim_edge_at(97.0, spans), Some((1, FadeSide::Out)));
+        assert_eq!(trim_edge_at(103.0, spans), Some((0, FadeSide::In)));
+        let spans = [(40.0, 100.0), (100.0, 200.0)];
+        assert_eq!(trim_edge_at(97.0, spans), Some((0, FadeSide::Out)));
+        assert_eq!(trim_edge_at(103.0, spans), Some((1, FadeSide::In)));
+        // A lone edge still reaches a little outside its clip.
+        assert_eq!(trim_edge_at(204.0, spans), Some((1, FadeSide::Out)));
+        assert_eq!(trim_edge_at(150.0, spans), None);
+    }
+
+    #[test]
+    fn a_video_clip_gets_transform_sliders_that_take_their_presses() {
+        use crate::effects::{EffectKind, EffectStack};
+        let stack = EffectStack::default();
+        let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, None, Some(&stack), 0.0);
+        let t = panel.transform.as_ref().expect("every video clip has a placement");
+        assert_eq!(t.rows.len(), 3);
+        assert!(panel.hint_y >= t.group.y + t.group.h, "the effects come after it");
+        assert_eq!(panel.hit([t.reset.x + 2.0, t.reset.y + 2.0]), Some(EffectsHit::TransformReset));
+        let zoom = t.rows[0];
+        assert_eq!(
+            panel.hit([zoom.slider.x + 10.0, zoom.row.y + 1.0]),
+            Some(EffectsHit::Transform { field: TransformField::Zoom, slider: zoom.slider })
+        );
+        // Nothing selected, nothing to place.
+        let none = effects_panel(400.0, 2000.0, &EffectKind::ALL, None, None, 0.0);
+        assert!(none.transform.is_none());
+    }
+
+    #[test]
+    fn transform_sliders_round_trip_and_reach_off_the_canvas() {
+        let reach = [offset_reach(3.16), offset_reach(1.0)];
+        for field in TransformField::ALL {
+            let values: [f32; 4] =
+                if field == TransformField::Zoom { [0.1, 0.5, 1.0, 3.16] } else { [-0.9, -0.2, 0.0, 0.45] };
+            for v in values {
+                let back = transform_value(field, transform_fraction(field, v, reach), reach);
+                assert!((back - v).abs() < 1e-4, "{field:?} {v} came back {back}");
+            }
+        }
+        // Centred is the middle of a position slider; the ends put a picture
+        // 3.16 canvases wide just off the frame.
+        assert_eq!(transform_fraction(TransformField::X, 0.0, reach), 0.5);
+        assert!((transform_value(TransformField::X, 1.0, reach) - 2.08).abs() < 1e-4);
+        // Halving and doubling the zoom are the same distance along it.
+        let at = |v| transform_fraction(TransformField::Zoom, v, reach);
+        assert!(((at(2.0) - at(1.0)) - (at(1.0) - at(0.5))).abs() < 1e-5);
+        // A small overlay can still reach a corner.
+        assert_eq!(offset_reach(0.1), 0.55);
+        assert_eq!(offset_reach(0.0), 0.5);
     }
 
     #[test]

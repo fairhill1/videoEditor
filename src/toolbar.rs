@@ -268,6 +268,12 @@ impl State {
             x: btn_x + stride * 9.0,
             ..self.timeline_split_btn
         };
+        // Beside the magnet: both change what a drag on the timeline does
+        // rather than doing anything themselves.
+        self.timeline_ripple_btn = Rect {
+            x: btn_x + stride * 10.0,
+            ..self.timeline_split_btn
+        };
         // Pinned to the right edge rather than trailing the cluster: Export
         // ends the workflow the other buttons edit, and the distance says so.
         self.timeline_export_btn = Rect {
@@ -303,7 +309,7 @@ impl State {
         // of changing the view has a control here too. Left out altogether
         // when the window is too narrow to fit them before the export readout,
         // rather than drawn underneath it.
-        let zoom_x = self.timeline_snap_btn.x + stride + TRANSPORT_GAP;
+        let zoom_x = self.timeline_ripple_btn.x + stride + TRANSPORT_GAP;
         let zoom_w = TRANSPORT_BTN_W * 3.0 + ZOOM_SLIDER_W + TRANSPORT_GAP * 3.0;
         let readout_left = self.timeline_reload_btn.x - EXPORT_READOUT_GAP - EXPORT_READOUT_W;
         if zoom_x + zoom_w <= readout_left {
@@ -454,6 +460,12 @@ impl State {
                 ICON_SNAP,
                 "Snap to clip edges (N)",
                 BtnState::Toggle(self.snap_enabled),
+            ),
+            (
+                self.timeline_ripple_btn,
+                ICON_RIPPLE,
+                "Ripple trims: what comes after a clip moves with its end (R)",
+                BtnState::Toggle(self.ripple_enabled),
             ),
             (
                 self.timeline_zoom_out_btn,
