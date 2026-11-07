@@ -286,13 +286,13 @@ impl State {
             (
                 self.timeline_split_btn,
                 ICON_SPLIT,
-                "Split at playhead (S)",
-                BtnState::Normal,
+                "Split selected clips at playhead (S)",
+                avail(self.has_selection()),
             ),
             (
                 self.timeline_delete_btn,
                 ICON_DELETE,
-                "Delete clip (Del)",
+                "Delete selected clips (Del)",
                 avail(self.has_selection()),
             ),
             (

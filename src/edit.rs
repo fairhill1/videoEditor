@@ -7,7 +7,7 @@
 
 use crate::input::DragMode;
 use crate::state::State;
-use crate::theme::SNAP_PX;
+use crate::theme::{SNAP_PX, STATUS_INFO};
 use crate::title::Title;
 use crate::timeline::{
     db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Transform,
@@ -186,8 +186,41 @@ impl State {
         self.commit_edit();
     }
 
+    /// Make `(track, idx)` the whole selection.
     pub(crate) fn select_clip_at(&mut self, track: usize, idx: usize) {
-        self.selected = Some(self.timeline.tracks[track].clips[idx].id);
+        self.selected = vec![self.timeline.tracks[track].clips[idx].id];
+    }
+
+    /// Add `(track, idx)` to the selection, or take it out if it is already
+    /// in: Shift+click. An added clip becomes the primary one.
+    pub(crate) fn toggle_clip_at(&mut self, track: usize, idx: usize) {
+        let id = self.timeline.tracks[track].clips[idx].id;
+        if self.selected.contains(&id) {
+            self.selected.retain(|s| *s != id);
+        } else {
+            self.selected.push(id);
+        }
+    }
+
+    pub(crate) fn is_selected(&self, id: u32) -> bool {
+        self.selected.contains(&id)
+    }
+
+    /// Where the primary selected clip is — the one picked last that still
+    /// exists.
+    pub(crate) fn primary_selected(&self) -> Option<(usize, usize)> {
+        self.selected.iter().rev().find_map(|id| self.timeline.find(*id))
+    }
+
+    /// Ids of every selected clip and every clip linked to one: what an action
+    /// on the selection acts on, since linked audio and video travel as a unit.
+    fn selection_with_links(&self) -> std::collections::HashSet<u32> {
+        self.selected
+            .iter()
+            .filter_map(|id| self.timeline.find(*id))
+            .flat_map(|(track, idx)| self.linked_siblings(track, idx))
+            .map(|(track, idx)| self.timeline.tracks[track].clips[idx].id)
+            .collect()
     }
 
     /// Indices of every clip linked to `(track, idx)`, including itself.
@@ -504,21 +537,28 @@ impl State {
     /// line under the cursor does. Audio steps in decibels rather than in the
     /// stored linear gain, so one press is the same perceived step wherever the
     /// level already sits; opacity is already linear and steps in percent.
+    ///
+    /// Every selected clip moves by the same step from its own level, as one
+    /// undo step.
     pub(crate) fn nudge_selected_level(&mut self, dir: f32, fine: bool) {
-        let Some((track, idx)) = self.selected.and_then(|id| self.timeline.find(id)) else {
+        let targets: Vec<(usize, usize)> =
+            self.selected.iter().filter_map(|id| self.timeline.find(*id)).collect();
+        if targets.is_empty() {
             return;
-        };
-        let clip = self.timeline.tracks[track].clips[idx];
+        }
         self.begin_edit();
-        match self.timeline.tracks[track].kind {
-            TrackKind::Audio => {
-                let step = if fine { GAIN_STEP_FINE_DB } else { GAIN_STEP_DB };
-                let db = gain_to_db(clip.gain) + dir * step;
-                self.set_clip_gain(track, idx, db_to_gain(db));
-            }
-            TrackKind::Video => {
-                let step = if fine { OPACITY_STEP_FINE } else { OPACITY_STEP };
-                self.set_clip_opacity(track, idx, clip.opacity + dir * step);
+        for (track, idx) in targets {
+            let clip = self.timeline.tracks[track].clips[idx];
+            match self.timeline.tracks[track].kind {
+                TrackKind::Audio => {
+                    let step = if fine { GAIN_STEP_FINE_DB } else { GAIN_STEP_DB };
+                    let db = gain_to_db(clip.gain) + dir * step;
+                    self.set_clip_gain(track, idx, db_to_gain(db));
+                }
+                TrackKind::Video => {
+                    let step = if fine { OPACITY_STEP_FINE } else { OPACITY_STEP };
+                    self.set_clip_opacity(track, idx, clip.opacity + dir * step);
+                }
             }
         }
         self.commit_edit();
@@ -551,7 +591,7 @@ impl State {
     /// Start typing into the selected clip's title, for the keyboard. Does
     /// nothing when the selection is footage, which has no text to change.
     pub(crate) fn edit_selected_title(&mut self) {
-        let Some((track, idx)) = self.selected.and_then(|id| self.timeline.find(id)) else {
+        let Some((track, idx)) = self.primary_selected() else {
             return;
         };
         let source = self.timeline.tracks[track].clips[idx].source;
@@ -611,40 +651,41 @@ impl State {
         }
     }
 
+    /// Cut the selected clips, and the clips linked to them, at the playhead.
+    /// Nothing else on the timeline is touched: a split is a decision about a
+    /// clip, and cutting every track under the playhead made one about clips
+    /// nobody had picked.
     pub(crate) fn split_at_playhead(&mut self) {
+        let ids = self.selection_with_links();
+        if ids.is_empty() {
+            self.set_status("Select a clip to split".into(), STATUS_INFO);
+            return;
+        }
         let t = self.audio.position();
         self.begin_edit();
-        self.timeline.split_at(t);
+        self.timeline.split_at(t, |clip| ids.contains(&clip.id));
         self.commit_edit();
     }
 
     /// Whether [`State::delete_selected`] would actually remove anything.
     pub(crate) fn has_selection(&self) -> bool {
-        self.selected
-            .is_some_and(|id| self.timeline.find(id).is_some())
+        self.selected.iter().any(|id| self.timeline.find(*id).is_some())
     }
 
-    /// Remove the selected clip, taking its linked siblings with it. Linked
-    /// A/V travels as a unit everywhere else — move, trim, split — so deleting
-    /// only half of a pair would be the odd one out.
+    /// Remove the selected clips, taking their linked siblings with them.
+    /// Linked A/V travels as a unit everywhere else — move, trim, split — so
+    /// deleting only half of a pair would be the odd one out.
     pub(crate) fn delete_selected(&mut self) {
-        let Some((track, idx)) = self.selected.and_then(|id| self.timeline.find(id)) else {
+        let doomed = self.selection_with_links();
+        if doomed.is_empty() {
             return;
-        };
-        // Resolve to ids before touching anything: every removal shifts the
-        // indices of the clips after it, so a list of positions goes stale the
-        // moment the first one is used.
-        let doomed: Vec<u32> = self
-            .linked_siblings(track, idx)
-            .into_iter()
-            .map(|(ti, ci)| self.timeline.tracks[ti].clips[ci].id)
-            .collect();
+        }
         self.begin_edit();
         for t in &mut self.timeline.tracks {
             t.clips.retain(|c| !doomed.contains(&c.id));
         }
         self.commit_edit();
-        self.selected = None;
+        self.selected.clear();
     }
 }
 

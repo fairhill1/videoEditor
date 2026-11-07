@@ -125,10 +125,14 @@ pub(crate) struct State {
     pub(crate) timeline_zoom_in_btn: Rect,
     pub(crate) timeline_zoom_fit_btn: Rect,
     pub(crate) timeline_delete_btn: Rect,
-    /// Clip id, not a position — see [`crate::timeline::Clip::id`]. A selection
-    /// whose clip has been deleted simply resolves to nothing, and comes back
-    /// if an undo restores the clip.
-    pub(crate) selected: Option<u32>,
+    /// Clip ids, not positions — see [`crate::timeline::Clip::id`]. A selected
+    /// clip that has been deleted simply resolves to nothing, and comes back if
+    /// an undo restores it.
+    ///
+    /// In the order they were picked, so the last is the one clicked most
+    /// recently: the *primary* clip, which the actions that only make sense on
+    /// one clip — the canvas handles, typing into a title — act on.
+    pub(crate) selected: Vec<u32>,
     /// Right-aligned in the toolbar row, well clear of the edit buttons: this
     /// one produces a file rather than changing the timeline.
     pub(crate) timeline_export_btn: Rect,
@@ -282,7 +286,7 @@ impl State {
             timeline_zoom_in_btn: Rect::default(),
             timeline_zoom_fit_btn: Rect::default(),
             timeline_delete_btn: Rect::default(),
-            selected: None,
+            selected: Vec::new(),
             timeline_export_btn: Rect::default(),
             timeline_project_btn: Rect::default(),
             timeline_open_btn: Rect::default(),

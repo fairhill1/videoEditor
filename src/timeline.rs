@@ -410,14 +410,15 @@ impl Timeline {
         pts
     }
 
-    /// Split every clip containing `t` into two clips meeting at `t`. Clips whose
-    /// start aligns exactly with `t` are left alone — there's nothing to split.
+    /// Split every clip containing `t` that `which` picks into two clips meeting
+    /// at `t`. Clips whose start aligns exactly with `t` are left alone —
+    /// there's nothing to split.
     ///
     /// Link preservation: the left halves keep the original link id; the right
     /// halves get a new shared link id (per old link id) so that e.g. video +
     /// audio clips linked together end up with their right halves linked to
     /// each other. Unlinked clips stay unlinked.
-    pub fn split_at(&mut self, t: f64) {
+    pub fn split_at(&mut self, t: f64, which: impl Fn(&Clip) -> bool) {
         use std::collections::{HashMap, HashSet};
 
         // First pass: find every old link id on a clip that will actually split.
@@ -426,7 +427,7 @@ impl Timeline {
         let mut old_links: HashSet<u32> = HashSet::new();
         for track in &self.tracks {
             for clip in &track.clips {
-                if clip.contains(t) && t > clip.timeline_start {
+                if which(clip) && clip.contains(t) && t > clip.timeline_start {
                     if let Some(l) = clip.link {
                         old_links.insert(l);
                     }
@@ -447,7 +448,7 @@ impl Timeline {
             let mut i = 0;
             while i < track.clips.len() {
                 let orig = track.clips[i];
-                if orig.contains(t) && t > orig.timeline_start {
+                if which(&orig) && orig.contains(t) && t > orig.timeline_start {
                     let split_source_t = orig.source_time(t);
                     track.clips[i].source_out = split_source_t;
                     // Each fade stays with the end it hangs off: the cut is a
@@ -484,6 +485,21 @@ impl Timeline {
 mod tests {
     use super::*;
 
+    /// Only the clips picked are cut: the rest of the stack under the playhead
+    /// is left whole.
+    #[test]
+    fn a_split_cuts_only_the_clips_it_is_given() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks[0].clips = vec![Clip { id: 1, source_out: 10.0, ..Clip::default() }];
+        tl.tracks[1].clips = vec![Clip { id: 2, source_out: 10.0, ..Clip::default() }];
+        tl.next_clip = 3;
+        tl.split_at(4.0, |c| c.id == 2);
+        assert_eq!(tl.tracks[0].clips.len(), 1);
+        assert_eq!(tl.tracks[1].clips.len(), 2);
+    }
+
     /// Ids are irrelevant to most of these tests, so they all share one;
     /// `timeline_with` hands out distinct ones where it matters.
     fn clip(start: f64, dur: f64) -> Clip {
@@ -509,7 +525,7 @@ mod tests {
         let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
         let before = tl.snapshot();
 
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         assert_eq!(tl.tracks[0].clips.len(), 2);
         assert_ne!(tl.snapshot(), before);
 
@@ -527,11 +543,11 @@ mod tests {
         tl.next_link = 1;
         let before = tl.snapshot();
 
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         let first = tl.tracks[0].clips[1].link;
 
         tl.restore(&before);
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         // The rewind is what keeps ids from drifting upward on every
         // undo/redo cycle; the clip that held the old id is gone.
         assert_eq!(tl.tracks[0].clips[1].link, first);
@@ -542,7 +558,7 @@ mod tests {
         let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
         let original = tl.tracks[0].clips[0].id;
 
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         assert_eq!(tl.tracks[0].clips[0].id, original);
         assert_ne!(tl.tracks[0].clips[1].id, original);
     }
@@ -558,7 +574,7 @@ mod tests {
             ..clip(0.0, 10.0)
         }];
 
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         let ids: Vec<u32> = tl
             .tracks
             .iter()
@@ -590,11 +606,11 @@ mod tests {
         let mut tl = timeline_with(vec![clip(0.0, 10.0)]);
         let before = tl.snapshot();
 
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         let first = tl.tracks[0].clips[1].id;
 
         tl.restore(&before);
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         // Without the rewind, ids would climb on every undo/redo cycle and a
         // selection restored by undo would no longer match its clip.
         assert_eq!(tl.tracks[0].clips[1].id, first);
@@ -760,7 +776,7 @@ mod tests {
             fade_out: 1.0,
             ..clip(0.0, 10.0)
         }]);
-        tl.split_at(4.0);
+        tl.split_at(4.0, |_| true);
         let (left, right) = (tl.tracks[0].clips[0], tl.tracks[0].clips[1]);
         assert_eq!((left.fade_in, left.fade_out), (1.0, 0.0));
         assert_eq!((right.fade_in, right.fade_out), (0.0, 1.0));
@@ -773,7 +789,7 @@ mod tests {
     #[test]
     fn a_split_pulls_a_fade_inside_the_half_that_keeps_it() {
         let mut tl = timeline_with(vec![Clip { fade_out: 6.0, ..clip(0.0, 10.0) }]);
-        tl.split_at(8.0);
+        tl.split_at(8.0, |_| true);
         assert_eq!(tl.tracks[0].clips[1].fade_out, 2.0);
     }
 

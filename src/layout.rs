@@ -720,7 +720,7 @@ impl State {
                 // instead: the press that selects still moves the clip, and the
                 // one after it adjusts the level.
                 let level_y = level_line_y(track.kind, lane_y, layout.lane_h, clip);
-                if self.selected == Some(clip.id)
+                if self.is_selected(clip.id)
                     && (cursor_y - level_y).abs() <= CLIP_LEVEL_GRAB_PX
                 {
                     return TimelineHit::ClipLevel { track: track_idx, idx: i };
@@ -741,7 +741,7 @@ impl State {
     /// `None` unless there is a video clip selected *and* it is live at the
     /// playhead — a clip you cannot see is one there is nothing to place.
     pub(crate) fn preview_transform_target(&self) -> Option<(usize, usize, Rect)> {
-        let (track, idx) = self.selected.and_then(|id| self.timeline.find(id))?;
+        let (track, idx) = self.primary_selected()?;
         if self.timeline.tracks[track].kind != TrackKind::Video {
             return None;
         }

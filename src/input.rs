@@ -260,7 +260,26 @@ impl State {
         // since a press there is still a statement about which clip you mean.
         // Pressing bare lane or ruler clears, so there is always a way to
         // deselect without a modifier.
-        match self.timeline_hit(cx, cy) {
+        //
+        // Shift+press on a clip adds it to the selection or takes it out, and
+        // that is all it does: a press that is busy building a selection is not
+        // also grabbing a clip to move, and a drag that set off from it would
+        // move one clip of several, which is not what a group looks like it
+        // is about to do.
+        let hit = self.timeline_hit(cx, cy);
+        let shift = self.modifiers.shift_key();
+        if shift {
+            if let TimelineHit::ClipTrimLeft { track, idx }
+            | TimelineHit::ClipTrimRight { track, idx }
+            | TimelineHit::ClipBody { track, idx, .. }
+            | TimelineHit::ClipFade { track, idx, .. }
+            | TimelineHit::ClipLevel { track, idx } = hit
+            {
+                self.toggle_clip_at(track, idx);
+                return;
+            }
+        }
+        match hit {
             TimelineHit::ClipTrimLeft { track, idx } => {
                 self.select_clip_at(track, idx);
                 self.begin_edit();
@@ -288,7 +307,11 @@ impl State {
                 self.drag = DragMode::ClipLevel { track, idx };
             }
             TimelineHit::Lane | TimelineHit::Ruler => {
-                self.selected = None;
+                // Shift keeps the selection, so the playhead can be moved to
+                // where a group of clips is about to be cut.
+                if !shift {
+                    self.selected.clear();
+                }
                 self.drag = DragMode::Scrub;
                 self.apply_scrub();
             }

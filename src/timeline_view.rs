@@ -342,7 +342,7 @@ impl State {
             // outline, rather than a colour of its own: the blue/green split
             // between video and audio is load-bearing, so recolouring the fill
             // outright would cost more information than it gives.
-            let selected = self.selected == Some(clip.id);
+            let selected = self.is_selected(clip.id);
             let (fill, border_color, b) = if selected {
                 (
                     lighten(clip_color, CLIP_SELECTED_LIFT),
