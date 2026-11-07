@@ -5,19 +5,29 @@
 //! is tested against, so what is drawn is what can be pressed.
 
 use crate::fmt::truncate_to_width;
+use crate::fonts;
 use crate::input::DragMode;
 use crate::effects::EffectKind;
-use crate::layout::{EffectsPanel, PoolCell};
+use crate::layout::{swatch_rects, EffectsPanel, PoolCell, TitleControl, TitleRow};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::theme::*;
-use crate::ui::{draw_button, draw_slider, draw_tooltip, BtnState, Rect, TooltipSide};
+use crate::title::{self, Title, TitleColor, TitleNumber, TitlePart, SWATCHES};
+use crate::ui::{
+    draw_button, draw_menu_row, draw_slider, draw_tooltip, BtnState, Rect, TooltipSide,
+};
 
 impl State {
     pub(crate) fn draw_effects_panel(&mut self) {
         let panel = self.effects_panel();
         let mut tooltip: Option<(Rect, &'static str)> = None;
-        let idle = matches!(self.drag, DragMode::None);
+        // Hover means something only over the part of the panel in view, and
+        // not while the font list is open over it.
+        let [top, bottom] = panel.visible;
+        let idle = matches!(self.drag, DragMode::None)
+            && self.font_menu.is_none()
+            && (top..bottom).contains(&self.cursor[1]);
+        self.quads.set_clip_y(top, bottom);
 
         // Whether the apply buttons have anything to apply to. They take the
         // press either way — the status line then says what is missing — but
@@ -66,7 +76,8 @@ impl State {
             }
         }
 
-        self.draw_clip_effects(&panel, &mut tooltip);
+        self.draw_clip_effects(&panel, idle, &mut tooltip);
+        self.quads.clear_clip_y();
 
         if let Some((anchor, label)) = tooltip {
             let w = self.logical_size()[0];
@@ -85,13 +96,18 @@ impl State {
 
     /// The selected clip's effects: a heading naming the clip, then each
     /// effect with its switch, its name, its remove button and its sliders.
-    fn draw_clip_effects(&mut self, panel: &EffectsPanel, tooltip: &mut Option<(Rect, &'static str)>) {
+    fn draw_clip_effects(
+        &mut self,
+        panel: &EffectsPanel,
+        idle: bool,
+        tooltip: &mut Option<(Rect, &'static str)>,
+    ) {
         let heading_w = self.draw_section_heading(panel.clip_heading_y, "SELECTED CLIP");
         let target = self.effects_target();
         let pool_right = self.media_pool_w() - LABEL_PAD;
 
         let Some((track, idx)) = target else {
-            self.draw_hint(panel.hint_y, "Select a video clip to see its effects.");
+            self.draw_hint(panel.hint_y, "Select a video clip to see its settings.");
             return;
         };
         let clip = self.timeline.tracks[track].clips[idx];
@@ -108,13 +124,16 @@ impl State {
                 CLIP_LABEL_COLOR,
             );
         }
+        if let Some((_, title)) = self.effects_title() {
+            let title = title.clone();
+            self.draw_title_settings(panel, &title, idle, tooltip);
+        }
         if clip.effects.is_empty() {
             self.draw_hint(panel.hint_y, "No effects yet. Drag one onto the clip, or press +.");
             return;
         }
 
         let canvas_h = self.canvas().height;
-        let idle = matches!(self.drag, DragMode::None);
         for row in &panel.stack {
             let Some(effect) = clip.effects.get(row.index).copied() else {
                 continue;
@@ -246,6 +265,337 @@ impl State {
         );
     }
 
+    /// A title's settings: the words, the face, the size and colour, then
+    /// the outline and the shadow, each a block with its switch at the top.
+    fn draw_title_settings(
+        &mut self,
+        panel: &EffectsPanel,
+        title: &Title,
+        idle: bool,
+        tooltip: &mut Option<(Rect, &'static str)>,
+    ) {
+        for g in &panel.title_groups {
+            self.quads.push(Quad::colored([g.x, g.y], [g.w, g.h], POOL_ROW_COLOR));
+        }
+        let canvas_h = self.canvas().height;
+        // This title, not just any: one being typed into from elsewhere
+        // leaves this box as it is.
+        let shown = self.effects_title().map(|(source, _)| source);
+        let typing = shown.is_some() && self.editing_title.as_ref().map(|(id, _)| *id) == shown;
+        for &TitleRow { control, row, field } in &panel.title {
+            // Rows under a switched-off outline or shadow dim with it, and
+            // still work: setting one up before turning it on is fine.
+            let on = match control {
+                TitleControl::Number(TitleNumber::OutlineWidth)
+                | TitleControl::Color(TitleColor::Outline) => title.outline.enabled,
+                TitleControl::Number(
+                    TitleNumber::ShadowDistance
+                    | TitleNumber::ShadowSoftness
+                    | TitleNumber::ShadowOpacity,
+                ) => title.shadow.enabled,
+                _ => true,
+            };
+            let color = if on { CLIP_LABEL_COLOR } else { EFFECT_OFF_COLOR };
+            let label = match control {
+                TitleControl::Text => Some("Text"),
+                TitleControl::Font => Some("Font"),
+                TitleControl::Number(n) => Some(n.spec().name),
+                TitleControl::Color(_) => Some("Colour"),
+                TitleControl::Toggle(_) => None,
+            };
+            if let Some(label) = label {
+                let baseline = self.centred_baseline(row, EFFECT_META_SIZE);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [row.x + EFFECT_PARAM_INDENT, baseline],
+                    label,
+                    EFFECT_META_SIZE,
+                    EFFECT_META_COLOR,
+                );
+            }
+            let hovered = idle && row.contains(self.cursor);
+            match control {
+                TitleControl::Text => {
+                    let field_hovered = idle && field.contains(self.cursor);
+                    let caret = typing.then_some(self.title_caret);
+                    self.draw_text_box(field, &title.text, field_hovered, caret);
+                    if field_hovered && !typing {
+                        *tooltip = Some((field, "Click to type"));
+                    }
+                }
+                TitleControl::Font => {
+                    let name = title.font.as_deref().unwrap_or("Default");
+                    let open = self.font_menu.is_some();
+                    let field_hovered = idle && field.contains(self.cursor);
+                    self.draw_field(field, name, field_hovered, open, Some(ICON_CHEVRON_DOWN));
+                }
+                TitleControl::Number(n) => {
+                    let spec = n.spec();
+                    let value = n.get(title);
+                    let dragging = matches!(
+                        self.drag,
+                        DragMode::TitleNumber { field, .. } if field == n
+                    );
+                    let knob = if dragging {
+                        SCROLLBAR_THUMB_ACTIVE_COLOR
+                    } else if hovered {
+                        SCROLLBAR_THUMB_HOVER_COLOR
+                    } else {
+                        SCROLLBAR_THUMB_COLOR
+                    };
+                    draw_slider(&mut self.quads, field, spec.fraction(value), knob);
+                    let text = spec.format(value, canvas_h);
+                    let tw = self.text.measure_width(&text, EFFECT_META_SIZE);
+                    let baseline = self.centred_baseline(row, EFFECT_META_SIZE);
+                    self.text.draw(
+                        &self.queue,
+                        &mut self.quads,
+                        [(row.x + row.w - POOL_ROW_PAD - tw).round(), baseline],
+                        &text,
+                        EFFECT_META_SIZE,
+                        color,
+                    );
+                }
+                TitleControl::Color(c) => {
+                    let current = c.get(title);
+                    for (swatch, rect) in SWATCHES.iter().zip(swatch_rects(field)) {
+                        let chosen = swatch[..3]
+                            .iter()
+                            .zip(&current[..3])
+                            .all(|(a, b)| (a - b).abs() < 0.01);
+                        let ring = if chosen {
+                            Some(TITLE_SWATCH_RING)
+                        } else if idle && rect.contains(self.cursor) {
+                            Some(TITLE_FIELD_HOVER_BORDER)
+                        } else {
+                            None
+                        };
+                        if let Some(ring) = ring {
+                            let g = TITLE_SWATCH_RING_PX;
+                            self.quads.push(Quad::colored(
+                                [rect.x - g, rect.y - g],
+                                [rect.w + g * 2.0, rect.h + g * 2.0],
+                                ring,
+                            ));
+                        }
+                        // A hairline edge, so black reads against the dark row.
+                        self.quads.push(Quad::colored([rect.x, rect.y], [rect.w, rect.h], TITLE_SWATCH_EDGE));
+                        let mut fill = *swatch;
+                        if !on {
+                            fill[3] = 0.4;
+                        }
+                        self.quads.push(Quad::colored(
+                            [rect.x + 1.0, rect.y + 1.0],
+                            [rect.w - 2.0, rect.h - 2.0],
+                            fill,
+                        ));
+                    }
+                }
+                TitleControl::Toggle(part) => {
+                    let enabled = part.enabled(title);
+                    draw_button(
+                        &mut self.quads,
+                        &mut self.text,
+                        &self.queue,
+                        field,
+                        if enabled { ICON_EYE } else { ICON_EYE_OFF },
+                        TRANSPORT_ICON_SIZE,
+                        hovered,
+                        BtnState::Normal,
+                    );
+                    if hovered {
+                        *tooltip = Some((field, match (part, enabled) {
+                            (TitlePart::Outline, true) => "Turn the outline off",
+                            (TitlePart::Outline, false) => "Turn the outline on",
+                            (TitlePart::Shadow, true) => "Turn the shadow off",
+                            (TitlePart::Shadow, false) => "Turn the shadow on",
+                        }));
+                    }
+                    let name_x = field.x + field.w + 8.0;
+                    let baseline = self.centred_baseline(row, EFFECT_NAME_SIZE);
+                    let color = if enabled { CLIP_LABEL_COLOR } else { EFFECT_OFF_COLOR };
+                    self.text.draw(
+                        &self.queue,
+                        &mut self.quads,
+                        [name_x, baseline],
+                        part.name(),
+                        EFFECT_NAME_SIZE,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Which of a title's lines the text box shows, and from where along
+    /// each: all of them from their start, unless the caret (`Some` while
+    /// typing) would be out of sight — then the lines and the letters scroll
+    /// to keep it in. The one answer drawing and a click on the box share.
+    pub(crate) fn text_box_view(&self, r: Rect, text: &str, caret: Option<usize>) -> TextBoxView {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let caret_at = caret.map(|i| title::caret::line_col(text, i.min(text.len())).0);
+        let skip = match caret_at {
+            Some(line) if line >= TITLE_TEXT_MAX_LINES => line + 1 - TITLE_TEXT_MAX_LINES,
+            _ => 0,
+        };
+        let room = (r.w - TITLE_FIELD_PAD * 2.0 - TITLE_CARET_W - 1.0).max(0.0);
+        let mut start = 0;
+        let mut rows = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let line_start = start;
+            start += line.len() + 1;
+            if i < skip || i >= skip + TITLE_TEXT_MAX_LINES {
+                continue;
+            }
+            // On the caret's line, letters off the start until the caret is
+            // in the box.
+            let mut from = 0;
+            if caret_at == Some(i) {
+                let to = caret.unwrap_or(0).min(text.len()) - line_start;
+                while from < to && self.text.measure_width(&line[from..to], TITLE_FIELD_SIZE) > room {
+                    from = title::caret::right(line, from);
+                }
+            }
+            rows.push(TextBoxRow { start: line_start, from: line_start + from, end: line_start + line.len() });
+        }
+        TextBoxView { rows }
+    }
+
+    /// The position in `text` nearest to `p`, for a click on its box.
+    pub(crate) fn text_box_hit(&self, r: Rect, text: &str, caret: Option<usize>, p: [f32; 2]) -> usize {
+        let view = self.text_box_view(r, text, caret);
+        let first_top = r.y + (TITLE_FIELD_H - TITLE_TEXT_LINE_H) * 0.5;
+        let row = (((p[1] - first_top) / TITLE_TEXT_LINE_H).floor().max(0.0) as usize)
+            .min(view.rows.len().saturating_sub(1));
+        let Some(row) = view.rows.get(row) else {
+            return text.len();
+        };
+        let x = p[0] - (r.x + TITLE_FIELD_PAD);
+        let shown = &text[row.from..row.end];
+        let mut best = row.from;
+        let mut best_d = x.abs();
+        for (j, ch) in shown.char_indices() {
+            let after = j + ch.len_utf8();
+            let d = (self.text.measure_width(&shown[..after], TITLE_FIELD_SIZE) - x).abs();
+            if d < best_d {
+                best_d = d;
+                best = row.from + after;
+            }
+        }
+        best
+    }
+
+    /// The title's words, every line of them, in a box that grows to hold
+    /// them, with the caret where it is while being typed into.
+    fn draw_text_box(&mut self, r: Rect, text: &str, hovered: bool, caret: Option<usize>) {
+        self.draw_field(r, "", hovered, caret.is_some(), None);
+        let view = self.text_box_view(r, text, caret);
+        let max_w = (r.w - TITLE_FIELD_PAD * 2.0).max(0.0);
+        let ascent = self.text.ascent(TITLE_FIELD_SIZE);
+        let first_baseline =
+            r.y + (TITLE_FIELD_H - TITLE_TEXT_LINE_H) * 0.5 + (TITLE_TEXT_LINE_H + ascent) * 0.5;
+        for (n, row) in view.rows.iter().enumerate() {
+            let baseline = (first_baseline + n as f32 * TITLE_TEXT_LINE_H).round();
+            let x0 = r.x + TITLE_FIELD_PAD;
+            let shown = truncate_to_width(&self.text, &text[row.from..row.end], TITLE_FIELD_SIZE, max_w);
+            self.text.draw(&self.queue, &mut self.quads, [x0, baseline], &shown, TITLE_FIELD_SIZE, CLIP_LABEL_COLOR);
+            if let Some(i) = caret.filter(|&i| i >= row.start && i <= row.end) {
+                let x = (x0 + self.text.measure_width(&text[row.from..i.max(row.from)], TITLE_FIELD_SIZE)).round();
+                self.quads.push(Quad::colored(
+                    [x, (baseline - ascent).round()],
+                    [TITLE_CARET_W, (ascent * 1.25).round()],
+                    TITLE_CARET_COLOR,
+                ));
+            }
+        }
+    }
+
+    /// A box with words in it: the title's text, or its font with a chevron
+    /// saying it opens a list. `active` while it is being typed into or its
+    /// list is open.
+    fn draw_field(&mut self, r: Rect, words: &str, hovered: bool, active: bool, icon: Option<char>) {
+        let border = if active {
+            TITLE_FIELD_ACTIVE_BORDER
+        } else if hovered {
+            TITLE_FIELD_HOVER_BORDER
+        } else {
+            TITLE_FIELD_BORDER
+        };
+        self.quads.push(Quad::colored([r.x, r.y], [r.w, r.h], border));
+        self.quads.push(Quad::colored([r.x + 1.0, r.y + 1.0], [r.w - 2.0, r.h - 2.0], TITLE_FIELD_BG));
+        let icon_w = icon.map_or(0.0, |_| r.h);
+        if let Some(icon) = icon {
+            let glyph = icon.to_string();
+            let gw = self.text.measure_width(&glyph, TITLE_FIELD_SIZE);
+            let baseline = self.centred_baseline(r, TITLE_FIELD_SIZE);
+            self.text.draw(
+                &self.queue,
+                &mut self.quads,
+                [(r.x + r.w - (icon_w + gw) * 0.5).round(), baseline],
+                &glyph,
+                TITLE_FIELD_SIZE,
+                EFFECT_META_COLOR,
+            );
+        }
+        let max_w = (r.w - TITLE_FIELD_PAD * 2.0 - icon_w).max(0.0);
+        if words.is_empty() {
+            return;
+        }
+        let shown = truncate_to_width(&self.text, words, TITLE_FIELD_SIZE, max_w);
+        let baseline = self.centred_baseline(r, TITLE_FIELD_SIZE);
+        self.text.draw(
+            &self.queue,
+            &mut self.quads,
+            [r.x + TITLE_FIELD_PAD, baseline],
+            &shown,
+            TITLE_FIELD_SIZE,
+            CLIP_LABEL_COLOR,
+        );
+    }
+
+    /// The list of installed fonts, dropped from the font box: over
+    /// everything, like the project popup.
+    pub(crate) fn draw_font_menu(&mut self) {
+        let Some(menu) = State::font_menu(self) else {
+            return;
+        };
+        let current = self.effects_title().and_then(|(_, t)| t.font.clone());
+        let Rect { x, y, w, h } = menu.rect;
+        for step in (1..=MENU_SHADOW_STEPS).rev() {
+            let g = step as f32;
+            self.quads.push(Quad::colored([x - g, y - g + 1.0], [w + g * 2.0, h + g * 2.0], MENU_SHADOW));
+        }
+        self.quads.push(Quad::colored([x - 1.0, y - 1.0], [w + 2.0, h + 2.0], MENU_BORDER));
+        self.quads.push(Quad::colored([x, y], [w, h], MENU_BG));
+        for &(i, rect) in &menu.rows {
+            let family = fonts::choice(i);
+            draw_menu_row(
+                &mut self.quads,
+                &mut self.text,
+                &self.queue,
+                rect,
+                family.unwrap_or("Default"),
+                MENU_ROW_SIZE,
+                rect.contains(self.cursor),
+                family.map(str::to_string) == current,
+            );
+        }
+        // Where in the whole list the rows shown are, along the right edge.
+        let n = fonts::choice_count();
+        if menu.max_scroll > 0 {
+            let first = menu.rows.first().map_or(0, |r| r.0);
+            let track_h = h - MENU_PAD * 2.0;
+            let thumb_h = (track_h * menu.rows.len() as f32 / n as f32).max(MENU_ROW_H * 0.5);
+            let thumb_y = y + MENU_PAD + (track_h - thumb_h) * first as f32 / menu.max_scroll as f32;
+            self.quads.push(Quad::colored(
+                [x + w - MENU_PAD * 0.5 - 1.5, thumb_y.round()],
+                [3.0, thumb_h.round()],
+                SCROLLBAR_THUMB_COLOR,
+            ));
+        }
+    }
+
     fn section_baseline(&self, top: f32) -> f32 {
         (top + (EFFECTS_SECTION_H + self.text.ascent(EFFECTS_SECTION_SIZE)) * 0.5).round()
     }
@@ -316,4 +666,17 @@ fn draw_effect_art(quads: &mut QuadRenderer, kind: EffectKind, slot: Rect) {
             }
         }
     }
+}
+
+/// What the text box shows: one row per line in sight.
+pub(crate) struct TextBoxView {
+    pub(crate) rows: Vec<TextBoxRow>,
+}
+
+/// A line in the text box, as byte offsets into the title's text: where the
+/// line starts, where the part in sight starts, and where it ends.
+pub(crate) struct TextBoxRow {
+    pub(crate) start: usize,
+    pub(crate) from: usize,
+    pub(crate) end: usize,
 }

@@ -33,6 +33,8 @@ pub enum Unit {
     /// same project re-mastered from 1080p to 4K has to look the same, not
     /// half as blurred.
     CanvasHeight,
+    /// Stored 0 to 1, shown as a percentage.
+    Percent,
 }
 
 /// One adjustable number on an effect: what it is called, its range, where a
@@ -51,6 +53,7 @@ impl ParamSpec {
     pub fn format(&self, value: f32, canvas_h: u32) -> String {
         match self.unit {
             Unit::CanvasHeight => format!("{} px", (value * canvas_h as f32).round()),
+            Unit::Percent => format!("{}%", (value * 100.0).round()),
         }
     }
 

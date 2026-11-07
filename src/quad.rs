@@ -107,6 +107,8 @@ pub struct QuadRenderer {
     batches: Vec<Batch>,
     /// The band [`QuadRenderer::set_clip_x`] is trimming to, if any.
     clip_x: Option<[f32; 2]>,
+    /// The same for [`QuadRenderer::set_clip_y`], down the screen.
+    clip_y: Option<[f32; 2]>,
 }
 
 impl QuadRenderer {
@@ -263,6 +265,7 @@ impl QuadRenderer {
             quads: Vec::new(),
             batches: Vec::new(),
             clip_x: None,
+            clip_y: None,
         }
     }
 
@@ -313,6 +316,7 @@ impl QuadRenderer {
         self.quads.clear();
         self.batches.clear();
         self.clip_x = None;
+        self.clip_y = None;
     }
 
     /// Trim everything pushed from here until [`QuadRenderer::clear_clip_x`]
@@ -332,14 +336,47 @@ impl QuadRenderer {
         self.clip_x = None;
     }
 
+    /// [`QuadRenderer::set_clip_x`] down the screen: for a panel that scrolls
+    /// vertically.
+    pub fn set_clip_y(&mut self, y0: f32, y1: f32) {
+        self.clip_y = Some([y0, y1]);
+    }
+
+    pub fn clear_clip_y(&mut self) {
+        self.clip_y = None;
+    }
+
     /// `quad` cut down to the active band, or `None` if the band excludes it.
     ///
     /// Zero-width quads pass through untouched: they draw nothing either way,
     /// and dividing by their width to rescale uv would not.
-    fn clipped(&self, mut quad: Quad) -> Option<Quad> {
+    fn clipped(&self, quad: Quad) -> Option<Quad> {
+        let quad = self.clipped_x(quad)?;
+        let Some([y0, y1]) = self.clip_y else {
+            return Some(quad);
+        };
+        // Down the screen by crossing the axes, so the arithmetic is written
+        // once: swap x and y, trim across, swap back.
+        let swap = |q: Quad| Quad {
+            pos: [q.pos[1], q.pos[0]],
+            size: [q.size[1], q.size[0]],
+            uv: [q.uv[1], q.uv[0], q.uv[3], q.uv[2]],
+            ..q
+        };
+        trim(swap(quad), y0, y1).map(swap)
+    }
+
+    fn clipped_x(&self, quad: Quad) -> Option<Quad> {
         let Some([x0, x1]) = self.clip_x else {
             return Some(quad);
         };
+        trim(quad, x0, x1)
+    }
+}
+
+/// `quad` cut to the horizontal band `[x0, x1)`, with its uv cut to match.
+fn trim(mut quad: Quad, x0: f32, x1: f32) -> Option<Quad> {
+    {
         let (left, w) = (quad.pos[0], quad.size[0]);
         if w <= 0.0 {
             return Some(quad);
@@ -356,7 +393,9 @@ impl QuadRenderer {
         quad.size[0] = new_right - new_left;
         Some(quad)
     }
+}
 
+impl QuadRenderer {
     pub fn push(&mut self, quad: Quad) {
         self.push_with(quad, None);
     }

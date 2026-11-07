@@ -14,6 +14,7 @@ use winit::{
 };
 
 use crate::state::State;
+use crate::title::caret;
 
 /// Points of touchpad travel that stand in for one detent of a mouse wheel.
 /// The only number here that is a judgement rather than a translation: winit
@@ -153,15 +154,20 @@ impl ApplicationHandler for App {
                 // the key — so while a title has the caret, nothing else does.
                 if state.typing_title() {
                     match code {
-                        KeyCode::Escape => state.cancel_title_edit(),
+                        KeyCode::Escape => state.finish_title_edit(),
                         KeyCode::Backspace => state.backspace_title(),
-                        // Shift is what puts a line break in rather than
-                        // finishing, the same as any other single-line field
-                        // that can hold more than one.
-                        KeyCode::Enter | KeyCode::NumpadEnter if shift => {
-                            state.type_into_title("\n")
-                        }
-                        KeyCode::Enter | KeyCode::NumpadEnter => state.finish_title_edit(),
+                        KeyCode::Delete => state.delete_in_title(),
+                        KeyCode::ArrowLeft => state.move_title_caret(caret::left),
+                        KeyCode::ArrowRight => state.move_title_caret(caret::right),
+                        KeyCode::ArrowUp => state.move_title_caret(caret::up),
+                        KeyCode::ArrowDown => state.move_title_caret(caret::down),
+                        KeyCode::Home => state.move_title_caret(caret::home),
+                        KeyCode::End => state.move_title_caret(caret::end),
+                        // A text box: Enter starts a new line, as in any
+                        // box that holds more than one. Done is Esc or a
+                        // click anywhere else, and the whole session is one
+                        // undo step if it was not what was wanted.
+                        KeyCode::Enter | KeyCode::NumpadEnter => state.type_into_title("\n"),
                         // Whatever the layout says this key produces — which is
                         // the only thing that gets accents and other keyboards
                         // right.
@@ -200,7 +206,18 @@ impl ApplicationHandler for App {
                     KeyCode::Equal | KeyCode::NumpadAdd => state.zoom_at_playhead(1.0),
                     // The rest are edge-triggered to avoid repeat spam.
                     _ if repeat => {}
-                    KeyCode::Escape => state.project_menu_open = false,
+                    // Esc closes whatever is open, the innermost first: a
+                    // popup, then a compound clip being edited.
+                    KeyCode::Escape => {
+                        if state.project_menu_open || state.font_menu.is_some() {
+                            state.project_menu_open = false;
+                            state.font_menu = None;
+                        } else {
+                            state.close_compound();
+                        }
+                    }
+                    KeyCode::KeyG if ctrl => state.combine_selected(),
+                    KeyCode::KeyA if ctrl => state.select_all(),
                     // Shift+Z rather than a bare key: it is the counterpart to
                     // the zoom pair above, and every bare letter it could have
                     // had is a verb that edits.
@@ -215,6 +232,8 @@ impl ApplicationHandler for App {
                     // Guarded on ctrl so the file-management combos above win
                     // rather than falling through to the bare-key action.
                     KeyCode::Space if !ctrl => state.toggle_playback(),
+                    KeyCode::KeyC if ctrl => state.copy_selected(),
+                    KeyCode::KeyV if ctrl => state.paste(),
                     KeyCode::KeyO if !ctrl => state.open_file_picker(),
                     KeyCode::KeyS if !ctrl => state.split_at_playhead(),
                     KeyCode::KeyN if !ctrl => {
@@ -223,7 +242,14 @@ impl ApplicationHandler for App {
                     KeyCode::KeyT if !ctrl => state.add_title(),
                     // Enter opens the selected clip's text for editing, which
                     // is what Enter does to a name everywhere else.
-                    KeyCode::Enter | KeyCode::NumpadEnter => state.edit_selected_title(),
+                    // or a compound clip's contents.
+                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                        if state.selected_compound().is_some() {
+                            state.open_selected_compound();
+                        } else {
+                            state.edit_selected_title();
+                        }
+                    }
                     _ => {}
                 }
             }

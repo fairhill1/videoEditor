@@ -220,6 +220,27 @@ impl State {
                 [PLAYHEAD_WIDTH, scroll.y - ruler_top],
                 PLAYHEAD_COLOR,
             ));
+            // The head: a tab on the ruler with a point at its foot, the
+            // thing to grab. The whole ruler scrubs, but a line two points
+            // wide does not look like a handle, and this does.
+            let cx = layout.t_to_x(t);
+            let head_x = (cx - PLAYHEAD_HEAD_W * 0.5).round();
+            self.quads.push(Quad::colored(
+                [head_x, ruler_top],
+                [PLAYHEAD_HEAD_W, PLAYHEAD_HEAD_H],
+                PLAYHEAD_COLOR,
+            ));
+            // The point, one row at a time, narrowing to the line.
+            let rows = PLAYHEAD_HEAD_POINT_H as usize;
+            for row in 0..rows {
+                let f = 1.0 - (row as f32 + 1.0) / (rows as f32 + 1.0);
+                let w = (PLAYHEAD_WIDTH + (PLAYHEAD_HEAD_W - PLAYHEAD_WIDTH) * f).round();
+                self.quads.push(Quad::colored(
+                    [(cx - w * 0.5).round(), ruler_top + PLAYHEAD_HEAD_H + row as f32],
+                    [w, 1.0],
+                    PLAYHEAD_COLOR,
+                ));
+            }
             self.quads.clear_clip_x();
         }
 

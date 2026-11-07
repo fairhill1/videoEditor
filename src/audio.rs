@@ -5,7 +5,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_next as ffmpeg;
 
 use crate::media::MediaPool;
-use crate::timeline::{Timeline, TrackKind};
+use crate::timeline::Clip;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
@@ -467,7 +467,10 @@ impl AudioEngine {
     /// Refill the output buffer up to `TARGET_BUFFER_SEC` ahead of the current
     /// consume point. Called from the render loop — cheap when there's already
     /// plenty buffered, does actual decode work when there isn't.
-    pub fn tick(&self, timeline: &Timeline, media: &mut MediaPool) {
+    /// `tracks` are the audio tracks to play: the timeline's own and those
+    /// inside its compound clips, already on the timeline's clock — see
+    /// [`crate::timeline::flatten_audio`].
+    pub fn tick(&self, tracks: &[Vec<Clip>], media: &mut MediaPool) {
         let (mut fill_t, to_produce) = {
             let shared = self.shared.lock().unwrap();
             let target = (TARGET_BUFFER_SEC * SAMPLE_RATE as f64) as usize * CHANNELS;
@@ -490,12 +493,8 @@ impl AudioEngine {
             let chunk = (to_produce - cursor).min(MIX_CHUNK_FRAMES * CHANNELS);
             // Sum every audio clip that's live at `fill_t`. Multi-track mixing
             // is the editor-standard behavior — A1 + A2 both play.
-            for track_idx in 0..timeline.tracks.len() {
-                let track = &timeline.tracks[track_idx];
-                if track.kind != TrackKind::Audio {
-                    continue;
-                }
-                let Some(clip) = track.active_clip(fill_t) else {
+            for track in tracks {
+                let Some(clip) = track.iter().find(|c| c.contains(fill_t)) else {
                     continue;
                 };
                 let src_t = clip.source_time(fill_t);

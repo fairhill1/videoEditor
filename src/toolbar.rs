@@ -182,28 +182,50 @@ impl State {
     /// together instead of drifting apart.
     pub(crate) fn draw_timeline_toolbar(&mut self, w: f32, top_h: f32, canvas: Canvas) {
         let toolbar_center_y = top_h + TIMELINE_TOP_PAD * 0.5;
+        let btn_y = (toolbar_center_y - TRANSPORT_BTN_H * 0.5).round();
+        // Inside a compound clip: a back button, then the compound clip's
+        // name where the timeline's label goes, so it is plain which timeline
+        // this is and how to leave it.
+        let compound_name = self
+            .editing_compound()
+            .and_then(|id| self.media.get(id))
+            .map(|src| src.name.to_uppercase());
+        let mut label_x = LABEL_PAD;
+        self.timeline_back_btn = Rect::default();
+        if compound_name.is_some() {
+            self.timeline_back_btn =
+                Rect { x: LABEL_PAD, y: btn_y, w: TRANSPORT_BTN_W, h: TRANSPORT_BTN_H };
+            label_x += TRANSPORT_BTN_W + TRANSPORT_GAP * 2.0;
+        }
+        let (label, label_color) = match compound_name.as_deref() {
+            Some(name) => (name, COMPOUND_LABEL_COLOR),
+            None => ("TIMELINE", LABEL_COLOR),
+        };
+        let label = truncate_to_width(&self.text, label, LABEL_SIZE, COMPOUND_LABEL_MAX_W);
         self.text.draw(
             &self.queue,
             &mut self.quads,
             [
-                LABEL_PAD,
+                label_x,
                 (toolbar_center_y + self.text.ascent(LABEL_SIZE) * 0.5).round(),
             ],
-            "TIMELINE",
+            &label,
             LABEL_SIZE,
-            LABEL_COLOR,
+            label_color,
         );
 
-        let timeline_label_w = self.text.measure_width("TIMELINE", LABEL_SIZE);
-        let btn_y = (toolbar_center_y - TRANSPORT_BTN_H * 0.5).round();
-        let btn_x = (LABEL_PAD + timeline_label_w + LABEL_PAD * 1.5).round();
+        let timeline_label_w = self.text.measure_width(&label, LABEL_SIZE);
+        let first_x = (label_x + timeline_label_w + LABEL_PAD * 1.5).round();
         let stride = TRANSPORT_BTN_W + TRANSPORT_GAP;
-        self.timeline_split_btn = Rect {
-            x: btn_x,
+        // Select all heads the clip buttons: it picks what the rest act on.
+        self.timeline_select_all_btn = Rect {
+            x: first_x,
             y: btn_y,
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
+        let btn_x = first_x + stride;
+        self.timeline_split_btn = Rect { x: btn_x, ..self.timeline_select_all_btn };
         // Delete sits next to Split — both act on clips — with undo/redo after
         // them. Those live here rather than in a window-level toolbar because
         // history covers timeline + pool edits, which is what this strip
@@ -212,16 +234,32 @@ impl State {
             x: btn_x + stride,
             ..self.timeline_split_btn
         };
-        self.timeline_undo_btn = Rect {
+        self.timeline_copy_btn = Rect {
             x: btn_x + stride * 2.0,
             ..self.timeline_split_btn
         };
-        self.timeline_redo_btn = Rect {
+        self.timeline_paste_btn = Rect {
             x: btn_x + stride * 3.0,
             ..self.timeline_split_btn
         };
-        self.timeline_snap_btn = Rect {
+        self.timeline_combine_btn = Rect {
             x: btn_x + stride * 4.0,
+            ..self.timeline_split_btn
+        };
+        self.timeline_open_compound_btn = Rect {
+            x: btn_x + stride * 5.0,
+            ..self.timeline_split_btn
+        };
+        self.timeline_undo_btn = Rect {
+            x: btn_x + stride * 6.0,
+            ..self.timeline_split_btn
+        };
+        self.timeline_redo_btn = Rect {
+            x: btn_x + stride * 7.0,
+            ..self.timeline_split_btn
+        };
+        self.timeline_snap_btn = Rect {
+            x: btn_x + stride * 8.0,
             ..self.timeline_split_btn
         };
         // Pinned to the right edge rather than trailing the cluster: Export
@@ -321,6 +359,12 @@ impl State {
                 avail(self.dirty),
             ),
             (
+                self.timeline_select_all_btn,
+                ICON_SELECT_ALL,
+                "Select every clip (Ctrl+A)",
+                avail(self.timeline.tracks.iter().any(|t| !t.clips.is_empty())),
+            ),
+            (
                 self.timeline_split_btn,
                 ICON_SPLIT,
                 "Split selected clips at playhead (S)",
@@ -331,6 +375,36 @@ impl State {
                 ICON_DELETE,
                 "Delete selected clips (Del)",
                 avail(self.has_selection()),
+            ),
+            (
+                self.timeline_copy_btn,
+                ICON_COPY,
+                "Copy selected clips (Ctrl+C)",
+                avail(self.has_selection()),
+            ),
+            (
+                self.timeline_paste_btn,
+                ICON_PASTE,
+                "Paste at the playhead (Ctrl+V)",
+                avail(!self.clipboard.is_empty()),
+            ),
+            (
+                self.timeline_combine_btn,
+                ICON_COMBINE,
+                "Combine selected clips into a compound clip (Ctrl+G)",
+                avail(self.has_selection()),
+            ),
+            (
+                self.timeline_open_compound_btn,
+                ICON_EDIT,
+                "Open the selected compound clip to edit it (Enter)",
+                avail(self.selected_compound().is_some()),
+            ),
+            (
+                self.timeline_back_btn,
+                ICON_BACK,
+                "Back to the timeline this compound clip is on (Esc)",
+                BtnState::Normal,
             ),
             (
                 self.timeline_undo_btn,

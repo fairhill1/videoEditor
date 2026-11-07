@@ -10,7 +10,6 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::software::scaling;
 use ffmpeg::{format, frame};
 
-use crate::colorspace;
 use crate::compose::Layer;
 
 /// Limited-range black in YUV420P, matching the range x264 signals by default,
@@ -168,126 +167,10 @@ fn for_each_plane(
     }
 }
 
-/// A colour in the output's YUV, obtained by handing it to the scaler.
-///
-/// Two by two because that is the smallest frame YUV420P can represent — one
-/// chroma sample needs a full quad of luma.
-///
-/// The scaler is told BT.709 explicitly, matching the tag the encoder writes.
-/// Left to its default it uses BT.601, which a BT.709 player decodes as a
-/// slightly different shade: whites and greys survive, a saturated title
-/// colour does not. Footage needs no such care because it never goes through
-/// RGB — it stays in the YUV it was recorded in.
-pub(super) fn color_to_yuv(color: [f32; 4]) -> (u8, u8, u8) {
-    let mut rgb = frame::Video::new(format::Pixel::RGBA, 2, 2);
-    let stride = rgb.stride(0);
-    let bytes = [
-        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-        255,
-    ];
-    let data = rgb.data_mut(0);
-    for row in 0..2 {
-        for col in 0..2 {
-            let at = row * stride + col * 4;
-            data[at..at + 4].copy_from_slice(&bytes);
-        }
-    }
-    let mut yuv = frame::Video::empty();
-    // The scaler refusing a 2x2 conversion would be remarkable; mid grey is at
-    // least a colour rather than a panic in a background worker.
-    let grey = (128, 128, 128);
-    let mut scaler = match scaling::Context::get(
-        format::Pixel::RGBA,
-        2,
-        2,
-        format::Pixel::YUV420P,
-        2,
-        2,
-        scaling::Flags::BILINEAR,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("title colour scaler setup failed: {e}");
-            return grey;
-        }
-    };
-    if !colorspace::use_matrix(&mut scaler, ffmpeg::ffi::SWS_CS_ITU709) {
-        log::warn!("scaler kept its default matrix; title colours may shift");
-    }
-    if let Err(e) = scaler.run(&rgb, &mut yuv) {
-        log::error!("title colour conversion failed: {e}");
-        return grey;
-    }
-    (yuv.data(0)[0], yuv.data(1)[0], yuv.data(2)[0])
-}
-
-/// Paint a flat `color` onto `dst` at `(x, y)`, as much of it at each pixel as
-/// `mask` says and `alpha` allows.
-///
-/// The picture counterpart of a fader: the title never varies in colour, only
-/// in how much of it is there, so this is a mix towards a constant rather than
-/// towards another picture.
-pub(super) fn compose_color(
-    dst: &mut frame::Video,
-    mask: &frame::Video,
-    x: u32,
-    y: u32,
-    color: (u8, u8, u8),
-    alpha: f32,
-) {
-    let alpha = alpha.clamp(0.0, 1.0);
-    if alpha <= 0.0 {
-        return;
-    }
-    let w = mask.width() as usize;
-    let h = mask.height() as usize;
-    let mask_stride = mask.stride(0);
-    let mask_data = mask.data(0);
-    let cov = |row: usize, col: usize| mask_data[row * mask_stride + col] as i32;
-    // Folded in once here rather than per sample: coverage is already the
-    // per-pixel part, and the clip's opacity is the same number everywhere.
-    let scale = |c: i32| ((c as f32) * alpha) as i32;
-
-    // Luma, one sample per pixel.
-    let stride = dst.stride(0);
-    let rows = h.min((dst.plane_height(0) as usize).saturating_sub(y as usize));
-    let cols = w.min((dst.plane_width(0) as usize).saturating_sub(x as usize));
-    let data = dst.data_mut(0);
-    for row in 0..rows {
-        let at = (y as usize + row) * stride + x as usize;
-        for col in 0..cols {
-            data[at + col] = mix(data[at + col], color.0, scale(cov(row, col)));
-        }
-    }
-
-    // Chroma, one sample per 2x2 block. The block's coverage is the mean of
-    // its four, so a diagonal edge fades its colour off at the same rate its
-    // luma does instead of stepping a whole sample at a time.
-    for (plane, value) in [(1usize, color.1), (2, color.2)] {
-        let stride = dst.stride(plane);
-        let rows = (h / 2).min((dst.plane_height(plane) as usize).saturating_sub(y as usize / 2));
-        let cols = (w / 2).min((dst.plane_width(plane) as usize).saturating_sub(x as usize / 2));
-        let data = dst.data_mut(plane);
-        for row in 0..rows {
-            let at = (y as usize / 2 + row) * stride + x as usize / 2;
-            for col in 0..cols {
-                let mean = (cov(row * 2, col * 2)
-                    + cov(row * 2, col * 2 + 1)
-                    + cov(row * 2 + 1, col * 2)
-                    + cov(row * 2 + 1, col * 2 + 1))
-                    / 4;
-                data[at + col] = mix(data[at + col], value, scale(mean));
-            }
-        }
-    }
-}
-
 /// Paint `src` onto `dst` at `(x, y)`, as much of it at each pixel as `mask`
 /// says and `alpha` allows: an image with transparency over what is below.
 ///
-/// [`compose_color`] with a picture in place of the flat colour, and the same
+/// A picture rather than a flat colour, and the same
 /// treatment of chroma: each 2x2 block takes the mean of its four coverages, so
 /// a soft edge fades its colour at the rate its luma fades.
 pub(super) fn compose_masked(
@@ -571,26 +454,6 @@ mod tests {
     #[test]
     fn a_sliver_thinner_than_a_chroma_sample_places_nowhere() {
         assert!(place_even(&layer([1919.5, 0.0, 1.0, 200.0]), 1920, 1080).is_none());
-    }
-
-    /// Pure red under BT.709 limited range is Y 63, Cb 102, Cr 240; BT.601
-    /// would give Y 81, Cb 90. Luma and blue-difference are where the two
-    /// matrices part, so those are what this pins.
-    #[test]
-    fn title_colours_convert_with_the_bt709_matrix() {
-        let (y, cb, cr) = color_to_yuv([1.0, 0.0, 0.0, 1.0]);
-        assert!(y.abs_diff(63) <= 2, "Y {y}");
-        assert!(cb.abs_diff(102) <= 2, "Cb {cb}");
-        assert!(cr.abs_diff(240) <= 2, "Cr {cr}");
-    }
-
-    /// Neutral greys are where the matrices agree, and where the range
-    /// mapping is easiest to get wrong: white must land on 235, not 255.
-    #[test]
-    fn white_lands_on_limited_range_white() {
-        let (y, cb, cr) = color_to_yuv([1.0, 1.0, 1.0, 1.0]);
-        assert!(y.abs_diff(235) <= 1, "Y {y}");
-        assert!(cb.abs_diff(128) <= 1 && cr.abs_diff(128) <= 1, "Cb {cb} Cr {cr}");
     }
 
     fn flat_frame(w: u32, h: u32, y: u8, uv: u8) -> frame::Video {

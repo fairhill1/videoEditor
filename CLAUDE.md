@@ -6,7 +6,8 @@
 `State` (`src/state.rs`) whose behaviour is split across modules by concern,
 each adding its own `impl State`: `layout` (geometry, the timeline's visible
 window, and hit testing), `input` (pointer gestures), `edit` (timeline
-mutations and undo), `session` (project files), `canvas` (project format and
+mutations and undo), `session` (project files), `compound` (compound clips:
+combining, opening and closing them), `canvas` (project format and
 its popup), and `render` / `toolbar` / `timeline_view` / `effects_view`
 (drawing).
 
@@ -14,7 +15,11 @@ Effects are modelled in `effects.rs`, which also holds the blur arithmetic
 both renderers follow: `blur.rs` + `blur.wgsl` run it on the GPU for the
 preview, `export/blur.rs` on the CPU for the file. A change to how a blur is
 computed lands in all three, and `blur::tests` checks the shader against the
-CPU path. New behaviour
+CPU path.
+
+A title is drawn once into a straight-RGBA picture by `title::render` (fill,
+outline, shadow; faces from `fonts.rs`). The preview uploads that picture and
+the export takes it as a still, so both show the same title. New behaviour
 joins the module that matches its concern rather than going back into
 `main.rs`.
 

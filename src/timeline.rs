@@ -238,9 +238,104 @@ impl Track {
             clips: Vec::new(),
         }
     }
+}
 
-    pub fn active_clip(&self, t: f64) -> Option<&Clip> {
-        self.clips.iter().find(|c| c.contains(t))
+/// What a compound clip holds: tracks of its own, timed from zero, in the
+/// same order and with the same meaning as the timeline's.
+pub type Tracks = Vec<(TrackKind, Vec<Clip>)>;
+
+/// How deep compound clips may sit inside each other before the rest is
+/// ignored. Far past any real edit; the bound is what keeps a cycle — which
+/// the editor refuses to make, but a hand-edited file could hold — from
+/// recursing forever.
+pub const MAX_NESTING: usize = 8;
+
+/// How long a compound clip's contents run: to the end of its last clip.
+pub fn tracks_duration(tracks: &[(TrackKind, Vec<Clip>)]) -> f64 {
+    tracks
+        .iter()
+        .flat_map(|(_, clips)| clips.iter().map(Clip::timeline_end))
+        .fold(0.0, f64::max)
+}
+
+/// `inner`, a clip inside a compound, as it plays on the timeline the
+/// compound clip `outer` sits on: moved to where `outer` puts it, and cut to
+/// the part of it `outer` shows. `None` when `outer` is trimmed past all of it.
+pub fn map_into(outer: &Clip, inner: &Clip) -> Option<Clip> {
+    let offset = outer.timeline_start - outer.source_in;
+    let s = inner.timeline_start + offset;
+    let e = s + inner.duration();
+    let lo = s.max(outer.timeline_start);
+    let hi = e.min(outer.timeline_end());
+    if hi <= lo {
+        return None;
+    }
+    let mut c = *inner;
+    c.timeline_start = lo;
+    c.source_in = inner.source_in + (lo - s);
+    c.source_out = c.source_in + (hi - lo);
+    c.clamp_fades();
+    Some(c)
+}
+
+/// Every audio clip the mixers play, as tracks: the timeline's own audio
+/// tracks, then the audio inside each compound clip, moved onto the timeline
+/// by [`map_into`]. A compound clip's sound is part of it, the way footage's
+/// is, so it plays wherever the compound clip does.
+///
+/// Compound clips on one track never overlap, so the audio of each inner
+/// track is gathered onto one track per outer one, however many compound
+/// clips that track holds.
+pub fn flatten_audio<'a>(
+    tracks: &[(TrackKind, &'a [Clip])],
+    contents_of: &dyn Fn(SourceId) -> Option<&'a [(TrackKind, Vec<Clip>)]>,
+) -> Vec<Vec<Clip>> {
+    flatten_audio_at(tracks, contents_of, 0)
+}
+
+fn flatten_audio_at<'a>(
+    tracks: &[(TrackKind, &'a [Clip])],
+    contents_of: &dyn Fn(SourceId) -> Option<&'a [(TrackKind, Vec<Clip>)]>,
+    depth: usize,
+) -> Vec<Vec<Clip>> {
+    let mut out = Vec::new();
+    for &(kind, clips) in tracks {
+        if kind == TrackKind::Audio {
+            out.push(clips.to_vec());
+            continue;
+        }
+        if depth >= MAX_NESTING {
+            continue;
+        }
+        let mut lanes: Vec<Vec<Clip>> = Vec::new();
+        for outer in clips {
+            let Some(inner) = contents_of(outer.source) else {
+                continue;
+            };
+            let inner: Vec<(TrackKind, &[Clip])> =
+                inner.iter().map(|(k, c)| (*k, c.as_slice())).collect();
+            for (i, lane) in flatten_audio_at(&inner, contents_of, depth + 1).iter().enumerate() {
+                if lanes.len() <= i {
+                    lanes.push(Vec::new());
+                }
+                lanes[i].extend(lane.iter().filter_map(|c| map_into(outer, c)));
+            }
+        }
+        out.extend(lanes.into_iter().filter(|l| !l.is_empty()));
+    }
+    out
+}
+
+/// Clips copied out of the timeline, to be pasted back in elsewhere: each with
+/// the track it came from, so a paste puts every clip back on its own lane.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Clipboard {
+    pub clips: Vec<(usize, TrackKind, Clip)>,
+}
+
+impl Clipboard {
+    pub fn is_empty(&self) -> bool {
+        self.clips.is_empty()
     }
 }
 
@@ -297,6 +392,22 @@ impl Timeline {
         let id = self.next_link;
         self.next_link += 1;
         id
+    }
+
+    /// The tracks as they are, in the form a compound clip holds them.
+    pub fn to_tracks(&self) -> Tracks {
+        self.tracks.iter().map(|t| (t.kind, t.clips.clone())).collect()
+    }
+
+    /// A timeline holding `tracks`, for editing a compound clip's contents.
+    pub fn from_tracks(tracks: &[(TrackKind, Vec<Clip>)]) -> Self {
+        let mut tl = Self::new();
+        tl.tracks = tracks
+            .iter()
+            .map(|(kind, clips)| Track { kind: *kind, clips: clips.clone() })
+            .collect();
+        tl.reseed_counters();
+        tl
     }
 
     pub fn snapshot(&self) -> TimelineSnapshot {
@@ -488,9 +599,207 @@ impl Timeline {
     }
 }
 
+impl TimelineSnapshot {
+    pub fn tracks(&self) -> &[(TrackKind, Vec<Clip>)] {
+        &self.tracks
+    }
+}
+
+impl Timeline {
+    /// The clips called `ids`, for pasting later.
+    pub fn copy(&self, ids: &std::collections::HashSet<u32>) -> Clipboard {
+        let clips = self
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, track)| {
+                track
+                    .clips
+                    .iter()
+                    .filter(|c| ids.contains(&c.id))
+                    .map(move |c| (ti, track.kind, *c))
+            })
+            .collect();
+        Clipboard { clips }
+    }
+
+    /// Put copies of `board`'s clips in, keeping their spacing and their
+    /// tracks, with the earliest of them at `at` — or, where that would land
+    /// on a clip already there, as soon after it as the whole group fits.
+    /// Returns the new clips' ids.
+    ///
+    /// The copies are clips of their own: fresh ids, and links of their own
+    /// that pair them with each other rather than with the clips they came
+    /// from. A track the clips came from that is gone, or is now the other
+    /// kind, gets a new one.
+    pub fn paste(&mut self, board: &Clipboard, at: f64) -> Vec<u32> {
+        let Some(start) = board.clips.iter().map(|(_, _, c)| c.timeline_start).reduce(f64::min)
+        else {
+            return Vec::new();
+        };
+        let mut lanes = std::collections::HashMap::new();
+        for &(ti, kind, _) in &board.clips {
+            if lanes.contains_key(&ti) {
+                continue;
+            }
+            let lane = if self.tracks.get(ti).is_some_and(|t| t.kind == kind) {
+                ti
+            } else {
+                self.push_track(kind)
+            };
+            lanes.insert(ti, lane);
+        }
+
+        // Pushed later until nothing is in the way. Each push clears the clip
+        // it found and only ever moves right, so this ends: at worst past the
+        // last clip on every track.
+        const EPS: f64 = 1e-9;
+        let mut shift = at.max(0.0) - start;
+        'fit: loop {
+            for (ti, _, clip) in &board.clips {
+                let s = clip.timeline_start + shift;
+                let e = s + clip.duration();
+                let blocker = self.tracks[lanes[ti]]
+                    .clips
+                    .iter()
+                    .filter(|o| o.timeline_start < e - EPS && o.timeline_end() > s + EPS)
+                    .map(Clip::timeline_end)
+                    .reduce(f64::max);
+                if let Some(end) = blocker {
+                    shift += end - s;
+                    continue 'fit;
+                }
+            }
+            break;
+        }
+
+        let mut links = std::collections::HashMap::new();
+        let mut ids = Vec::with_capacity(board.clips.len());
+        for (ti, _, clip) in &board.clips {
+            let link = clip.link.map(|old| *links.entry(old).or_insert_with(|| {
+                let id = self.next_link;
+                self.next_link += 1;
+                id
+            }));
+            let id = self.new_clip_id();
+            self.tracks[lanes[ti]].clips.push(Clip {
+                id,
+                link,
+                timeline_start: clip.timeline_start + shift,
+                ..*clip
+            });
+            ids.push(id);
+        }
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clip inside a compound clip plays where the compound clip puts it,
+    /// cut to the part of the contents the compound clip is trimmed to.
+    #[test]
+    fn a_clip_inside_a_compound_maps_onto_the_outer_timeline() {
+        let outer = Clip { source_in: 1.0, source_out: 3.0, timeline_start: 10.0, ..Clip::default() };
+        // Runs 0.5..2.5 inside: its first half second is trimmed away.
+        let inner = Clip { source_in: 5.0, source_out: 7.0, timeline_start: 0.5, ..Clip::default() };
+        let mapped = map_into(&outer, &inner).unwrap();
+        assert_eq!(mapped.timeline_start, 10.0);
+        assert_eq!(mapped.source_in, 5.5);
+        assert_eq!(mapped.timeline_end(), 11.5);
+        // Entirely in the trimmed-off part: nothing.
+        let early = Clip { source_out: 0.5, ..inner };
+        let early = Clip { timeline_start: 0.0, ..early };
+        assert!(map_into(&outer, &early).is_none());
+    }
+
+    #[test]
+    fn a_compound_clips_sound_joins_the_mix() {
+        let inner: Tracks = vec![
+            (TrackKind::Video, vec![clip(0.0, 4.0)]),
+            (TrackKind::Audio, vec![Clip { source: SourceId(3), ..clip(1.0, 2.0) }]),
+        ];
+        let compound = Clip { source: SourceId(9), ..clip(10.0, 4.0) };
+        let own_audio = vec![Clip { source: SourceId(4), ..clip(0.0, 1.0) }];
+        let tracks: Vec<(TrackKind, &[Clip])> = vec![
+            (TrackKind::Video, std::slice::from_ref(&compound)),
+            (TrackKind::Audio, own_audio.as_slice()),
+        ];
+        let flat = flatten_audio(&tracks, &|id| (id == SourceId(9)).then_some(inner.as_slice()));
+        assert_eq!(flat.len(), 2);
+        let all: Vec<&Clip> = flat.iter().flatten().collect();
+        let from_compound = all.iter().find(|c| c.source == SourceId(3)).unwrap();
+        assert_eq!(from_compound.timeline_start, 11.0);
+        assert!(all.iter().any(|c| c.source == SourceId(4)));
+    }
+
+    fn board_of(tl: &Timeline, ids: &[u32]) -> Clipboard {
+        tl.copy(&ids.iter().copied().collect())
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_playhead_keeping_its_spacing() {
+        let mut tl = timeline_with(vec![clip(0.0, 2.0), clip(3.0, 1.0)]);
+        let board = board_of(&tl, &[0, 1]);
+        let ids = tl.paste(&board, 10.0);
+        assert_eq!(ids.len(), 2);
+        let starts: Vec<f64> = ids.iter().map(|id| {
+            let (t, i) = tl.find(*id).unwrap();
+            tl.tracks[t].clips[i].timeline_start
+        }).collect();
+        assert_eq!(starts, vec![10.0, 13.0]);
+    }
+
+    #[test]
+    fn a_paste_onto_a_clip_goes_after_it() {
+        let mut tl = timeline_with(vec![clip(0.0, 4.0), clip(6.0, 2.0)]);
+        let board = board_of(&tl, &[1]);
+        // Playhead in the middle of the first clip: after it, where 2s fits.
+        let ids = tl.paste(&board, 1.0);
+        let (t, i) = tl.find(ids[0]).unwrap();
+        assert_eq!(tl.tracks[t].clips[i].timeline_start, 4.0);
+        // Again at the same spot: the gap is now full up to 8, so after that.
+        let ids = tl.paste(&board, 1.0);
+        let (t, i) = tl.find(ids[0]).unwrap();
+        assert_eq!(tl.tracks[t].clips[i].timeline_start, 8.0);
+    }
+
+    #[test]
+    fn pasted_clips_link_to_each_other_not_to_the_originals() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        let link = tl.new_link_id();
+        let (v, a) = (tl.new_clip_id(), tl.new_clip_id());
+        tl.tracks[0].clips.push(Clip { id: v, link: Some(link), ..clip(0.0, 3.0) });
+        tl.tracks[1].clips.push(Clip { id: a, link: Some(link), ..clip(0.0, 3.0) });
+        let board = board_of(&tl, &[v, a]);
+        let ids = tl.paste(&board, 5.0);
+        let (vt, vi) = tl.find(ids[0]).unwrap();
+        let (at, ai) = tl.find(ids[1]).unwrap();
+        assert_eq!((vt, at), (0, 1), "each back on its own track");
+        let (nv, na) = (tl.tracks[vt].clips[vi], tl.tracks[at].clips[ai]);
+        assert_eq!(nv.link, na.link);
+        assert!(nv.link.is_some() && nv.link != Some(link));
+        assert!(nv.id != v && na.id != a);
+    }
+
+    #[test]
+    fn a_paste_whose_track_is_gone_makes_one() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks.push(Track::new(TrackKind::Video));
+        let id = tl.new_clip_id();
+        tl.tracks[1].clips.push(Clip { id, ..clip(0.0, 1.0) });
+        let board = board_of(&tl, &[id]);
+        tl.tracks.truncate(1);
+        let ids = tl.paste(&board, 0.0);
+        assert_eq!(tl.tracks.len(), 2);
+        assert_eq!(tl.find(ids[0]).unwrap().0, 1);
+        assert_eq!(tl.tracks[1].kind, TrackKind::Video);
+    }
 
     /// Only the clips picked are cut: the rest of the stack under the playhead
     /// is left whole.

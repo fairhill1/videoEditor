@@ -6,13 +6,16 @@
 //! change itself lives there.
 
 use crate::effects::EffectKind;
+use crate::fonts;
 use crate::layout::{
     resolve_split, track_header_button, y_to_gain, y_to_opacity, EffectsHit, PoolTab, PoolView,
+    TitleControl,
     PreviewHit, Splitter, TimelineHit,
 };
 use crate::state::State;
 use crate::theme::*;
 use crate::timeline::{Clip, FadeSide, SourceId, TrackKind, Transform};
+use crate::title::{TitleNumber, SWATCHES};
 use crate::ui::Rect;
 
 #[derive(Copy, Clone, Debug)]
@@ -26,7 +29,15 @@ pub(crate) enum DragMode {
     /// rect as the press found it, so the value follows the cursor along the
     /// same span the knob is drawn in.
     EffectParam { index: usize, param: usize, slider: Rect },
-    ClipMove { track: usize, idx: usize, grab_t_offset: f64 },
+    /// Dragging one of a title's sliders on the effects tab. One undo step,
+    /// opened at the press and closed in `end_drag`, as for an effect's.
+    TitleNumber { field: TitleNumber, slider: Rect },
+    /// Moving a clip along the timeline. `group` when it was pressed as one
+    /// of several selected clips: then every selected clip moves with it, and
+    /// it stays on its track. `moved` turns true at the first step, so a
+    /// click on a group member that never dragged can narrow the selection to
+    /// that clip on release.
+    ClipMove { track: usize, idx: usize, grab_t_offset: f64, group: bool, moved: bool },
     ClipTrimLeft { track: usize, idx: usize },
     ClipTrimRight { track: usize, idx: usize },
     ClipFade { track: usize, idx: usize, side: FadeSide },
@@ -109,6 +120,17 @@ impl State {
             self.project_menu_open = true;
             return;
         }
+        // The font list, the same way: a pick, or a press anywhere else that
+        // only closes it.
+        if let Some(menu) = self.font_menu() {
+            self.font_menu = None;
+            if let Some(&(i, _)) = menu.rows.iter().find(|(_, r)| r.contains([cx, cy])) {
+                let family = fonts::choice(i).map(str::to_string);
+                self.change_shown_title(|t| t.font = family);
+            }
+            return;
+        }
+        self.font_menu = None;
         // Before every button and panel: a divider sits on top of the panels it
         // separates, and its grab band overlaps them by design. Nothing else
         // lives within a few points of one, so this costs the rest nothing.
@@ -136,6 +158,10 @@ impl State {
             self.goto_edit_point(true);
             return;
         }
+        if self.timeline_select_all_btn.contains([cx, cy]) {
+            self.select_all();
+            return;
+        }
         if self.timeline_split_btn.contains([cx, cy]) {
             self.split_at_playhead();
             return;
@@ -152,6 +178,26 @@ impl State {
         }
         if self.timeline_delete_btn.contains([cx, cy]) {
             self.delete_selected();
+            return;
+        }
+        if self.timeline_copy_btn.contains([cx, cy]) {
+            self.copy_selected();
+            return;
+        }
+        if self.timeline_paste_btn.contains([cx, cy]) {
+            self.paste();
+            return;
+        }
+        if self.timeline_combine_btn.contains([cx, cy]) {
+            self.combine_selected();
+            return;
+        }
+        if self.timeline_open_compound_btn.contains([cx, cy]) {
+            self.open_selected_compound();
+            return;
+        }
+        if self.timeline_back_btn.contains([cx, cy]) {
+            self.close_compound();
             return;
         }
         if self.timeline_snap_btn.contains([cx, cy]) {
@@ -280,6 +326,32 @@ impl State {
                         self.drag = DragMode::EffectParam { index, param, slider };
                         self.update_drag();
                     }
+                    Some(EffectsHit::TitleText) => {
+                        // The caret goes where the click is, worked out on the
+                        // box as it was drawn — scrolled to the old caret if
+                        // typing was already under way.
+                        let typing = self.typing_title();
+                        let caret = typing.then_some(self.title_caret);
+                        let panel = self.effects_panel();
+                        let field = panel.title.iter().find(|r| r.control == TitleControl::Text).map(|r| r.field);
+                        if let (Some((source, title)), Some(field)) = (self.effects_title(), field) {
+                            let at = self.text_box_hit(field, &title.text, caret, [cx, cy]);
+                            self.begin_title_edit(source);
+                            self.title_caret = at;
+                        }
+                    }
+                    Some(EffectsHit::TitleFont) => self.open_font_menu(),
+                    Some(EffectsHit::TitleNumber { field, slider }) => {
+                        self.begin_edit();
+                        self.drag = DragMode::TitleNumber { field, slider };
+                        self.update_drag();
+                    }
+                    Some(EffectsHit::TitleSwatch { field, swatch }) => {
+                        self.change_shown_title(|t| field.set(t, SWATCHES[swatch]));
+                    }
+                    Some(EffectsHit::TitleToggle(part)) => {
+                        self.change_shown_title(|t| part.toggle(t));
+                    }
                     None => {}
                 }
                 return;
@@ -355,9 +427,16 @@ impl State {
                 self.drag = DragMode::ClipTrimRight { track, idx };
             }
             TimelineHit::ClipBody { track, idx, grab_t_offset } => {
-                self.select_clip_at(track, idx);
+                // A press on one of several selected clips keeps them all
+                // selected, so the drag that follows takes the group.
+                let id = self.timeline.tracks[track].clips[idx].id;
+                let group = self.is_selected(id) && self.selection_with_links().len()
+                    > self.linked_siblings(track, idx).len();
+                if !group {
+                    self.select_clip_at(track, idx);
+                }
                 self.begin_edit();
-                self.drag = DragMode::ClipMove { track, idx, grab_t_offset };
+                self.drag = DragMode::ClipMove { track, idx, grab_t_offset, group, moved: false };
             }
             TimelineHit::ClipFade { track, idx, side } => {
                 self.select_clip_at(track, idx);
@@ -407,6 +486,10 @@ impl State {
                 let value = spec.at(slider_fraction(slider, self.cursor[0]) as f32);
                 self.set_effect_param(index, param, value);
             }
+            DragMode::TitleNumber { field, slider } => {
+                let value = field.spec().at(slider_fraction(slider, self.cursor[0]) as f32);
+                self.edit_shown_title(|t| field.set(t, value));
+            }
             DragMode::Scrub => self.apply_scrub(),
             DragMode::Pan { grab_x, start } => {
                 let px_per_sec = self.timeline_layout().px_per_sec();
@@ -442,7 +525,20 @@ impl State {
                     self.dirty = true;
                 }
             }
-            DragMode::ClipMove { track, idx, grab_t_offset } => {
+            DragMode::ClipMove { track, idx, grab_t_offset, group, .. } if group => {
+                let layout = self.timeline_layout();
+                let cursor_t = layout.cursor_to_t(self.cursor[0]);
+                let current_start = self.timeline.tracks[track].clips[idx].timeline_start;
+                let desired_delta = (cursor_t - grab_t_offset) - current_start;
+                if desired_delta != 0.0 {
+                    self.drag = DragMode::ClipMove { track, idx, grab_t_offset, group, moved: true };
+                }
+                let ids = self.selection_with_links();
+                let set: Vec<(usize, usize)> =
+                    ids.iter().filter_map(|id| self.timeline.find(*id)).collect();
+                self.apply_group_move_delta(&set, desired_delta);
+            }
+            DragMode::ClipMove { track, idx, grab_t_offset, .. } => {
                 let layout = self.timeline_layout();
                 // Allow vertical drag: if the cursor is over a different
                 // same-kind track, relocate the clip there before nudging x.
@@ -461,6 +557,8 @@ impl State {
                             track: hover,
                             idx: new_idx,
                             grab_t_offset,
+                            group: false,
+                            moved: true,
                         };
                         (hover, new_idx)
                     } else {
@@ -578,6 +676,13 @@ impl State {
     }
 
     pub(crate) fn end_drag(&mut self) {
+        // A click on one of several selected clips that never became a drag
+        // picks that clip alone, as a click on any other clip does.
+        if let DragMode::ClipMove { track, idx, group: true, moved: false, .. } = self.drag {
+            if track < self.timeline.tracks.len() && idx < self.timeline.tracks[track].clips.len() {
+                self.select_clip_at(track, idx);
+            }
+        }
         // Dropped on a clip: the effect goes on that clip's picture, and the
         // clip is selected so the panel the effect came from shows it there.
         if let DragMode::EffectDrag { kind } = self.drag {
@@ -587,6 +692,11 @@ impl State {
             }
         }
         if let DragMode::PoolDrag { source } = self.drag {
+            if !self.may_place(source) && self.cursor[1] >= self.timeline_top() {
+                self.refuse_nesting();
+                self.drag = DragMode::None;
+                return;
+            }
             let cy = self.cursor[1];
             let layout = self.timeline_layout();
             // Opened before a track can be made, so a new track and the clip
@@ -708,6 +818,22 @@ impl State {
     /// and a wheel that silently zoomed the timeline from over the media pool
     /// would read as a bug.
     pub(crate) fn wheel(&mut self, dx: f32, dy: f32) {
+        // The font list first: it is drawn over the panels, so the wheel over
+        // it means it.
+        if let Some(menu) = self.font_menu() {
+            if menu.rect.contains(self.cursor) {
+                let rows = self.font_menu.unwrap_or(0).min(menu.max_scroll) as f32 - dy.round();
+                self.font_menu = Some((rows.max(0.0) as usize).min(menu.max_scroll));
+                return;
+            }
+        }
+        let [cx, cy] = self.cursor;
+        if self.pool_tab == PoolTab::Effects && cx < self.media_pool_w() && cy < self.timeline_top() {
+            // Down the page for a wheel turned towards you, as everywhere.
+            let max = self.effects_panel().max_scroll;
+            self.effects_scroll = (self.effects_scroll - dy * EFFECTS_SCROLL_STEP).clamp(0.0, max);
+            return;
+        }
         if self.cursor[1] < self.timeline_top() {
             return;
         }

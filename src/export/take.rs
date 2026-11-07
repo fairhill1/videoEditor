@@ -12,12 +12,12 @@ use ffmpeg::{codec, format, frame};
 
 use crate::colorspace;
 use crate::effects::BlurPlan;
-use crate::still;
-use crate::title::{self, Title};
+use crate::still::{self, Rgba};
 
-use super::blur::{blur_gray, blur_yuv};
+
+use super::blur::blur_yuv;
 use super::raster::{
-    alloc_gray, alloc_yuv, color_to_yuv, crop_gray8, crop_yuv420p, even_down, even_up,
+    alloc_gray, alloc_yuv, crop_gray8, crop_yuv420p, even_down, even_up,
     scale_gray_into, scale_into, Placement,
 };
 
@@ -316,130 +316,6 @@ impl VideoTake {
 
 }
 
-/// A title, rasterized once for the whole render.
-///
-/// Nothing here decodes. What varies across a title's frame is only how much of
-/// one colour is present, so what is carried is a coverage mask and three
-/// numbers — not a picture. That is also why it scales in one plane rather than
-/// three: a title moved and shrunk on the canvas resamples a quarter of the
-/// data a clip of footage would.
-pub(super) struct TitleTake {
-    /// Coverage at canvas size, held as a frame so the scaler can take it.
-    pub(super) mask: frame::Video,
-    pub(super) cropped: frame::Video,
-    pub(super) scaled: frame::Video,
-    pub(super) scaler: Option<scaling::Context>,
-    /// The mask blurred at the plan's work size, then back at canvas size, for
-    /// the plan it answers — the same round trip [`VideoTake`] makes, for the
-    /// same reason.
-    pub(super) blur_work: frame::Video,
-    pub(super) restored: frame::Video,
-    pub(super) restore_scaler: Option<scaling::Context>,
-    pub(super) blurred_for: Option<BlurPlan>,
-    /// The title's colour, already in the output's own YUV.
-    pub(super) color: (u8, u8, u8),
-    /// The colour's own alpha, before the clip's opacity and fades multiply in.
-    pub(super) alpha: f32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-}
-
-impl TitleTake {
-    pub(super) fn bake(title: &Title, width: u32, height: u32) -> Self {
-        let mask = title::rasterize(title, width, height);
-        let mut frame = frame::Video::new(format::Pixel::GRAY8, width, height);
-        let stride = frame.stride(0);
-        let data = frame.data_mut(0);
-        for row in 0..height as usize {
-            let from = row * width as usize;
-            data[row * stride..row * stride + width as usize]
-                .copy_from_slice(&mask.coverage[from..from + width as usize]);
-        }
-        Self {
-            mask: frame,
-            cropped: frame::Video::empty(),
-            scaled: frame::Video::empty(),
-            scaler: None,
-            blur_work: frame::Video::empty(),
-            restored: frame::Video::empty(),
-            restore_scaler: None,
-            blurred_for: None,
-            color: color_to_yuv(title.color),
-            alpha: title.color[3],
-            width,
-            height,
-        }
-    }
-
-    pub(super) fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// The coverage this placement needs: the part of the mask still on canvas,
-    /// at the size it is being drawn, blurred first when `blur` says so.
-    ///
-    /// The common case — a title left where it was made — is the mask itself,
-    /// untouched: it was rasterized at canvas size, so filling the canvas asks
-    /// for no crop and no resample.
-    pub(super) fn stage(
-        &mut self,
-        placement: Placement,
-        blur: Option<BlurPlan>,
-    ) -> Option<&frame::Video> {
-        if let Some(plan) = blur {
-            if self.blurred_for != Some(plan) {
-                self.blurred_for = None;
-                blur_gray(&self.mask, plan, &mut self.blur_work);
-                if !scale_gray_into(
-                    &mut self.restore_scaler,
-                    &self.blur_work,
-                    &mut self.restored,
-                    self.width,
-                    self.height,
-                ) {
-                    return None;
-                }
-                self.blurred_for = Some(plan);
-            }
-        }
-        let mask = if blur.is_some() { &self.restored } else { &self.mask };
-        let full = placement.src == [0.0, 0.0, 1.0, 1.0];
-        if full && placement.w == self.width && placement.h == self.height {
-            return Some(mask);
-        }
-        let source = if full {
-            mask
-        } else {
-            let [u0, v0, u1, v1] = placement.src;
-            let x0 = (u0 * self.width as f32).round() as u32;
-            let y0 = (v0 * self.height as f32).round() as u32;
-            let x1 = (u1 * self.width as f32).round().min(self.width as f32) as u32;
-            let y1 = (v1 * self.height as f32).round().min(self.height as f32) as u32;
-            if x1 <= x0 || y1 <= y0 {
-                return None;
-            }
-            alloc_gray(&mut self.cropped, x1 - x0, y1 - y0);
-            crop_gray8(&mut self.cropped, mask, x0, y0);
-            &self.cropped
-        };
-        // Already exactly the rect it is drawn at, which is what a full-size
-        // title pushed off an edge crops down to. Nothing left to resample.
-        if source.width() == placement.w && source.height() == placement.h {
-            return Some(source);
-        }
-        if !scale_gray_into(
-            &mut self.scaler,
-            source,
-            &mut self.scaled,
-            placement.w,
-            placement.h,
-        ) {
-            return None;
-        }
-        Some(&self.scaled)
-    }
-}
-
 /// An image, decoded and converted once for the whole render.
 ///
 /// Held as YUV at its own size, ready to be cut and scaled to wherever its
@@ -477,7 +353,12 @@ pub(super) struct StillTake {
 
 impl StillTake {
     pub(super) fn open(path: &str) -> Result<Self, ffmpeg::Error> {
-        let image = still::decode(path)?;
+        Self::from_rgba(&still::decode(path)?, path)
+    }
+
+    /// A picture already in memory — what a title is drawn as. `name` is only
+    /// for the log.
+    pub(super) fn from_rgba(image: &Rgba, name: &str) -> Result<Self, ffmpeg::Error> {
         let (w, h) = (even_down(image.width).max(2), even_down(image.height).max(2));
         let mut rgba = frame::Video::new(format::Pixel::RGBA, image.width, image.height);
         let stride = rgba.stride(0);
@@ -495,10 +376,13 @@ impl StillTake {
             h,
             scaling::Flags::LANCZOS,
         )?;
-        // BT.709, for the reason `color_to_yuv` gives: an image goes through
-        // RGB as a title colour does, and the default would be BT.601.
+        // BT.709, matching the tag the encoder writes. Left to its default
+        // the scaler uses BT.601, which a BT.709 player decodes as a slightly
+        // different shade: whites and greys survive, a saturated title or
+        // logo colour does not. Footage needs no such care because it never
+        // goes through RGB.
         if !colorspace::use_matrix(&mut scaler, ffmpeg::ffi::SWS_CS_ITU709) {
-            log::warn!("{path}: scaler kept its default matrix; colours may shift");
+            log::warn!("{name}: scaler kept its default matrix; colours may shift");
         }
         let mut picture = frame::Video::empty();
         scaler.run(&rgba, &mut picture)?;
@@ -674,4 +558,38 @@ fn crop_and_scale(
     alloc_yuv(cropped, x1 - x0, y1 - y0);
     crop_yuv420p(cropped, source, x0, y0);
     scale_into(scaler, cropped, staged, placement.w, placement.h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(color: [u8; 4]) -> StillTake {
+        let image = Rgba { width: 2, height: 2, pixels: color.repeat(4) };
+        StillTake::from_rgba(&image, "test").unwrap()
+    }
+
+    fn first_sample(f: &frame::Video) -> (u8, u8, u8) {
+        (f.data(0)[0], f.data(1)[0], f.data(2)[0])
+    }
+
+    /// Pure red under BT.709 limited range is Y 63, Cb 102, Cr 240; BT.601
+    /// would give Y 81, Cb 90. Luma and blue-difference are where the two
+    /// matrices part, so those are what this pins.
+    #[test]
+    fn images_convert_with_the_bt709_matrix() {
+        let (y, cb, cr) = first_sample(&flat([255, 0, 0, 255]).picture);
+        assert!(y.abs_diff(63) <= 2, "Y {y}");
+        assert!(cb.abs_diff(102) <= 2, "Cb {cb}");
+        assert!(cr.abs_diff(240) <= 2, "Cr {cr}");
+    }
+
+    /// Neutral greys are where the matrices agree, and where the range
+    /// mapping is easiest to get wrong: white must land on 235, not 255.
+    #[test]
+    fn white_lands_on_limited_range_white() {
+        let (y, cb, cr) = first_sample(&flat([255, 255, 255, 255]).picture);
+        assert!(y.abs_diff(235) <= 1, "Y {y}");
+        assert!(cb.abs_diff(128) <= 1 && cr.abs_diff(128) <= 1, "Cb {cb} Cr {cr}");
+    }
 }

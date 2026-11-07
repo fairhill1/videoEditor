@@ -15,7 +15,7 @@
 use crate::canvas::Canvas;
 use crate::effects::BlurPlan;
 use crate::state::State;
-use crate::timeline::{Clip, SourceId, TrackKind};
+use crate::timeline::{flatten_audio, Clip, SourceId, TrackKind, MAX_NESTING};
 
 /// Below this a layer contributes nothing a viewer could see, and it is
 /// cheaper to drop it than to decode a frame and blend it invisibly. One step
@@ -92,14 +92,43 @@ impl Layer {
 ///
 /// Painting order is track order, so a higher track covers a lower one — the
 /// arrangement the timeline already draws, with V2 sitting above V1.
+#[cfg(test)]
 pub(crate) fn layers_at<'a>(
     tracks: impl Iterator<Item = (TrackKind, &'a [Clip])>,
     t: f64,
     canvas: Canvas,
-    mut size_of: impl FnMut(SourceId) -> Option<(u32, u32)>,
+    size_of: impl FnMut(SourceId) -> Option<(u32, u32)>,
 ) -> Vec<Layer> {
+    layers_with_compounds(tracks, t, canvas, size_of, |_| None)
+}
+
+/// [`layers_at`] where a clip may be a compound clip, whose contents
+/// `contents_of` hands over: its layers are its contents' layers, in their
+/// order and at their places on a canvas the compound clip then places as one
+/// picture the size of the canvas — moved, scaled, faded and blurred as one.
+pub(crate) fn layers_with_compounds<'a>(
+    tracks: impl Iterator<Item = (TrackKind, &'a [Clip])>,
+    t: f64,
+    canvas: Canvas,
+    mut size_of: impl FnMut(SourceId) -> Option<(u32, u32)>,
+    contents_of: impl Fn(SourceId) -> Option<&'a [(TrackKind, Vec<Clip>)]>,
+) -> Vec<Layer> {
+    let tracks: Vec<(TrackKind, &[Clip])> = tracks.collect();
     let mut layers = Vec::new();
-    for (kind, clips) in tracks {
+    collect_layers(&tracks, t, canvas, &mut size_of, &contents_of, 0, &mut layers);
+    layers
+}
+
+fn collect_layers<'a>(
+    tracks: &[(TrackKind, &'a [Clip])],
+    t: f64,
+    canvas: Canvas,
+    size_of: &mut dyn FnMut(SourceId) -> Option<(u32, u32)>,
+    contents_of: &dyn Fn(SourceId) -> Option<&'a [(TrackKind, Vec<Clip>)]>,
+    depth: usize,
+    layers: &mut Vec<Layer>,
+) {
+    for &(kind, clips) in tracks {
         if kind != TrackKind::Video {
             continue;
         }
@@ -111,6 +140,33 @@ pub(crate) fn layers_at<'a>(
         };
         let alpha = clip.alpha(t);
         if alpha < MIN_VISIBLE_ALPHA {
+            continue;
+        }
+        if let Some(inner) = contents_of(clip.source) {
+            if depth >= MAX_NESTING {
+                continue;
+            }
+            let inner: Vec<(TrackKind, &[Clip])> =
+                inner.iter().map(|(k, c)| (*k, c.as_slice())).collect();
+            let first = layers.len();
+            collect_layers(&inner, clip.source_time(t), canvas, size_of, contents_of, depth + 1, layers);
+            // The contents fill a canvas of their own, which the compound
+            // clip places like any picture the size of the canvas.
+            let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+            let [ox, oy, ow, oh] = canvas.place(cw, ch, clip.transform);
+            let (sx, sy) = (ow / cw, oh / ch);
+            let blur = clip.effects.blur_sigma(canvas.height);
+            for layer in &mut layers[first..] {
+                let [x, y, w, h] = layer.rect;
+                layer.rect = [ox + x * sx, oy + y * sy, w * sx, h * sy];
+                layer.alpha *= alpha;
+                // Blurs in sequence add as variances; the inner one shrinks
+                // with the picture it was set on.
+                layer.blur = ((layer.blur * sy).powi(2) + blur.powi(2)).sqrt();
+                // Each placement of the contents is its own picture to a
+                // renderer that keeps something per clip.
+                layer.clip = (clip.id ^ 0x5bd1_e995).wrapping_mul(0x0100_0193) ^ layer.clip;
+            }
             continue;
         }
         let Some((sw, sh)) = size_of(clip.source) else {
@@ -125,7 +181,6 @@ pub(crate) fn layers_at<'a>(
             blur: clip.effects.blur_sigma(canvas.height),
         });
     }
-    layers
 }
 
 impl State {
@@ -138,7 +193,8 @@ impl State {
     /// same way a matching clip's does.
     pub(crate) fn source_size(&self, id: SourceId, canvas: Canvas) -> Option<(u32, u32)> {
         let src = self.media.get(id)?;
-        if src.title.is_some() {
+        // A compound clip is its own canvas, which its contents fill.
+        if src.title.is_some() || src.compound.is_some() {
             return Some((canvas.width, canvas.height));
         }
         if let Some(still) = src.still.as_ref() {
@@ -157,9 +213,25 @@ impl State {
             .iter()
             .map(|tr| (tr.kind, tr.clips.as_slice()))
             .collect();
-        layers_at(tracks.into_iter(), t, canvas, |id| {
-            self.source_size(id, canvas)
-        })
+        layers_with_compounds(
+            tracks.into_iter(),
+            t,
+            canvas,
+            |id| self.source_size(id, canvas),
+            |id| self.media.compound(id),
+        )
+    }
+
+    /// Every audio track the mixer plays: the timeline's, and the sound
+    /// inside its compound clips, moved onto the timeline's clock.
+    pub(crate) fn audio_tracks(&self) -> Vec<Vec<Clip>> {
+        let tracks: Vec<(TrackKind, &[Clip])> = self
+            .timeline
+            .tracks
+            .iter()
+            .map(|tr| (tr.kind, tr.clips.as_slice()))
+            .collect();
+        flatten_audio(&tracks, &|id| self.media.compound(id))
     }
 }
 
@@ -208,6 +280,59 @@ mod tests {
             |_| Some((1920, 1080)),
         );
         assert!((layers[0].blur - 10.8).abs() < 1e-4);
+    }
+
+    /// A compound clip's contents are drawn in its place: their own layers,
+    /// in their own order, placed inside wherever the compound clip puts its
+    /// canvas, and as faded as it is.
+    #[test]
+    fn a_compound_clip_draws_its_contents_where_it_is_placed() {
+        let inner: Vec<(TrackKind, Vec<Clip>)> = vec![
+            (TrackKind::Video, vec![Clip { id: 1, ..clip(1, 0.0, 4.0) }]),
+            (TrackKind::Video, vec![Clip { id: 2, opacity: 0.5, ..clip(2, 1.0, 2.0) }]),
+        ];
+        let mut outer = clip(9, 10.0, 4.0);
+        outer.transform = Transform { x: 0.25, y: 0.0, scale: 0.5 };
+        outer.opacity = 0.5;
+        outer.id = 7;
+        let tracks = [(TrackKind::Video, vec![outer])];
+        let layers = layers_with_compounds(
+            tracks.iter().map(|(k, c)| (*k, c.as_slice())),
+            11.5,
+            canvas(),
+            |_| Some((1920, 1080)),
+            |id| (id == SourceId(9)).then_some(inner.as_slice()),
+        );
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].source, SourceId(1));
+        assert_eq!(layers[1].source, SourceId(2));
+        // 1.5s into the compound clip is 1.5s into its contents.
+        assert_eq!(layers[0].source_time, 1.5);
+        assert_eq!(layers[1].source_time, 0.5);
+        // Half size, centred a quarter of the canvas to the right.
+        assert_eq!(layers[0].rect, [960.0, 270.0, 960.0, 540.0]);
+        assert_eq!(layers[0].alpha, 0.5);
+        assert_eq!(layers[1].alpha, 0.25);
+        // Each placement is its own picture to a renderer keeping per-clip
+        // state, and not the inner clip's own.
+        assert_ne!(layers[0].clip, layers[1].clip);
+        assert_ne!(layers[0].clip, 0);
+    }
+
+    /// A compound clip that holds itself — which a hand-edited file could
+    /// say — stops at the nesting bound rather than recursing forever.
+    #[test]
+    fn a_compound_clip_inside_itself_ends() {
+        let inner: Vec<(TrackKind, Vec<Clip>)> = vec![(TrackKind::Video, vec![clip(9, 0.0, 4.0)])];
+        let tracks = [(TrackKind::Video, vec![clip(9, 0.0, 4.0)])];
+        let layers = layers_with_compounds(
+            tracks.iter().map(|(k, c)| (*k, c.as_slice())),
+            1.0,
+            canvas(),
+            |_| Some((1920, 1080)),
+            |_| Some(inner.as_slice()),
+        );
+        assert!(layers.is_empty());
     }
 
     fn clip(source: u32, start: f64, len: f64) -> Clip {

@@ -12,11 +12,11 @@ use ffmpeg::{encoder, format, frame, picture, ChannelLayout, Rational};
 
 use crate::audio::{AudioStream, CHANNELS, SAMPLE_RATE};
 use crate::canvas::Canvas;
-use crate::compose::layers_at;
-use crate::timeline::{Clip, SourceId, TrackKind};
+use crate::compose::layers_with_compounds;
+use crate::timeline::{Clip, SourceId, TrackKind, Tracks};
 
-use super::raster::{compose, compose_color, compose_masked, fill_black, place_even};
-use super::take::{StillTake, TitleTake, VideoTake};
+use super::raster::{compose, compose_masked, fill_black, place_even};
+use super::take::{StillTake, VideoTake};
 use super::{drain, VideoSpec};
 
 /// Re-seek an audio source once its read head drifts this far from where the
@@ -30,7 +30,7 @@ pub(super) struct VideoRender {
     pub(super) stream_tb: Rational,
     pub(super) spec: VideoSpec,
     pub(super) takes: HashMap<SourceId, VideoTake>,
-    pub(super) titles: HashMap<SourceId, TitleTake>,
+    /// Images, and titles drawn as images.
     pub(super) stills: HashMap<SourceId, StillTake>,
 }
 
@@ -51,6 +51,7 @@ impl VideoRender {
         n: u64,
         t: f64,
         tracks: &[(TrackKind, Vec<Clip>)],
+        compounds: &HashMap<SourceId, Tracks>,
         octx: &mut format::context::Output,
     ) -> Result<(), ffmpeg::Error> {
         // A fresh frame per iteration: the encoder keeps a reference to what it
@@ -66,8 +67,8 @@ impl VideoRender {
         // Which pictures, where, and how much of each — decided by the same
         // code the preview asks, so the file is the frame that was approved on
         // screen rather than a second interpretation of the timeline.
-        let (takes, titles, stills) = (&self.takes, &self.titles, &self.stills);
-        let layers = layers_at(
+        let (takes, stills) = (&self.takes, &self.stills);
+        let layers = layers_with_compounds(
             tracks.iter().map(|(kind, clips)| (*kind, clips.as_slice())),
             t,
             self.canvas(),
@@ -75,9 +76,9 @@ impl VideoRender {
                 takes
                     .get(&source)
                     .map(VideoTake::size)
-                    .or_else(|| titles.get(&source).map(TitleTake::size))
                     .or_else(|| stills.get(&source).map(StillTake::size))
             },
+            |source| compounds.get(&source).map(Vec::as_slice),
         );
         for layer in &layers {
             let Some(placement) = place_even(layer, self.spec.width, self.spec.height) else {
@@ -86,21 +87,6 @@ impl VideoRender {
             // Each source answers with the height of the picture it holds,
             // which is what the blur is worked out against — the same number
             // the preview hands the same call.
-            if let Some(title) = self.titles.get_mut(&layer.source) {
-                let (color, color_alpha) = (title.color, title.alpha);
-                let blur = layer.blur_plan(title.size().1);
-                if let Some(mask) = title.stage(placement, blur) {
-                    compose_color(
-                        &mut canvas,
-                        mask,
-                        placement.x,
-                        placement.y,
-                        color,
-                        color_alpha * layer.alpha,
-                    );
-                }
-                continue;
-            }
             if let Some(still) = self.stills.get_mut(&layer.source) {
                 let blur = layer.blur_plan(still.size().1);
                 match still.render(placement, blur) {

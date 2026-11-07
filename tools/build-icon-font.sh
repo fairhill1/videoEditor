@@ -36,6 +36,13 @@ ICONS=(
     plus                      # effects: apply to the selected clips
     eye                       # effects: an applied effect is on
     eye-off                   # effects: an applied effect is off
+    chevron-down              # effects: the font box opens a list
+    copy                      # timeline: copy the selected clips
+    clipboard-paste           # timeline: paste at the playhead
+    group                     # timeline: combine clips into a compound clip
+    pencil                    # timeline: open a compound clip to edit it
+    arrow-left                # timeline: back out of a compound clip
+    square-dashed             # timeline: select every clip
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

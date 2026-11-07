@@ -93,9 +93,20 @@ pub struct SourceEntry {
     /// referred to from it, and a project file with its titles inside opens the
     /// same wherever it is taken.
     pub title: Option<Title>,
+    /// `Some` for a compound clip: its name and the tracks it holds, whose
+    /// clips point at the other sources here by the same ids the timeline's
+    /// do. Defaulted so a project saved before compound clips still opens.
+    #[serde(default)]
+    pub compound: Option<CompoundEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct CompoundEntry {
+    pub name: String,
+    pub tracks: Vec<TrackEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct TrackEntry {
     pub kind: TrackKind,
     pub clips: Vec<Clip>,
@@ -175,6 +186,7 @@ pub fn read(path: &Path) -> Result<Project, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::title::{Outline, Shadow};
     use crate::timeline::Transform;
 
     fn sample() -> Project {
@@ -189,6 +201,19 @@ mod tests {
                     id: SourceId(0),
                     path: "a.mp4".into(),
                     title: None,
+                    compound: None,
+                },
+                SourceEntry {
+                    id: SourceId(2),
+                    path: String::new(),
+                    title: None,
+                    compound: Some(CompoundEntry {
+                        name: "End card".into(),
+                        tracks: vec![TrackEntry {
+                            kind: TrackKind::Video,
+                            clips: vec![Clip { source: SourceId(1), source_out: 2.0, ..Clip::default() }],
+                        }],
+                    }),
                 },
                 SourceEntry {
                     id: SourceId(1),
@@ -197,7 +222,11 @@ mod tests {
                         text: "Chapter\nOne".into(),
                         size: 0.2,
                         color: [1.0, 0.5, 0.25, 0.8],
+                        font: Some("DejaVu Serif".into()),
+                        outline: Outline { enabled: true, width: 0.01, color: [0.0, 0.0, 1.0, 1.0] },
+                        shadow: Shadow { enabled: true, distance: 0.02, softness: 0.0, opacity: 0.5 },
                     }),
+                    compound: None,
                 },
             ],
             tracks: vec![TrackEntry {
@@ -238,6 +267,7 @@ mod tests {
         assert_eq!(back.sources[0].path, "a.mp4");
         assert_eq!(back.sources[0].title, None);
         assert_eq!(back.sources[1].title, sample().sources[1].title);
+        assert_eq!(back.sources[2].compound, sample().sources[2].compound);
         assert_eq!(back.tracks[0].kind, TrackKind::Video);
         assert_eq!(back.tracks[0].clips[0], sample().tracks[0].clips[0]);
         assert_eq!(back.layout, sample().layout);

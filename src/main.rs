@@ -27,6 +27,8 @@ mod effects_view;
 mod export;
 mod filmstrip;
 mod fmt;
+mod compound;
+mod fonts;
 mod input;
 mod layout;
 mod media;

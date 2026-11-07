@@ -31,7 +31,7 @@ use crate::project;
 use crate::quad::QuadRenderer;
 use crate::text::TextRenderer;
 use crate::theme::*;
-use crate::timeline::{SourceId, Timeline, Track, TrackKind};
+use crate::timeline::{Clip, Clipboard, SourceId, Timeline, Track, TrackKind, Tracks};
 use crate::title::Title;
 use crate::ui::Rect;
 
@@ -129,6 +129,13 @@ pub(crate) struct State {
     pub(crate) timeline_zoom_in_btn: Rect,
     pub(crate) timeline_zoom_fit_btn: Rect,
     pub(crate) timeline_delete_btn: Rect,
+    pub(crate) timeline_copy_btn: Rect,
+    pub(crate) timeline_combine_btn: Rect,
+    pub(crate) timeline_select_all_btn: Rect,
+    pub(crate) timeline_open_compound_btn: Rect,
+    /// Back out of the compound clip being edited; empty when none is.
+    pub(crate) timeline_back_btn: Rect,
+    pub(crate) timeline_paste_btn: Rect,
     /// Clip ids, not positions — see [`crate::timeline::Clip::id`]. A selected
     /// clip that has been deleted simply resolves to nothing, and comes back if
     /// an undo restores it.
@@ -137,6 +144,11 @@ pub(crate) struct State {
     /// recently: the *primary* clip, which the actions that only make sense on
     /// one clip — the canvas handles, typing into a title — act on.
     pub(crate) selected: Vec<u32>,
+    /// What Ctrl+C took, for Ctrl+V to put back. Kept for the session only.
+    pub(crate) clipboard: Clipboard,
+    /// The compound clips open for editing, outermost first. The timeline
+    /// shows the last one's contents; empty, it shows the project's own.
+    pub(crate) compound_stack: Vec<crate::compound::CompoundEdit>,
     /// Right-aligned in the toolbar row, well clear of the edit buttons: this
     /// one produces a file rather than changing the timeline.
     pub(crate) timeline_export_btn: Rect,
@@ -175,6 +187,10 @@ pub(crate) struct State {
     pub(crate) pool_tab_btns: [Rect; 2],
     /// Which of the two the panel shows. Saved with the layout.
     pub(crate) pool_tab: PoolTab,
+    /// How far the effects tab is scrolled down, in points.
+    pub(crate) effects_scroll: f32,
+    /// The font list, while it is open: how many rows it is scrolled down.
+    pub(crate) font_menu: Option<usize>,
     /// The title being typed into, and what it said when typing started, so
     /// Escape can put it back.
     ///
@@ -182,6 +198,9 @@ pub(crate) struct State {
     /// lets a cancelled edit leave no step behind at all: the text goes back
     /// and the open edit closes having changed nothing.
     pub(crate) editing_title: Option<(SourceId, Title)>,
+    /// Where in the title being typed into the next letter goes: a byte
+    /// offset into its text, on a character boundary.
+    pub(crate) title_caret: usize,
     pub(crate) modifiers: ModifiersState,
     pub(crate) undo_stack: Vec<EditSnapshot>,
     pub(crate) redo_stack: Vec<EditSnapshot>,
@@ -295,7 +314,15 @@ impl State {
             timeline_zoom_in_btn: Rect::default(),
             timeline_zoom_fit_btn: Rect::default(),
             timeline_delete_btn: Rect::default(),
+            timeline_copy_btn: Rect::default(),
+            timeline_combine_btn: Rect::default(),
+            timeline_select_all_btn: Rect::default(),
+            timeline_open_compound_btn: Rect::default(),
+            timeline_back_btn: Rect::default(),
+            timeline_paste_btn: Rect::default(),
             selected: Vec::new(),
+            clipboard: Clipboard::default(),
+            compound_stack: Vec::new(),
             timeline_export_btn: Rect::default(),
             timeline_project_btn: Rect::default(),
             timeline_open_btn: Rect::default(),
@@ -311,7 +338,10 @@ impl State {
             pool_view: PoolView::default(),
             pool_tab_btns: [Rect::default(); 2],
             pool_tab: PoolTab::default(),
+            effects_scroll: 0.0,
+            font_menu: None,
             editing_title: None,
+            title_caret: 0,
             modifiers: ModifiersState::empty(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -401,6 +431,7 @@ impl State {
             | DragMode::PoolDrag { .. }
             | DragMode::EffectDrag { .. }
             | DragMode::EffectParam { .. }
+            | DragMode::TitleNumber { .. }
             | DragMode::Scrollbar { .. }
             | DragMode::ZoomSlider => CursorIcon::Default,
             DragMode::None => self.hover_cursor(),
@@ -543,7 +574,10 @@ impl State {
             self.set_status("Cancelling…".into(), STATUS_INFO);
             return;
         }
-        if self.timeline.duration() <= 0.0 {
+        // The project's own timeline, whatever is open: a compound clip
+        // being edited is exported as it stands, inside the timeline it is on.
+        let (main, compounds) = self.committed();
+        if crate::timeline::tracks_duration(&main) <= 0.0 {
             self.set_status("Nothing to export".into(), STATUS_ERR);
             return;
         }
@@ -558,17 +592,37 @@ impl State {
         // Snapshot the timeline and resolve every path up front, so the worker
         // renders what you saw when you pressed the button and you stay free to
         // keep editing while it runs.
-        let tracks = self
-            .timeline
-            .tracks
+        //
+        // Pictures go as they are, compound clips and all, and are composed
+        // frame by frame from `compounds`. Sound goes already flattened onto
+        // the timeline's clock, as the live mixer plays it.
+        let audio = Self::flattened_audio(&main, &compounds);
+        let tracks: Vec<(TrackKind, Vec<Clip>)> = main
             .iter()
-            .map(|t| (t.kind, t.clips.clone()))
-            .collect::<Vec<_>>();
+            .filter(|(kind, _)| *kind == TrackKind::Video)
+            .cloned()
+            .chain(audio.into_iter().map(|clips| (TrackKind::Audio, clips)))
+            .collect();
+        // Only the compound clips the timeline reaches, and every clip in
+        // them, however deep.
+        let mut reached: HashMap<SourceId, Tracks> = HashMap::new();
+        let mut every: Vec<Clip> = Vec::new();
+        let mut pending: Vec<Clip> = tracks.iter().flat_map(|(_, c)| c.iter().copied()).collect();
+        while let Some(clip) = pending.pop() {
+            if let Some(inner) = compounds.get(&clip.source) {
+                if !reached.contains_key(&clip.source) {
+                    reached.insert(clip.source, inner.clone());
+                    pending.extend(inner.iter().flat_map(|(_, c)| c.iter().copied()));
+                }
+                continue;
+            }
+            every.push(clip);
+        }
         let mut paths = HashMap::new();
         let mut titles = HashMap::new();
         let mut stills = HashMap::new();
-        for (_, clips) in &tracks {
-            for clip in clips {
+        {
+            for clip in &every {
                 let Some(src) = self.media.get(clip.source) else {
                     continue;
                 };
@@ -591,6 +645,7 @@ impl State {
             paths,
             titles,
             stills,
+            compounds: reached,
         };
         self.export = Some(ExportJob::start(request));
         self.set_status("Starting…".into(), STATUS_INFO);

@@ -66,18 +66,28 @@ impl State {
     /// imported footage is part of the project even before it reaches a track,
     /// and reopening to find the unused imports gone would be a quiet loss.
     fn as_project(&self, dir: &Path) -> project::Project {
+        // The project's own timeline, with any compound clip being edited
+        // saved as it stands.
+        let (main, compounds) = self.committed();
         let mut ids = self.media.ids().to_vec();
         // A clip whose source has left the pool can't currently arise —
         // removing a pool row removes its clips too — but writing a clip that
         // points at a source the file doesn't carry would make a project that
         // silently drops that clip when reopened. Append rather than trust.
-        for track in &self.timeline.tracks {
-            for clip in &track.clips {
+        let inside = compounds.values().flat_map(|t| t.iter());
+        for (_, clips) in main.iter().chain(inside) {
+            for clip in clips {
                 if !ids.contains(&clip.source) {
                     ids.push(clip.source);
                 }
             }
         }
+        let entries = |tracks: &crate::timeline::Tracks| {
+            tracks
+                .iter()
+                .map(|(kind, clips)| project::TrackEntry { kind: *kind, clips: clips.clone() })
+                .collect::<Vec<_>>()
+        };
         project::Project {
             version: project::FORMAT_VERSION,
             canvas: project::CanvasSettings {
@@ -91,18 +101,14 @@ impl State {
                         id,
                         path: project::Project::store_path(Path::new(&src.path), dir),
                         title: src.title.clone(),
+                        compound: compounds.get(&id).map(|tracks| project::CompoundEntry {
+                            name: src.name.clone(),
+                            tracks: entries(tracks),
+                        }),
                     })
                 })
                 .collect(),
-            tracks: self
-                .timeline
-                .tracks
-                .iter()
-                .map(|t| project::TrackEntry {
-                    kind: t.kind,
-                    clips: t.clips.clone(),
-                })
-                .collect(),
+            tracks: entries(&main),
             layout: Some(project::Layout {
                 split_top_bottom: self.split_top_bottom,
                 split_pool_preview: self.split_pool_preview,
@@ -236,6 +242,12 @@ impl State {
                 imported.insert(entry.id, media.add_title(title));
                 continue;
             }
+            // Its contents point at other sources, which may come later in
+            // the file: made empty here, and filled once every id is known.
+            if let Some(compound) = entry.compound.as_ref() {
+                imported.insert(entry.id, media.add_compound(compound.name.clone(), Vec::new()));
+                continue;
+            }
             let resolved = project::Project::resolve_path(&entry.path, &dir);
             match resolved
                 .to_str()
@@ -253,6 +265,31 @@ impl State {
         }
 
         let mut dropped = 0;
+        for entry in &loaded.sources {
+            let (Some(compound), Some(&id)) = (entry.compound.as_ref(), imported.get(&entry.id))
+            else {
+                continue;
+            };
+            let tracks = compound
+                .tracks
+                .iter()
+                .map(|t| {
+                    let clips = t
+                        .clips
+                        .iter()
+                        .filter_map(|clip| match imported.get(&clip.source) {
+                            Some(&source) => Some(Clip { source, ..*clip }),
+                            None => {
+                                dropped += 1;
+                                None
+                            }
+                        })
+                        .collect();
+                    (t.kind, clips)
+                })
+                .collect();
+            media.set_compound(id, tracks);
+        }
         let mut tracks = Vec::new();
         for entry in &loaded.tracks {
             let mut track = Track::new(entry.kind);
@@ -318,6 +355,8 @@ impl State {
     /// restores clips referencing sources this one has never imported.
     fn reset_session_state(&mut self) {
         self.selected.clear();
+        // The compound clips that were open belong to the project replaced.
+        self.compound_stack.clear();
         // Back to fit: a zoom into the middle of the old project would leave
         // the new one showing an empty stretch of a timeline it doesn't have.
         self.zoom_timeline_to_fit();

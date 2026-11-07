@@ -25,11 +25,11 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::{codec, encoder, format, ChannelLayout, Dictionary, Packet, Rational};
 
 use crate::audio::{AudioStream, CHANNELS, SAMPLE_RATE};
-use crate::timeline::{Clip, SourceId, TrackKind};
-use crate::title::Title;
+use crate::timeline::{Clip, SourceId, TrackKind, Tracks, MAX_NESTING};
+use crate::title::{self, Title};
 
 use streams::{AudioRender, VideoRender};
-use take::{StillTake, TitleTake, VideoTake};
+use take::{StillTake, VideoTake};
 
 /// x264 knobs, set for a master that gets uploaded and re-encoded. Game
 /// footage (particles, foliage, fast pans) shows blocking at crf 20 that the
@@ -70,6 +70,10 @@ pub struct ExportRequest {
     /// Images, by path. Kept apart from `paths` because they are opened as a
     /// picture to hold rather than as footage to decode frame by frame.
     pub stills: HashMap<SourceId, String>,
+    /// What each compound clip the timeline reaches holds. Their sound is
+    /// already in `tracks`, moved onto the timeline's clock as the live mixer
+    /// has it; their pictures are composed from these, frame by frame.
+    pub compounds: HashMap<SourceId, Tracks>,
 }
 
 pub enum Outcome {
@@ -222,8 +226,10 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
                 stream.index()
             };
             let takes = open_video_takes(req)?;
-            let titles = bake_titles(req, spec);
-            let stills = open_stills(req)?;
+            // A title is drawn into a picture once, up front, and from then on
+            // is an image like any other.
+            let mut stills = open_stills(req)?;
+            stills.extend(bake_titles(req, spec)?);
             Some(VideoRender {
                 enc,
                 enc_tb,
@@ -231,7 +237,6 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
                 stream_tb: enc_tb,
                 spec,
                 takes,
-                titles,
                 stills,
             })
         }
@@ -288,7 +293,7 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
             break;
         }
         let v = video.as_mut().expect("frame count implies a video stream");
-        v.encode(n, n as f64 / fps, &req.tracks, &mut octx)
+        v.encode(n, n as f64 / fps, &req.tracks, &req.compounds, &mut octx)
             .map_err(|e| format!("video encode failed at frame {n}: {e}"))?;
         // Keep audio a frame ahead of the video stream so the muxer's
         // interleaving queue stays shallow instead of buffering the whole run.
@@ -424,14 +429,45 @@ fn open_audio_encoder(global_header: bool) -> Result<encoder::Audio, ffmpeg::Err
 }
 
 fn source_ids(req: &ExportRequest, kind: TrackKind) -> HashSet<SourceId> {
-    req.tracks
-        .iter()
-        .filter(|(k, _)| *k == kind)
-        .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
-        // Generated sources have no file behind them, so every path this feeds
-        // would come back missing.
+    let ids = match kind {
+        TrackKind::Video => video_sources(req),
+        TrackKind::Audio => req
+            .tracks
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
+            .collect(),
+    };
+    // Generated sources have no file behind them, so every path this feeds
+    // would come back missing.
+    ids.into_iter()
         .filter(|id| !req.titles.contains_key(id) && !req.stills.contains_key(id))
         .collect()
+}
+
+/// Every source with a picture on screen somewhere in the render: on a video
+/// track, or inside a compound clip on one, however deep. Not the compound
+/// clips themselves, which have no picture but their contents'.
+fn video_sources(req: &ExportRequest) -> HashSet<SourceId> {
+    fn walk(req: &ExportRequest, tracks: &[(TrackKind, Vec<Clip>)], depth: usize, out: &mut HashSet<SourceId>) {
+        for (kind, clips) in tracks {
+            if *kind != TrackKind::Video {
+                continue;
+            }
+            for clip in clips {
+                match req.compounds.get(&clip.source) {
+                    Some(inner) if depth < MAX_NESTING => walk(req, inner, depth + 1, out),
+                    Some(_) => {}
+                    None => {
+                        out.insert(clip.source);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(req, &req.tracks, 0, &mut out);
+    out
 }
 
 fn path_for(req: &ExportRequest, source: SourceId) -> Result<&str, String> {
@@ -458,27 +494,25 @@ fn open_video_takes(req: &ExportRequest) -> Result<HashMap<SourceId, VideoTake>,
 /// Up front rather than on demand because a title's picture never changes
 /// during a render — the text is fixed the moment the export starts — so the
 /// only thing lazy baking would buy is a branch inside the per-frame loop.
-fn bake_titles(req: &ExportRequest, spec: VideoSpec) -> HashMap<SourceId, TitleTake> {
-    let used: HashSet<SourceId> = req
-        .tracks
-        .iter()
-        .filter(|(kind, _)| *kind == TrackKind::Video)
-        .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
-        .collect();
+fn bake_titles(
+    req: &ExportRequest,
+    spec: VideoSpec,
+) -> Result<HashMap<SourceId, StillTake>, String> {
+    let used = video_sources(req);
     req.titles
         .iter()
         .filter(|(id, _)| used.contains(id))
-        .map(|(id, title)| (*id, TitleTake::bake(title, spec.width, spec.height)))
+        .map(|(id, title)| {
+            let picture = title::render(title, spec.width, spec.height);
+            StillTake::from_rgba(&picture, "title")
+                .map(|take| (*id, take))
+                .map_err(|e| format!("cannot draw a title: {e}"))
+        })
         .collect()
 }
 
 fn open_stills(req: &ExportRequest) -> Result<HashMap<SourceId, StillTake>, String> {
-    let used: HashSet<SourceId> = req
-        .tracks
-        .iter()
-        .filter(|(kind, _)| *kind == TrackKind::Video)
-        .flat_map(|(_, clips)| clips.iter().map(|c| c.source))
-        .collect();
+    let used = video_sources(req);
     let mut stills = HashMap::new();
     for (id, path) in req.stills.iter().filter(|(id, _)| used.contains(id)) {
         // Fail the export rather than leave a hole, as for footage.
@@ -584,6 +618,7 @@ mod tests {
             paths,
             titles,
             stills: HashMap::new(),
+            compounds: HashMap::new(),
         };
 
         let shared = Mutex::new(Shared {
@@ -666,6 +701,7 @@ mod tests {
             paths: HashMap::new(),
             titles: HashMap::from([(overlay, Title::default())]),
             stills: HashMap::new(),
+            compounds: HashMap::new(),
         };
 
         let shared = Mutex::new(Shared {
@@ -775,6 +811,7 @@ mod tests {
             paths: HashMap::new(),
             titles: HashMap::new(),
             stills: HashMap::from([(still, png.to_str().unwrap().to_string())]),
+            compounds: HashMap::new(),
         };
         let shared = Mutex::new(Shared { progress: Progress::default(), outcome: None });
         assert!(run(&req, &shared, &AtomicBool::new(false)).expect("still export failed"));
@@ -842,6 +879,7 @@ mod tests {
                 paths: HashMap::from([(source, path.to_string())]),
                 titles: HashMap::new(),
                 stills: HashMap::new(),
+            compounds: HashMap::new(),
             };
             let shared = Mutex::new(Shared { progress: Progress::default(), outcome: None });
             assert!(run(&req, &shared, &AtomicBool::new(false)).expect("export failed"));

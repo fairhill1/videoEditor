@@ -148,13 +148,9 @@ impl State {
         // Refill the audio mix buffer before doing render work. Done early so
         // if render is slow the audio thread still has samples queued.
         {
-            let Self {
-                audio,
-                timeline,
-                media,
-                ..
-            } = self;
-            audio.tick(timeline, media);
+            let audio_tracks = self.audio_tracks();
+            let Self { audio, media, .. } = self;
+            audio.tick(&audio_tracks, media);
         }
 
         let preview_h = (top_h - TRANSPORT_BAR_H).max(0.0);
@@ -235,6 +231,7 @@ impl State {
         if self.project_menu_open {
             self.draw_project_menu(self.timeline_project_btn, w, h);
         }
+        self.draw_font_menu();
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Ahead of the main pass, which samples what these write.
@@ -310,14 +307,11 @@ impl State {
         // Titles are drawn rather than decoded, so their picture has to exist
         // before the pass that paints it. Baking is a no-op for anything whose
         // text and canvas have not moved since last frame.
-        let typing = self.editing_title.as_ref().map(|(id, _)| *id);
         for layer in &layers {
-            let caret = typing == Some(layer.source);
             let Self { media, device, queue, quads, .. } = self;
             media.bake_title(
                 layer.source,
                 (canvas.width, canvas.height),
-                caret,
                 device,
                 queue,
                 quads,
@@ -333,22 +327,19 @@ impl State {
         {
             let Self { media, quads, queue, device, blur, .. } = self;
             for layer in &layers {
-                let Some(mut quad) = canvas_quad(layer, canvas, canvas_x, canvas_y, canvas_scale)
+                let Some(quad) = canvas_quad(layer, canvas, canvas_x, canvas_y, canvas_scale)
                 else {
                     continue;
                 };
-                // Which picture to draw. A title's colour rides on the quad and
-                // its shape on the texture's alpha, so one baked picture serves
-                // any colour — and the layer's own opacity multiplies straight
-                // into it. An image's alpha rides through the blend as it is,
-                // so a logo with a transparent background sits on whatever is
-                // below it.
-                let texture = if let Some(title) =
-                    media.get(layer.source).and_then(|s| s.title.as_ref())
-                {
-                    let [r, g, b, a] = title.color;
-                    quad.color = [r, g, b, a * layer.alpha];
+                // Which picture to draw. A title is baked into a picture with
+                // its colours, outline and shadow already in it, so it draws
+                // as an image does: its alpha rides through the blend as it
+                // is, so a logo with a transparent background, or the space
+                // around a title's letters, sits on whatever is below it.
+                let texture = if let Some(texture) =
                     media.get(layer.source).and_then(|s| s.title_texture())
+                {
+                    Some(texture)
                 } else if let Some(still) = media.get(layer.source).and_then(|s| s.still.as_ref()) {
                     Some(still.texture())
                 } else if let Some(stream) =
@@ -390,7 +381,7 @@ impl State {
         }
         // ASCII throughout, for the reason the media pool's format line is:
         // the UI font is a stock face rather than a subset we control.
-        const HINT: &str = "Typing title - Enter to finish, Shift+Enter for a line, Esc to cancel";
+        const HINT: &str = "Typing title - Enter for a new line, Esc or click elsewhere when done";
         let w = self.text.measure_width(HINT, STATUS_SIZE);
         let x = (media_w + (preview_w - w) * 0.5).round();
         let baseline = (below_y + LABEL_PAD + self.text.ascent(STATUS_SIZE)).round();
@@ -492,6 +483,24 @@ impl State {
                 );
             } else if let Some(wf) = src.waveform.as_ref() {
                 draw_waveform_summary(&mut self.quads, wf, thumb.x, thumb.y, thumb.w, thumb.h);
+            } else if src.compound.is_some() {
+                // The combine icon, standing for the clips inside: a
+                // compound clip has no one picture of its own to show.
+                let glyph = ICON_COMBINE.to_string();
+                let size = POOL_COMPOUND_ICON_SIZE;
+                let gw = self.text.measure_width(&glyph, size);
+                let ascent = self.text.ascent(size);
+                self.text.draw(
+                    &self.queue,
+                    &mut self.quads,
+                    [
+                        (thumb.x + (thumb.w - gw) * 0.5).round(),
+                        (thumb.y + (thumb.h + ascent) * 0.5).round(),
+                    ],
+                    &glyph,
+                    size,
+                    COMPOUND_LABEL_COLOR,
+                );
             } else if let Some(title) = src.title.as_ref() {
                 // A title's own words, in its own colour, standing in for the
                 // frame a decoded source has — the same reasoning as the
@@ -656,7 +665,14 @@ impl State {
                 // the canvas. A title always does — it is drawn at whatever
                 // the canvas turns out to be — so it says its size instead.
                 Some(t) => format!("title, {}% of frame", (t.size * 100.0).round()),
-                None => String::new(),
+                // A compound clip says what it holds.
+                None => match src.compound.as_ref() {
+                    Some(tracks) => {
+                        let n: usize = tracks.iter().map(|(_, c)| c.len()).sum();
+                        format!("compound clip, {n} {}", if n == 1 { "clip" } else { "clips" })
+                    }
+                    None => String::new(),
+                },
             },
         };
         let meta = truncate_to_width(&self.text, &meta, POOL_ITEM_META_SIZE, name_max_w);

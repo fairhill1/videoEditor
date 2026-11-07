@@ -8,10 +8,11 @@
 use crate::effects::{Effect, EffectKind, MAX_EFFECTS};
 use crate::input::DragMode;
 use crate::state::State;
-use crate::theme::{SNAP_PX, STATUS_INFO};
-use crate::title::Title;
+use crate::fonts;
+use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_INFO};
+use crate::title::{self, Title};
 use crate::timeline::{
-    db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Transform,
+    db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Tracks, Transform,
     MAX_GAIN_DB, MAX_OPACITY, MAX_SCALE, MIN_GAIN_DB, MIN_OPACITY, MIN_SCALE,
 };
 
@@ -40,6 +41,7 @@ pub(crate) struct EditSnapshot {
     timeline: TimelineSnapshot,
     pool_order: Vec<SourceId>,
     titles: Vec<(SourceId, Title)>,
+    compounds: Vec<(SourceId, Tracks)>,
 }
 
 /// Closest latch of any `edge` onto any `target` within `threshold`, expressed
@@ -81,11 +83,12 @@ fn nearest_scale(scale: f32, candidates: &[(f32, f32)], threshold: f32) -> f32 {
 }
 
 impl State {
-    fn edit_snapshot(&self) -> EditSnapshot {
+    pub(crate) fn edit_snapshot(&self) -> EditSnapshot {
         EditSnapshot {
             timeline: self.timeline.snapshot(),
             pool_order: self.media.ids().to_vec(),
             titles: self.media.title_snapshot(),
+            compounds: self.media.compound_snapshot(),
         }
     }
 
@@ -158,6 +161,7 @@ impl State {
         self.timeline.restore(&snap.timeline);
         self.media.set_order(&snap.pool_order);
         self.media.restore_titles(&snap.titles);
+        self.media.restore_compounds(&snap.compounds);
         // A step that predates this title, or removes it, leaves nothing to
         // type into.
         self.editing_title = None;
@@ -178,13 +182,25 @@ impl State {
         if self.editing_title.as_ref().is_some_and(|(s, _)| *s == id) {
             self.finish_title_edit();
         }
+        // A compound clip open for editing, or one around it, cannot leave
+        // the pool from inside itself.
+        if self.compound_stack.iter().any(|e| self.media.contains_compound(e.source, id) || e.source == id) {
+            self.set_status("Close the compound clip before removing it".into(), STATUS_INFO);
+            return;
+        }
         self.begin_edit();
         self.media.remove(id);
         self.timeline.remove_source(id);
+        self.media.remove_from_compounds(id);
         if self.last_playing_source == Some(id) {
             self.last_playing_source = None;
         }
         self.commit_edit();
+    }
+
+    /// Select every clip on the timeline.
+    pub(crate) fn select_all(&mut self) {
+        self.selected = self.timeline.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
     }
 
     /// Make `(track, idx)` the whole selection.
@@ -215,7 +231,7 @@ impl State {
 
     /// Ids of every selected clip and every clip linked to one: what an action
     /// on the selection acts on, since linked audio and video travel as a unit.
-    fn selection_with_links(&self) -> std::collections::HashSet<u32> {
+    pub(crate) fn selection_with_links(&self) -> std::collections::HashSet<u32> {
         self.selected
             .iter()
             .filter_map(|id| self.timeline.find(*id))
@@ -338,6 +354,14 @@ impl State {
 
     pub(crate) fn apply_move_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
         let siblings = self.linked_siblings(track, idx);
+        self.apply_group_move_delta(&siblings, desired_delta);
+    }
+
+    /// Move every clip in `siblings` by the same `desired_delta`, snapped and
+    /// held off the timeline's start as one: a linked pair, or a selection
+    /// dragged together.
+    pub(crate) fn apply_group_move_delta(&mut self, siblings: &[(usize, usize)], desired_delta: f64) {
+        let siblings = siblings.to_vec();
         // Clamp so the earliest-starting sibling doesn't go negative —
         // applying the same delta everywhere preserves the sync offset.
         let min_start = siblings
@@ -636,6 +660,7 @@ impl State {
             return;
         };
         self.finish_title_edit();
+        self.title_caret = title.text.len();
         self.editing_title = Some((source, title));
         // One typing session is one undo step, however many keys it took —
         // the same bargain a drag makes.
@@ -663,46 +688,128 @@ impl State {
         }
     }
 
-    /// Put the text back as it was and close the edit, which then has nothing
-    /// in it and is dropped rather than pushed.
-    pub(crate) fn cancel_title_edit(&mut self) {
-        let Some((source, original)) = self.editing_title.take() else {
-            return;
-        };
-        self.media.set_title(source, original);
-        self.commit_edit();
+    /// The title being typed into, its text, and the caret held inside it —
+    /// an undo or another edit can have shortened the text under the caret.
+    fn typing_text(&mut self) -> Option<(SourceId, String)> {
+        let (source, _) = self.editing_title.as_ref()?;
+        let source = *source;
+        let text = self.media.title(source)?.text.clone();
+        let mut i = self.title_caret.min(text.len());
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        self.title_caret = i;
+        Some((source, text))
     }
 
-    /// Append typed text to the title being edited.
+    fn set_typed_text(&mut self, source: SourceId, text: String) {
+        if let Some(mut title) = self.media.title(source).cloned() {
+            title.text = text;
+            self.media.set_title(source, title);
+        }
+    }
+
+    /// Put typed text in at the caret, and the caret after it.
     ///
     /// Control characters are dropped: the window hands over the key's text
     /// whatever it was, and a tab or an escape has no business in a title even
     /// though the keyboard reports one.
-    pub(crate) fn type_into_title(&mut self, text: &str) {
-        let Some((source, _)) = self.editing_title else {
+    pub(crate) fn type_into_title(&mut self, typed: &str) {
+        let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let Some(mut title) = self.media.title(source).cloned() else {
+        let typed: String = typed.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+        if typed.is_empty() {
+            return;
+        }
+        text.insert_str(self.title_caret, &typed);
+        self.title_caret += typed.len();
+        self.set_typed_text(source, text);
+    }
+
+    /// Remove the character before the caret.
+    pub(crate) fn backspace_title(&mut self) {
+        let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let before = title.text.len();
-        title.text.extend(text.chars().filter(|c| !c.is_control() || *c == '\n'));
-        if title.text.len() != before {
-            self.media.set_title(source, title);
+        let from = title::caret::left(&text, self.title_caret);
+        if from < self.title_caret {
+            text.replace_range(from..self.title_caret, "");
+            self.title_caret = from;
+            self.set_typed_text(source, text);
         }
     }
 
-    /// Remove the last character of the title being edited.
-    pub(crate) fn backspace_title(&mut self) {
-        let Some((source, _)) = self.editing_title else {
+    /// Remove the character after the caret.
+    pub(crate) fn delete_in_title(&mut self) {
+        let Some((source, mut text)) = self.typing_text() else {
             return;
         };
-        let Some(mut title) = self.media.title(source).cloned() else {
-            return;
-        };
-        if title.text.pop().is_some() {
-            self.media.set_title(source, title);
+        let to = title::caret::right(&text, self.title_caret);
+        if to > self.title_caret {
+            text.replace_range(self.title_caret..to, "");
+            self.set_typed_text(source, text);
         }
+    }
+
+    /// Move the caret with one of [`title::caret`]'s moves.
+    pub(crate) fn move_title_caret(&mut self, step: fn(&str, usize) -> usize) {
+        if let Some((_, text)) = self.typing_text() {
+            self.title_caret = step(&text, self.title_caret);
+        }
+    }
+
+    /// Copy the selected clips, and the clips linked to them, for a paste.
+    pub(crate) fn copy_selected(&mut self) {
+        let ids = self.selection_with_links();
+        if ids.is_empty() {
+            self.set_status("Select clips to copy".into(), STATUS_INFO);
+            return;
+        }
+        self.clipboard = self.timeline.copy(&ids);
+        let n = self.clipboard.clips.len();
+        let noun = if n == 1 { "clip" } else { "clips" };
+        self.set_status(format!("Copied {n} {noun}"), STATUS_INFO);
+    }
+
+    /// Paste what was copied at the playhead, or just after the clip the
+    /// playhead is on, and select it. The playhead moves to the end of what
+    /// was pasted, so pressing paste again lays the next copy after it.
+    ///
+    /// A title comes back as a title of its own, a copy of the words: changing
+    /// one afterwards leaves the other as it was, which is what copying text
+    /// means everywhere else.
+    pub(crate) fn paste(&mut self) {
+        let mut board = self.clipboard.clone();
+        // A source taken out of the pool since the copy has nothing to show.
+        board.clips.retain(|(_, _, c)| self.media.get(c.source).is_some());
+        // Nor can a compound clip go inside itself.
+        let before = board.clips.len();
+        board.clips.retain(|(_, _, c)| self.may_place(c.source));
+        if board.clips.len() < before {
+            self.refuse_nesting();
+        }
+        if board.is_empty() {
+            self.set_status("Nothing to paste - copy clips first".into(), STATUS_INFO);
+            return;
+        }
+        self.begin_edit();
+        let mut fresh = std::collections::HashMap::new();
+        for (_, _, clip) in &mut board.clips {
+            if let Some(title) = self.media.title(clip.source).cloned() {
+                clip.source =
+                    *fresh.entry(clip.source).or_insert_with(|| self.media.add_title(title));
+            }
+        }
+        let ids = self.timeline.paste(&board, self.audio.position());
+        self.commit_edit();
+        let end = ids
+            .iter()
+            .filter_map(|id| self.timeline.find(*id))
+            .map(|(t, i)| self.timeline.tracks[t].clips[i].timeline_end())
+            .fold(0.0, f64::max);
+        self.selected = ids;
+        self.audio.set_position(end);
     }
 
     /// Cut the selected clips, and the clips linked to them, at the playhead.
@@ -829,6 +936,38 @@ impl State {
 
     /// Set one parameter of the shown clip's effect `index`. Called through a
     /// slider drag, which holds the edit open around it.
+    /// Change the title the effects tab is showing, as part of an edit
+    /// already open — a slider drag, which is one step however far it goes.
+    pub(crate) fn edit_shown_title(&mut self, change: impl FnOnce(&mut Title)) {
+        let Some((source, title)) = self.effects_title() else {
+            return;
+        };
+        let mut title = title.clone();
+        change(&mut title);
+        self.media.set_title(source, title);
+    }
+
+    /// Change the title the effects tab is showing, as one undo step.
+    pub(crate) fn change_shown_title(&mut self, change: impl FnOnce(&mut Title)) {
+        self.begin_edit();
+        self.edit_shown_title(change);
+        self.commit_edit();
+    }
+
+    /// Drop the font list from the font box, scrolled so the font in use is
+    /// in view.
+    pub(crate) fn open_font_menu(&mut self) {
+        let Some((_, title)) = self.effects_title() else {
+            return;
+        };
+        let current = title
+            .font
+            .as_deref()
+            .and_then(|f| fonts::families().iter().position(|n| n == f))
+            .map_or(0, |i| i + 1);
+        self.font_menu = Some(current.saturating_sub(FONT_MENU_ROWS / 2));
+    }
+
     pub(crate) fn set_effect_param(&mut self, index: usize, param: usize, value: f32) {
         if let Some(effect) = self.shown_effect_mut(index) {
             effect.set_param(param, value);

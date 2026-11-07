@@ -109,13 +109,6 @@ pub(super) fn blur_yuv(
     }
 }
 
-/// Blur the GRAY8 `src` into `out`, at the plan's work size.
-pub(super) fn blur_gray(src: &frame::Video, plan: BlurPlan, out: &mut frame::Video) {
-    let (w, h) = plan.work_size(src.width(), src.height());
-    alloc_gray(out, w, h);
-    write_plane(out, 0, &blur_plane(&read_plane(src, 0), plan));
-}
-
 /// The plan on the chroma grid: the same halvings, the blur at half the
 /// radius, since a chroma sample spans two luma samples.
 fn chroma_plan(plan: BlurPlan) -> BlurPlan {

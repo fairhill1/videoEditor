@@ -6,7 +6,7 @@ use crate::audio::{self, AudioStream, Waveform};
 use crate::filmstrip::Filmstrip;
 use crate::still::{self, Still};
 use crate::quad::{QuadRenderer, Texture};
-use crate::timeline::SourceId;
+use crate::timeline::{tracks_duration, Clip, SourceId, TrackKind, Tracks};
 use crate::title::{self, Title};
 use crate::video::VideoStream;
 
@@ -32,6 +32,9 @@ pub struct Source {
     pub path: String,
     /// `Some` for a title, whose picture is drawn rather than decoded.
     pub title: Option<Title>,
+    /// `Some` for a compound clip: clips of other sources, on tracks of their
+    /// own, that play as one.
+    pub compound: Option<Tracks>,
     /// The title's picture, baked for one canvas size and one state of the
     /// text. Rebuilt when either changes and otherwise reused, so typing into
     /// a title costs one rasterization per keystroke rather than one per frame.
@@ -56,6 +59,7 @@ impl Source {
             name,
             path,
             title: None,
+            compound: None,
             title_texture: None,
             title_baked: None,
             revision: 0,
@@ -160,6 +164,75 @@ impl MediaPool {
         self.insert(Source { title: Some(title), ..Source::empty(name, String::new()) })
     }
 
+    /// Add a compound clip holding `tracks`, named `name`.
+    pub fn add_compound(&mut self, name: String, tracks: Tracks) -> SourceId {
+        self.insert(Source { compound: Some(tracks), ..Source::empty(name, String::new()) })
+    }
+
+    /// What the compound clip `id` holds, or `None` for any other source.
+    pub fn compound(&self, id: SourceId) -> Option<&[(TrackKind, Vec<Clip>)]> {
+        self.sources.get(&id)?.compound.as_deref()
+    }
+
+    pub fn set_compound(&mut self, id: SourceId, tracks: Tracks) {
+        if let Some(src) = self.sources.get_mut(&id) {
+            if src.compound.is_some() {
+                src.compound = Some(tracks);
+            }
+        }
+    }
+
+    /// Every compound clip's contents, for the undo history, in id order for
+    /// the same reason as [`MediaPool::title_snapshot`].
+    pub fn compound_snapshot(&self) -> Vec<(SourceId, Tracks)> {
+        let mut all: Vec<(SourceId, Tracks)> = self
+            .sources
+            .iter()
+            .filter_map(|(id, src)| src.compound.clone().map(|c| (*id, c)))
+            .collect();
+        all.sort_by_key(|(id, _)| id.0);
+        all
+    }
+
+    pub fn restore_compounds(&mut self, all: &[(SourceId, Tracks)]) {
+        for (id, tracks) in all {
+            self.set_compound(*id, tracks.clone());
+        }
+    }
+
+    /// Take every clip of `source` out of every compound clip, as removing it
+    /// from the pool takes it off the timeline.
+    pub fn remove_from_compounds(&mut self, source: SourceId) {
+        for src in self.sources.values_mut() {
+            if let Some(tracks) = src.compound.as_mut() {
+                for (_, clips) in tracks {
+                    clips.retain(|c| c.source != source);
+                }
+            }
+        }
+    }
+
+    /// Whether `outer` is `inner` or holds it, however deep: what would make
+    /// a compound clip contain itself.
+    pub fn contains_compound(&self, outer: SourceId, inner: SourceId) -> bool {
+        self.contains_at(outer, inner, 0)
+    }
+
+    fn contains_at(&self, outer: SourceId, inner: SourceId, depth: usize) -> bool {
+        if outer == inner {
+            return true;
+        }
+        if depth >= crate::timeline::MAX_NESTING {
+            return true;
+        }
+        self.compound(outer).is_some_and(|tracks| {
+            tracks
+                .iter()
+                .flat_map(|(_, clips)| clips.iter())
+                .any(|c| self.contains_at(c.source, inner, depth + 1))
+        })
+    }
+
     pub fn title(&self, id: SourceId) -> Option<&Title> {
         self.sources.get(&id)?.title.as_ref()
     }
@@ -205,15 +278,10 @@ impl MediaPool {
     /// Split out from drawing because it needs the pool mutably and the GPU
     /// immutably, which is the one combination the render pass cannot hold
     /// while it is pushing quads.
-    /// `caret` adds a bar after the last character, for the title being typed
-    /// into. Part of the picture rather than something drawn over it, because
-    /// the text is centred: only the rasterizer knows where the last character
-    /// ended up, and it moves with every keystroke.
     pub fn bake_title(
         &mut self,
         id: SourceId,
         canvas: (u32, u32),
-        caret: bool,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         quads: &QuadRenderer,
@@ -225,37 +293,20 @@ impl MediaPool {
         let Some(title) = src.title.as_ref() else {
             return;
         };
-        // The caret joins the key, so putting it up or taking it away rebakes
-        // exactly once rather than not at all.
-        let key = (src.revision * 2 + caret as u64, width, height);
+        let key = (src.revision, width, height);
         if src.title_baked == Some(key) {
             return;
         }
-        let shown;
-        let title = if caret {
-            shown = Title {
-                text: format!("{}{}", title.text, title::CARET),
-                ..title.clone()
-            };
-            &shown
-        } else {
-            title
-        };
-        let mask = title::rasterize(title, width, height);
-        // White with the coverage in alpha, exactly as the glyph atlas stores
-        // its own bitmaps: the colour rides on the quad instead, so a title
-        // recoloured does not have to be rasterized again.
-        let mut rgba = vec![255u8; mask.coverage.len() * 4];
-        for (i, &c) in mask.coverage.iter().enumerate() {
-            rgba[i * 4 + 3] = c;
-        }
+        // The same picture the export draws, so what is styled here is what
+        // lands in the file.
+        let picture = title::render(title, width, height);
         let texture = quads.create_empty_texture(
             device,
             width,
             height,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );
-        texture.write_region(queue, 0, 0, width, height, &rgba);
+        texture.write_region(queue, 0, 0, width, height, &picture.pixels);
         src.title_texture = Some(texture);
         src.title_baked = Some(key);
     }
@@ -323,6 +374,9 @@ impl MediaPool {
             if s.still.is_some() {
                 return still::MAX_DURATION;
             }
+            if let Some(tracks) = s.compound.as_ref() {
+                return tracks_duration(tracks);
+            }
             s.stream
                 .as_ref()
                 .map(|v| v.duration())
@@ -349,7 +403,9 @@ impl MediaPool {
     pub fn has_video(&self, id: SourceId) -> bool {
         self.sources
             .get(&id)
-            .is_some_and(|s| s.stream.is_some() || s.title.is_some() || s.still.is_some())
+            .is_some_and(|s| {
+                s.stream.is_some() || s.title.is_some() || s.still.is_some() || s.compound.is_some()
+            })
     }
 
     pub fn audio_duration(&self, id: SourceId) -> Option<f64> {

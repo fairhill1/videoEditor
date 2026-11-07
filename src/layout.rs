@@ -7,6 +7,7 @@
 //! on and the rect you can see from drifting apart.
 
 use crate::effects::{EffectKind, EffectStack};
+use crate::fonts;
 use crate::input::DragMode;
 use crate::state::State;
 use crate::theme::*;
@@ -14,6 +15,7 @@ use crate::timeline::{
     db_to_gain, gain_to_db, Clip, FadeSide, SourceId, TrackKind, MAX_GAIN_DB, MAX_OPACITY,
     MIN_GAIN_DB, MIN_OPACITY,
 };
+use crate::title::{Title, TitleColor, TitleNumber, TitlePart, SWATCHES};
 use crate::ui::Rect;
 
 /// The two panel dividers, each named for what it separates.
@@ -529,17 +531,53 @@ pub(crate) struct StackRow {
     pub(crate) params: Vec<ParamRow>,
 }
 
+/// One control on a title: what it changes. The panel shows one row per
+/// control when the clip it is showing is a title.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum TitleControl {
+    /// The words, in a box that starts typing when pressed.
+    Text,
+    /// The face, in a box that opens the list of installed fonts.
+    Font,
+    Number(TitleNumber),
+    Color(TitleColor),
+    /// The on-off switch heading the outline's or shadow's rows.
+    Toggle(TitlePart),
+}
+
+/// One row of a title's settings: the row, and the control in it — the text
+/// box, the font box, the slider, the swatch strip, or the switch.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct TitleRow {
+    pub(crate) control: TitleControl,
+    pub(crate) row: Rect,
+    pub(crate) field: Rect,
+}
+
 /// Where everything on the effects tab sits. Like [`pool_cells`], the one
 /// place this is worked out, for drawing and hit testing alike.
+///
+/// Every rect is already scrolled: it is where the thing is on screen, and
+/// may be partly or wholly outside the panel's visible band, which drawing
+/// clips to and [`EffectsPanel::hit`] refuses presses outside of.
 #[derive(Clone, Debug)]
 pub(crate) struct EffectsPanel {
     pub(crate) library: Vec<LibraryCard>,
-    /// Top of the heading over the selected clip's effects.
+    /// Top of the heading over the selected clip's settings.
     pub(crate) clip_heading_y: f32,
+    /// The title's settings, when the clip is a title, and the blocks they
+    /// are grouped into: the words and their look, the outline, the shadow.
+    pub(crate) title: Vec<TitleRow>,
+    pub(crate) title_groups: Vec<Rect>,
     /// Top of the line that stands in for the stack when it has nothing to
     /// list — no clip picked, or a clip with no effects yet.
     pub(crate) hint_y: f32,
     pub(crate) stack: Vec<StackRow>,
+    /// The band the panel shows, top to bottom; content above or below it is
+    /// scrolled out of sight.
+    pub(crate) visible: [f32; 2],
+    /// How far the content can scroll: its height past the visible band.
+    pub(crate) max_scroll: f32,
 }
 
 /// What a press on the effects tab landed on.
@@ -551,11 +589,50 @@ pub(crate) enum EffectsHit {
     Toggle { index: usize },
     Remove { index: usize },
     Param { index: usize, param: usize, slider: Rect },
+    TitleText,
+    TitleFont,
+    TitleNumber { field: TitleNumber, slider: Rect },
+    TitleSwatch { field: TitleColor, swatch: usize },
+    TitleToggle(TitlePart),
+}
+
+/// How tall the text box is for `lines` lines: every one of them, blank ones
+/// too, up to a cap past which it shows the end.
+pub(crate) fn text_box_h(lines: usize) -> f32 {
+    let shown = lines.clamp(1, TITLE_TEXT_MAX_LINES) as f32;
+    (shown * TITLE_TEXT_LINE_H + (TITLE_FIELD_H - TITLE_TEXT_LINE_H)).round()
+}
+
+/// The swatches in a colour row's strip, one per entry in [`SWATCHES`]:
+/// square, in rows of [`TITLE_SWATCH_COLUMNS`], spaced evenly and centred
+/// down the strip.
+pub(crate) fn swatch_rects(field: Rect) -> [Rect; SWATCHES.len()] {
+    let cols = TITLE_SWATCH_COLUMNS as f32;
+    let rows = SWATCHES.len().div_ceil(TITLE_SWATCH_COLUMNS) as f32;
+    let side = TITLE_SWATCH
+        .min(((field.w - TITLE_SWATCH_GAP * (cols - 1.0)) / cols).floor())
+        .max(4.0);
+    let block_h = rows * side + (rows - 1.0) * TITLE_SWATCH_GAP;
+    let top = (field.y + (field.h - block_h) * 0.5).round();
+    std::array::from_fn(|i| Rect {
+        x: field.x + (i % TITLE_SWATCH_COLUMNS) as f32 * (side + TITLE_SWATCH_GAP),
+        y: top + (i / TITLE_SWATCH_COLUMNS) as f32 * (side + TITLE_SWATCH_GAP),
+        w: side,
+        h: side,
+    })
+}
+
+/// A colour row: tall enough for every row of swatches, with the same margin
+/// above and below as a slider row has around its knob.
+fn swatch_row_h() -> f32 {
+    let rows = SWATCHES.len().div_ceil(TITLE_SWATCH_COLUMNS) as f32;
+    rows * TITLE_SWATCH + (rows - 1.0) * TITLE_SWATCH_GAP + (EFFECT_PARAM_H - TITLE_SWATCH)
 }
 
 /// Lay the effects tab out in a pool `pool_w` wide and `pool_h` tall: the
-/// library as cards, then the effects on the clip being shown — `stack` — if
-/// there is one. Rows that would run past the bottom are left out.
+/// library as cards, then the clip being shown — its title settings when
+/// `title_lines` says it is one (and how many lines its text box needs),
+/// then its effects, `stack` — scrolled up by `scroll`.
 ///
 /// The cards are the media pool's grid tiles exactly, so the two pages of the
 /// panel read as one kind of thing. The library comes first so it holds
@@ -566,14 +643,16 @@ pub(crate) fn effects_panel(
     pool_w: f32,
     pool_h: f32,
     kinds: &[EffectKind],
+    title_lines: Option<usize>,
     stack: Option<&EffectStack>,
+    scroll: f32,
 ) -> EffectsPanel {
     let x = LABEL_PAD;
     let w = (pool_w - LABEL_PAD * 2.0).max(1.0);
-    let fits = |y: f32, h: f32| y + h <= pool_h;
-    let cells = pool_cells(PoolView::Grid, pool_w, pool_h, kinds.len());
+    // Laid out unscrolled, top at `POOL_LIST_TOP`, and moved up at the end.
+    let cells = pool_cells(PoolView::Grid, pool_w, f32::INFINITY, kinds.len());
     let mut y = cells.iter().map(|c| c.cell.y + c.cell.h).fold(POOL_LIST_TOP, f32::max);
-    let library = kinds
+    let mut library: Vec<LibraryCard> = kinds
         .iter()
         .zip(cells)
         .map(|(&kind, card)| LibraryCard {
@@ -591,55 +670,168 @@ pub(crate) fn effects_panel(
     y += EFFECTS_SECTION_GAP;
     let clip_heading_y = y;
     y += EFFECTS_SECTION_H;
+
+    // Where a labelled control starts: past the label, as an effect's
+    // sliders do, so every control in the panel lines up.
+    let field_x = x + EFFECT_PARAM_INDENT + EFFECT_PARAM_LABEL_W;
+    let field_right = x + w - POOL_ROW_PAD;
+    let slider_in = |row: Rect| Rect {
+        x: field_x,
+        y: (row.y + (row.h - ZOOM_SLIDER_KNOB_H) * 0.5).round(),
+        w: (field_right - EFFECT_PARAM_VALUE_W - field_x).max(ZOOM_SLIDER_KNOB_W),
+        h: ZOOM_SLIDER_KNOB_H,
+    };
+    let toggle_in = |row: Rect| Rect {
+        x: x + POOL_ROW_PAD,
+        y: (row.y + (row.h - EFFECT_SMALL_BTN) * 0.5).round(),
+        w: EFFECT_SMALL_BTN,
+        h: EFFECT_SMALL_BTN,
+    };
+
+    let mut title_rows = Vec::new();
+    let mut title_groups = Vec::new();
+    if let Some(lines) = title_lines {
+        use TitleControl as C;
+        let text_h = text_box_h(lines);
+        let groups: [&[TitleControl]; 3] = [
+            &[C::Text, C::Font, C::Number(TitleNumber::Size), C::Color(TitleColor::Fill)],
+            &[
+                C::Toggle(TitlePart::Outline),
+                C::Number(TitleNumber::OutlineWidth),
+                C::Color(TitleColor::Outline),
+            ],
+            &[
+                C::Toggle(TitlePart::Shadow),
+                C::Number(TitleNumber::ShadowDistance),
+                C::Number(TitleNumber::ShadowSoftness),
+                C::Number(TitleNumber::ShadowOpacity),
+            ],
+        ];
+        for group in groups {
+            let top = y;
+            for &control in group {
+                let h = match control {
+                    C::Text => text_h + (EFFECT_ROW_H - TITLE_FIELD_H),
+                    C::Toggle(_) => EFFECT_ROW_H,
+                    C::Color(_) => swatch_row_h(),
+                    _ => EFFECT_PARAM_H,
+                };
+                let row = Rect { x, y, w, h };
+                let field_h = if control == C::Text { text_h } else { TITLE_FIELD_H };
+                let boxed = Rect {
+                    x: field_x,
+                    y: (y + (h - field_h) * 0.5).round(),
+                    w: (field_right - field_x).max(1.0),
+                    h: field_h,
+                };
+                let field = match control {
+                    C::Text | C::Font => boxed,
+                    C::Number(_) => slider_in(row),
+                    C::Color(_) => Rect { y: row.y, h: row.h, ..boxed },
+                    C::Toggle(_) => toggle_in(row),
+                };
+                title_rows.push(TitleRow { control, row, field });
+                y += h;
+            }
+            title_groups.push(Rect { x, y: top, w, h: y - top });
+            y += EFFECT_ROW_GAP;
+        }
+        y += EFFECTS_SECTION_GAP - EFFECT_ROW_GAP;
+    }
     let hint_y = y;
 
     let mut rows = Vec::new();
     for (index, effect) in stack.into_iter().flat_map(|s| s.iter()).enumerate() {
-        if !fits(y, EFFECT_ROW_H) {
-            break;
-        }
         let row = Rect { x, y, w, h: EFFECT_ROW_H };
-        let btn_y = (y + (EFFECT_ROW_H - EFFECT_SMALL_BTN) * 0.5).round();
-        let toggle = Rect {
-            x: x + POOL_ROW_PAD,
-            y: btn_y,
-            w: EFFECT_SMALL_BTN,
-            h: EFFECT_SMALL_BTN,
-        };
+        let toggle = toggle_in(row);
         let remove = Rect { x: x + w - POOL_ROW_PAD - EFFECT_SMALL_BTN, ..toggle };
         y += EFFECT_ROW_H;
         let mut params = Vec::new();
         for param in 0..effect.kind().params().len() {
-            if !fits(y, EFFECT_PARAM_H) {
-                break;
-            }
             let prow = Rect { x, y, w, h: EFFECT_PARAM_H };
-            let slider_x = x + EFFECT_PARAM_INDENT + EFFECT_PARAM_LABEL_W;
-            let slider = Rect {
-                x: slider_x,
-                y: (y + (EFFECT_PARAM_H - ZOOM_SLIDER_KNOB_H) * 0.5).round(),
-                w: (x + w - POOL_ROW_PAD - EFFECT_PARAM_VALUE_W - slider_x).max(ZOOM_SLIDER_KNOB_W),
-                h: ZOOM_SLIDER_KNOB_H,
-            };
-            params.push(ParamRow { param, row: prow, slider });
+            params.push(ParamRow { param, row: prow, slider: slider_in(prow) });
             y += EFFECT_PARAM_H;
         }
         rows.push(StackRow { index, row, toggle, remove, params });
         y += EFFECT_ROW_GAP;
     }
+    // Room for the hint line under an empty stack, so scrolling to the end
+    // still shows it.
+    let bottom = if rows.is_empty() { hint_y + EFFECT_ROW_H } else { y };
 
-    EffectsPanel { library, clip_heading_y, hint_y, stack: rows }
+    let max_scroll = (bottom + LABEL_PAD - pool_h).max(0.0);
+    let scroll = scroll.clamp(0.0, max_scroll);
+    let up = |r: Rect| Rect { y: r.y - scroll, ..r };
+    for lib in &mut library {
+        lib.card.cell = up(lib.card.cell);
+        lib.card.thumb = up(lib.card.thumb);
+        lib.apply = up(lib.apply);
+    }
+    for r in &mut title_rows {
+        r.row = up(r.row);
+        r.field = up(r.field);
+    }
+    for g in &mut title_groups {
+        *g = up(*g);
+    }
+    for r in &mut rows {
+        r.row = up(r.row);
+        r.toggle = up(r.toggle);
+        r.remove = up(r.remove);
+        for p in &mut r.params {
+            p.row = up(p.row);
+            p.slider = up(p.slider);
+        }
+    }
+
+    EffectsPanel {
+        library,
+        clip_heading_y: clip_heading_y - scroll,
+        title: title_rows,
+        title_groups,
+        hint_y: hint_y - scroll,
+        stack: rows,
+        visible: [POOL_LIST_TOP, pool_h],
+        max_scroll,
+    }
 }
 
 impl EffectsPanel {
-    /// What is under `p`. Buttons before the rows they sit in.
+    /// What is under `p`. Buttons before the rows they sit in, and nothing
+    /// for a point in the part of the content scrolled out of sight.
     pub(crate) fn hit(&self, p: [f32; 2]) -> Option<EffectsHit> {
+        if p[1] < self.visible[0] || p[1] >= self.visible[1] {
+            return None;
+        }
         for lib in &self.library {
             if lib.apply.contains(p) {
                 return Some(EffectsHit::Apply(lib.kind));
             }
             if lib.card.cell.contains(p) {
                 return Some(EffectsHit::Library(lib.kind));
+            }
+        }
+        for r in &self.title {
+            match r.control {
+                TitleControl::Text if r.field.contains(p) => return Some(EffectsHit::TitleText),
+                TitleControl::Font if r.field.contains(p) => return Some(EffectsHit::TitleFont),
+                // The whole row past the label, as for an effect's slider.
+                TitleControl::Number(field)
+                    if r.row.contains(p) && p[0] >= r.field.x - ZOOM_SLIDER_KNOB_W =>
+                {
+                    return Some(EffectsHit::TitleNumber { field, slider: r.field });
+                }
+                TitleControl::Color(field) => {
+                    if let Some(swatch) = swatch_rects(r.field).iter().position(|s| s.contains(p)) {
+                        return Some(EffectsHit::TitleSwatch { field, swatch });
+                    }
+                }
+                // The switch, or the name beside it: the row is the switch's
+                // label, and a label that does nothing when clicked is a trap.
+                TitleControl::Toggle(part) if r.row.contains(p) => {
+                    return Some(EffectsHit::TitleToggle(part));
+                }
+                _ => {}
             }
         }
         for row in &self.stack {
@@ -663,6 +855,57 @@ impl EffectsPanel {
         }
         None
     }
+
+    /// The font box, for the list that drops from it.
+    pub(crate) fn font_field(&self) -> Option<Rect> {
+        self.title.iter().find(|r| r.control == TitleControl::Font).map(|r| r.field)
+    }
+}
+
+/// The list of fonts dropped from the font box `anchor`: where it sits, and
+/// the rows in it, which are `n` long and scrolled down by `scroll` rows.
+/// Below the box when it fits and above when it does not, inside a window
+/// `win` big.
+#[derive(Clone, Debug)]
+pub(crate) struct FontMenu {
+    pub(crate) rect: Rect,
+    /// Each visible row with the index of the entry it shows.
+    pub(crate) rows: Vec<(usize, Rect)>,
+    pub(crate) max_scroll: usize,
+}
+
+pub(crate) fn font_menu(anchor: Rect, win: [f32; 2], n: usize, scroll: usize) -> FontMenu {
+    let stride = MENU_ROW_H + MENU_ROW_GAP;
+    let below = anchor.y + anchor.h + MENU_GAP;
+    let room_below = win[1] - MENU_PAD - below;
+    let room_above = anchor.y - MENU_GAP - MENU_PAD;
+    let fit = |room: f32| ((room - MENU_PAD * 2.0) / stride).floor().max(0.0) as usize;
+    let rows_shown = n.min(FONT_MENU_ROWS);
+    let (shown, y) = if fit(room_below) >= rows_shown || room_below >= room_above {
+        let shown = rows_shown.min(fit(room_below)).max(1);
+        (shown, below)
+    } else {
+        let shown = rows_shown.min(fit(room_above)).max(1);
+        (shown, anchor.y - MENU_GAP - (shown as f32 * stride + MENU_PAD * 2.0))
+    };
+    let w = anchor.w.max(FONT_MENU_MIN_W);
+    let x = anchor.x.min(win[0] - w - MENU_PAD).max(MENU_PAD);
+    let h = shown as f32 * stride + MENU_PAD * 2.0 - MENU_ROW_GAP;
+    let rect = Rect { x: x.round(), y: y.round(), w, h };
+    let max_scroll = n.saturating_sub(shown);
+    let scroll = scroll.min(max_scroll);
+    let rows = (0..shown.min(n))
+        .map(|i| {
+            let r = Rect {
+                x: rect.x + MENU_PAD,
+                y: rect.y + MENU_PAD + i as f32 * stride,
+                w: w - MENU_PAD * 2.0,
+                h: MENU_ROW_H,
+            };
+            (scroll + i, r)
+        })
+        .collect();
+    FontMenu { rect, rows, max_scroll }
 }
 
 /// The fx badge on a clip with effects, given the left of the clip's visible
@@ -1148,10 +1391,33 @@ impl State {
 
     /// The effects tab, laid out for the clip it is showing.
     pub(crate) fn effects_panel(&self) -> EffectsPanel {
-        let stack = self
-            .effects_target()
-            .map(|(t, i)| &self.timeline.tracks[t].clips[i].effects);
-        effects_panel(self.media_pool_w(), self.timeline_top(), &EffectKind::ALL, stack)
+        let target = self.effects_target().map(|(t, i)| &self.timeline.tracks[t].clips[i]);
+        effects_panel(
+            self.media_pool_w(),
+            self.timeline_top(),
+            &EffectKind::ALL,
+            self.effects_title().map(|(_, t)| t.text.split('\n').count()),
+            target.map(|c| &c.effects),
+            self.effects_scroll,
+        )
+    }
+
+    /// The title the effects tab is showing the settings of, when the clip it
+    /// is showing is a title: its source and the title as it stands.
+    pub(crate) fn effects_title(&self) -> Option<(SourceId, &Title)> {
+        let (t, i) = self.effects_target()?;
+        let source = self.timeline.tracks[t].clips[i].source;
+        self.media.title(source).map(|title| (source, title))
+    }
+
+    /// The font list, laid out under the font box, while it is open.
+    pub(crate) fn font_menu(&self) -> Option<FontMenu> {
+        let scroll = self.font_menu?;
+        if self.pool_tab != PoolTab::Effects {
+            return None;
+        }
+        let anchor = self.effects_panel().font_field()?;
+        Some(font_menu(anchor, self.logical_size(), fonts::choice_count(), scroll))
     }
 
     pub(crate) fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
@@ -1379,7 +1645,7 @@ mod tests {
         let mut stack = EffectStack::default();
         stack.push(EffectKind::GaussianBlur.instance());
         stack.push(EffectKind::GaussianBlur.instance());
-        let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(&stack));
+        let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, None, Some(&stack), 0.0);
         assert_eq!(panel.library.len(), EffectKind::ALL.len());
         let card = panel.library[0].card;
         // The card's apply button sits on its picture, and the card is a
@@ -1401,20 +1667,110 @@ mod tests {
     }
 
     #[test]
-    fn an_effects_tab_too_short_for_its_rows_leaves_them_out() {
+    fn an_effects_tab_too_short_for_its_rows_scrolls_to_reach_them() {
         use crate::effects::{EffectKind, EffectStack};
         let mut stack = EffectStack::default();
         for _ in 0..8 {
             stack.push(EffectKind::GaussianBlur.instance());
         }
-        let panel = effects_panel(400.0, 420.0, &EffectKind::ALL, Some(&stack));
-        for row in &panel.stack {
-            assert!(row.row.y + row.row.h <= 420.0);
-            for p in &row.params {
-                assert!(p.row.y + p.row.h <= 420.0);
+        let top = effects_panel(400.0, 420.0, &EffectKind::ALL, Some(1), Some(&stack), 0.0);
+        assert_eq!(top.stack.len(), 8, "rows are scrolled to, not dropped");
+        assert!(top.max_scroll > 0.0);
+        // Scrolled past the end, it stops at the end: the last row's bottom
+        // sits inside the panel.
+        let end = effects_panel(400.0, 420.0, &EffectKind::ALL, Some(1), Some(&stack), 1e6);
+        let last = end.stack[7].params.last().unwrap().row;
+        assert!(last.y + last.h <= 420.0);
+        assert!(last.y + last.h > 420.0 - EFFECT_ROW_H * 2.0);
+        // What is scrolled out of sight takes no presses, even where a row
+        // of it now sits above the panel's top.
+        let card = end.library[0].card.cell;
+        assert!(card.y + card.h < POOL_LIST_TOP);
+        assert_eq!(end.hit([card.x + 2.0, card.y + card.h - 2.0]), None);
+    }
+
+    #[test]
+    fn a_titles_settings_sit_between_the_heading_and_its_effects() {
+        use crate::effects::{EffectKind, EffectStack};
+        let mut stack = EffectStack::default();
+        stack.push(EffectKind::GaussianBlur.instance());
+        let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(1), Some(&stack), 0.0);
+        let controls: Vec<TitleControl> = panel.title.iter().map(|r| r.control).collect();
+        assert_eq!(controls.len(), 11);
+        assert_eq!(controls[0], TitleControl::Text);
+        assert!(panel.title[0].row.y >= panel.clip_heading_y + EFFECTS_SECTION_H);
+        let last = panel.title.last().unwrap().row;
+        assert!(panel.stack[0].row.y >= last.y + last.h);
+        for pair in panel.title.windows(2) {
+            assert!(pair[1].row.y >= pair[0].row.y + pair[0].row.h);
+        }
+        // Each control answers to a press on it.
+        let at = |c: TitleControl| panel.title.iter().find(|r| r.control == c).unwrap();
+        let f = at(TitleControl::Text).field;
+        assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleText));
+        let f = at(TitleControl::Font).field;
+        assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleFont));
+        let size = at(TitleControl::Number(TitleNumber::Size));
+        assert_eq!(
+            panel.hit([size.field.x + 4.0, size.row.y + 2.0]),
+            Some(EffectsHit::TitleNumber { field: TitleNumber::Size, slider: size.field })
+        );
+        let swatches = swatch_rects(at(TitleControl::Color(TitleColor::Outline)).field);
+        assert_eq!(
+            panel.hit([swatches[3].x + 2.0, swatches[3].y + 2.0]),
+            Some(EffectsHit::TitleSwatch { field: TitleColor::Outline, swatch: 3 })
+        );
+        let toggle = at(TitleControl::Toggle(TitlePart::Shadow)).row;
+        assert_eq!(
+            panel.hit([toggle.x + 100.0, toggle.y + 2.0]),
+            Some(EffectsHit::TitleToggle(TitlePart::Shadow))
+        );
+        // A clip that is not a title has none of it.
+        let plain = effects_panel(400.0, 2000.0, &EffectKind::ALL, None, Some(&stack), 0.0);
+        assert!(plain.title.is_empty());
+    }
+
+    #[test]
+    fn the_text_box_grows_with_the_lines_and_stops_at_a_cap() {
+        use crate::effects::EffectKind;
+        let field = |lines| {
+            let p = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(lines), None, 0.0);
+            p.title.iter().find(|r| r.control == TitleControl::Text).unwrap().field.h
+        };
+        assert!(field(3) > field(1));
+        assert_eq!(field(3) - field(2), TITLE_TEXT_LINE_H);
+        assert_eq!(field(TITLE_TEXT_MAX_LINES), field(TITLE_TEXT_MAX_LINES + 5));
+        // Every swatch fits in its row, and none overlap.
+        let p = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(1), None, 0.0);
+        let row = p.title.iter().find(|r| matches!(r.control, TitleControl::Color(_))).unwrap();
+        let rects = swatch_rects(row.field);
+        for (i, a) in rects.iter().enumerate() {
+            assert!(a.y >= row.row.y && a.y + a.h <= row.row.y + row.row.h);
+            assert!(a.x + a.w <= row.row.x + row.row.w);
+            for b in &rects[i + 1..] {
+                assert!(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
             }
         }
-        assert!(panel.stack.len() < 8);
+    }
+
+    #[test]
+    fn the_font_list_stays_inside_the_window_and_scrolls() {
+        let anchor = Rect { x: 100.0, y: 200.0, w: 180.0, h: TITLE_FIELD_H };
+        let menu = font_menu(anchor, [1200.0, 800.0], 300, 0);
+        assert_eq!(menu.rows.len(), FONT_MENU_ROWS);
+        assert!(menu.rect.y >= anchor.y + anchor.h);
+        assert_eq!(menu.max_scroll, 300 - FONT_MENU_ROWS);
+        // Near the bottom of the window it opens upwards instead.
+        let low = Rect { y: 760.0, ..anchor };
+        let up = font_menu(low, [1200.0, 800.0], 300, 0);
+        assert!(up.rect.y + up.rect.h <= low.y);
+        assert!(up.rect.y >= 0.0);
+        // Scrolled past the end, the last entry is the last row.
+        let end = font_menu(anchor, [1200.0, 800.0], 300, 10_000);
+        assert_eq!(end.rows.last().unwrap().0, 299);
+        for (_, r) in &menu.rows {
+            assert!(r.x + r.w <= 1200.0 && r.y + r.h <= 800.0);
+        }
     }
 
     #[test]

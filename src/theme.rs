@@ -39,6 +39,13 @@ pub(crate) const ICON_ZOOM_FIT: char = '\u{E43D}'; // unfold-horizontal
 pub(crate) const ICON_PLUS: char = '\u{E13D}'; // plus
 pub(crate) const ICON_EYE: char = '\u{E0BA}'; // eye
 pub(crate) const ICON_EYE_OFF: char = '\u{E0BB}'; // eye-off
+pub(crate) const ICON_CHEVRON_DOWN: char = '\u{E06D}'; // chevron-down
+pub(crate) const ICON_COPY: char = '\u{E09E}'; // copy
+pub(crate) const ICON_PASTE: char = '\u{E3E8}'; // clipboard-paste
+pub(crate) const ICON_COMBINE: char = '\u{E464}'; // group
+pub(crate) const ICON_EDIT: char = '\u{E1F9}'; // pencil
+pub(crate) const ICON_BACK: char = '\u{E048}'; // arrow-left
+pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -188,6 +195,20 @@ pub(crate) const CLIP_LABEL_SIZE: f32 = TYPE_SM;
 pub(crate) const LABEL_PAD: f32 = 10.0;
 pub(crate) const PLAYHEAD_COLOR: [f32; 4] = [0.95, 0.35, 0.35, 1.0];
 pub(crate) const PLAYHEAD_WIDTH: f32 = 2.0;
+/// The timeline's label while a compound clip is open: its name, in the
+/// selection accent, so the timeline says plainly that it is not the edit.
+pub(crate) const COMPOUND_LABEL_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
+/// Past this a compound clip's name is cut short, so a long one cannot push
+/// the timeline's buttons off the toolbar.
+pub(crate) const COMPOUND_LABEL_MAX_W: f32 = 180.0;
+/// The combine icon a compound clip shows in the pool where footage shows a
+/// frame.
+pub(crate) const POOL_COMPOUND_ICON_SIZE: f32 = TYPE_ICON;
+/// The playhead's grip on the ruler: a tab, then a point down into the line.
+/// Together they fill most of the ruler's height.
+pub(crate) const PLAYHEAD_HEAD_W: f32 = 12.0;
+pub(crate) const PLAYHEAD_HEAD_H: f32 = 9.0;
+pub(crate) const PLAYHEAD_HEAD_POINT_H: f32 = 6.0;
 pub(crate) const TIMER_SIZE: f32 = TYPE_XL;
 pub(crate) const TIMER_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 // Transport bar between preview and timeline; holds prev/play/next + timer.
@@ -441,6 +462,37 @@ pub(crate) const EFFECT_DRAG_OFFSET: f32 = 14.0;
 /// The outline on the clip a dragged effect would land on.
 pub(crate) const EFFECT_DROP_OUTLINE_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
 pub(crate) const EFFECT_DROP_OUTLINE_PX: f32 = 2.0;
+/// How far one notch of the wheel scrolls the effects tab.
+pub(crate) const EFFECTS_SCROLL_STEP: f32 = 40.0;
+
+// A title's settings on the effects tab.
+/// The text and font boxes: a sunken field, darker than the row it sits in,
+/// that reads as somewhere to click and type.
+pub(crate) const TITLE_FIELD_H: f32 = 22.0;
+pub(crate) const TITLE_FIELD_BG: [f32; 4] = [0.12, 0.12, 0.15, 1.0];
+pub(crate) const TITLE_FIELD_BORDER: [f32; 4] = [0.30, 0.30, 0.36, 1.0];
+pub(crate) const TITLE_FIELD_HOVER_BORDER: [f32; 4] = [0.46, 0.46, 0.54, 1.0];
+pub(crate) const TITLE_FIELD_ACTIVE_BORDER: [f32; 4] = CLIP_SELECTED_BORDER;
+pub(crate) const TITLE_FIELD_PAD: f32 = 6.0;
+pub(crate) const TITLE_FIELD_SIZE: f32 = TYPE_MD;
+/// The text box grows a line at a time to show every line of the title, up
+/// to this many; past it, it shows the last ones.
+pub(crate) const TITLE_TEXT_LINE_H: f32 = 17.0;
+pub(crate) const TITLE_TEXT_MAX_LINES: usize = 8;
+/// The text cursor in the text box while a title is being typed into.
+pub(crate) const TITLE_CARET_W: f32 = 1.5;
+pub(crate) const TITLE_CARET_COLOR: [f32; 4] = CLIP_LABEL_COLOR;
+/// The colour swatches, and the ring around the one in use.
+pub(crate) const TITLE_SWATCH: f32 = 16.0;
+pub(crate) const TITLE_SWATCH_GAP: f32 = 4.0;
+pub(crate) const TITLE_SWATCH_COLUMNS: usize = 8;
+pub(crate) const TITLE_SWATCH_EDGE: [f32; 4] = [0.40, 0.40, 0.46, 1.0];
+pub(crate) const TITLE_SWATCH_RING: [f32; 4] = CLIP_LABEL_COLOR;
+pub(crate) const TITLE_SWATCH_RING_PX: f32 = 2.0;
+/// The list of fonts that drops from the font box: this many rows at most,
+/// and at least this wide however narrow the panel.
+pub(crate) const FONT_MENU_ROWS: usize = 14;
+pub(crate) const FONT_MENU_MIN_W: f32 = 220.0;
 
 // The fx badge on a clip that has effects: the way from a clip on the timeline
 // to the panel that edits them.
