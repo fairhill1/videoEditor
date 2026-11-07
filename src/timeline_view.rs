@@ -221,9 +221,10 @@ impl State {
         }
 
         // --- Pool-drag ghost: previews where the clip will land ---
-        // Start-aligned to the cursor (matches `end_drag`'s drop_t semantics)
-        // and snapped to the hovered lane's y when over one, so the preview
-        // rect is exactly the rect that'll be created on mouse-up. Its duration
+        // Starts where `pool_drop_start` says the drop will — the cursor,
+        // latched onto a nearby edge when snapping is on — and sits on the
+        // hovered lane's y when over one, so the preview rect is exactly the
+        // rect that'll be created on mouse-up. Its duration
         // is already folded into the view (see `State::content_duration`), so
         // the width here is the width it will have once dropped.
         if let DragMode::PoolDrag { source } = self.drag {
@@ -231,7 +232,7 @@ impl State {
             let ghost_w = ((dur * layout.px_per_sec()) as f32).max(GHOST_MIN_W);
             let ghost_h = lane_h;
             let over_lane = self.track_at_y(self.cursor[1], &layout);
-            let gx = self.cursor[0].max(layout.clips_x);
+            let gx = layout.t_to_x(self.pool_drop_start(source)).max(layout.clips_x);
             let (gy, ghost_color) = match over_lane {
                 Some(track_idx) => match self.timeline.tracks[track_idx].kind {
                     TrackKind::Video => {

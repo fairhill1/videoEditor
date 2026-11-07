@@ -266,17 +266,9 @@ impl State {
     /// target. Returns `delta` untouched when nothing is in range or snapping
     /// is off.
     fn snap_move_delta(&self, siblings: &[(usize, usize)], delta: f64) -> f64 {
-        if !self.snap_enabled {
+        let Some(threshold) = self.timeline_snap_threshold() else {
             return delta;
-        }
-        let layout = self.timeline_layout();
-        // The threshold is authored in pixels, so convert with the same
-        // seconds-per-pixel mapping the drag itself uses — which means the pull
-        // tightens as you zoom in, exactly as the pixel threshold promises.
-        let px_per_sec = layout.px_per_sec();
-        if !px_per_sec.is_finite() || px_per_sec <= 0.0 {
-            return delta;
-        }
+        };
         let edges: Vec<f64> = siblings
             .iter()
             .flat_map(|&(ti, ci)| {
@@ -285,7 +277,62 @@ impl State {
             })
             .collect();
         let targets = self.snap_targets(siblings);
-        delta + nearest_snap(&edges, &targets, SNAP_PX as f64 / px_per_sec).unwrap_or(0.0)
+        delta + nearest_snap(&edges, &targets, threshold).unwrap_or(0.0)
+    }
+
+    /// How far, in seconds, an edge on the timeline is pulled onto a snap
+    /// target. `None` when snapping is off or the timeline has no width.
+    ///
+    /// The threshold is authored in pixels, so it converts with the same
+    /// seconds-per-pixel mapping the drag itself uses — which means the pull
+    /// tightens as you zoom in, exactly as the pixel threshold promises.
+    fn timeline_snap_threshold(&self) -> Option<f64> {
+        if !self.snap_enabled {
+            return None;
+        }
+        let px_per_sec = self.timeline_layout().px_per_sec();
+        (px_per_sec.is_finite() && px_per_sec > 0.0).then(|| SNAP_PX as f64 / px_per_sec)
+    }
+
+    /// Nudge a trim's `delta` so the edge being dragged lands exactly on a
+    /// snap target, as a moved clip's edges do. `start` says which edge: the
+    /// left trim moves starts, the right trim ends. Every linked sibling's edge
+    /// competes, since the same delta moves them all.
+    fn snap_trim_delta(&self, siblings: &[(usize, usize)], delta: f64, start: bool) -> f64 {
+        let Some(threshold) = self.timeline_snap_threshold() else {
+            return delta;
+        };
+        let edges: Vec<f64> = siblings
+            .iter()
+            .map(|&(ti, ci)| {
+                let c = &self.timeline.tracks[ti].clips[ci];
+                delta + if start { c.timeline_start } else { c.timeline_end() }
+            })
+            .collect();
+        let targets = self.snap_targets(siblings);
+        delta + nearest_snap(&edges, &targets, threshold).unwrap_or(0.0)
+    }
+
+    /// Where a clip dragged in from the pool starts if it is dropped now: under
+    /// the cursor, latched by either of its edges onto the same targets a clip
+    /// being moved latches onto. The ghost and the drop both ask this, so the
+    /// preview is where the clip lands.
+    ///
+    /// The paired audio's end counts as an edge too when it differs from the
+    /// picture's, since that clip lands alongside and lining it up is as much
+    /// the point.
+    pub(crate) fn pool_drop_start(&self, source: SourceId) -> f64 {
+        let t = self.timeline_layout().cursor_to_t(self.cursor[0]).max(0.0);
+        let Some(threshold) = self.timeline_snap_threshold() else {
+            return t;
+        };
+        let mut edges = vec![t, t + self.media.drop_duration(source)];
+        if let Some(adur) = self.media.audio_duration(source) {
+            edges.push(t + adur);
+        }
+        let targets = self.snap_targets(&[]);
+        let snap = nearest_snap(&edges, &targets, threshold).unwrap_or(0.0);
+        (t + snap).max(0.0)
     }
 
     pub(crate) fn apply_move_delta(&mut self, track: usize, idx: usize, desired_delta: f64) {
@@ -319,7 +366,11 @@ impl State {
             min_delta = min_delta.max(-c.timeline_start);
             max_delta = max_delta.min(c.duration() - MIN_CLIP_DURATION);
         }
-        let delta = desired_delta.clamp(min_delta, max_delta);
+        // Snapped first, then held to the limits: a target past the start of
+        // the source or through the clip's own end is not one it can reach.
+        let delta = self
+            .snap_trim_delta(&siblings, desired_delta, true)
+            .clamp(min_delta, max_delta);
         for (ti, ci) in siblings {
             let c = &mut self.timeline.tracks[ti].clips[ci];
             c.source_in += delta;
@@ -344,7 +395,9 @@ impl State {
             };
             max_delta = max_delta.min(src_dur - c.source_out);
         }
-        let delta = desired_delta.clamp(min_delta, max_delta);
+        let delta = self
+            .snap_trim_delta(&siblings, desired_delta, false)
+            .clamp(min_delta, max_delta);
         for (ti, ci) in siblings {
             let c = &mut self.timeline.tracks[ti].clips[ci];
             c.source_out += delta;

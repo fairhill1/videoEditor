@@ -480,11 +480,11 @@ impl State {
 
     pub(crate) fn end_drag(&mut self) {
         if let DragMode::PoolDrag { source } = self.drag {
-            let [cx, cy] = self.cursor;
+            let cy = self.cursor[1];
             let layout = self.timeline_layout();
             if let Some(track_idx) = self.track_at_y(cy, &layout) {
                 self.begin_edit();
-                let drop_t = layout.cursor_to_t(cx).max(0.0);
+                let drop_t = self.pool_drop_start(source);
                 let kind = self.timeline.tracks[track_idx].kind;
                 match kind {
                     // Mirrors the audio lane's rule below: a source with no
