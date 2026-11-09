@@ -8,7 +8,7 @@
 use crate::effects::EffectKind;
 use crate::fonts;
 use crate::layout::{
-    resolve_split, track_header_button, transform_fraction, transform_value, y_to_gain,
+    resolve_split, style_remove_rect, track_header_button, transform_fraction, transform_value, y_to_gain,
     y_to_opacity, EffectsHit, PickerHit, PoolTab, PoolView, TitleMenu,
     TitleControl,
     PreviewHit, Splitter, TimelineHit,
@@ -101,6 +101,8 @@ impl State {
         // about taking the words back — and before the guard below, so the
         // typing session closes as itself rather than as a leaked drag.
         self.finish_title_edit();
+        // And of typing a style's name, the same way.
+        self.finish_style_name();
         // A press with an edit still open means the matching release never
         // arrived (focus lost mid-drag). Close it here — otherwise the depth
         // counter leaks and every later edit nests inside it, silently
@@ -182,8 +184,17 @@ impl State {
         // only closes it.
         if let Some((kind, menu)) = self.font_menu() {
             self.font_menu = None;
-            if let Some(&(i, _)) = menu.rows.iter().find(|(_, r)| r.contains([cx, cy])) {
+            if let Some(&(i, row)) = menu.rows.iter().find(|(_, r)| r.contains([cx, cy])) {
                 match kind {
+                    TitleMenu::Style if style_remove_rect(row).contains([cx, cy]) => {
+                        self.delete_style(i);
+                        // Left open on what remains, so clearing out a few
+                        // is a few presses rather than reopening between.
+                        if !self.title_styles.is_empty() {
+                            self.font_menu = Some((TitleMenu::Style, menu.rows[0].0));
+                        }
+                    }
+                    TitleMenu::Style => self.apply_style(i),
                     TitleMenu::Font => {
                         let family = fonts::choice(i).map(str::to_string);
                         self.change_shown_title(|t| t.font = family.clone());
@@ -426,6 +437,8 @@ impl State {
                             self.drag = DragMode::TextSelect { field };
                         }
                     }
+                    Some(EffectsHit::TitleStyle) => self.open_style_menu(),
+                    Some(EffectsHit::TitleSaveStyle) => self.save_shown_style(),
                     Some(EffectsHit::TitleFont) => self.open_font_menu(),
                     Some(EffectsHit::TitleWeight) => self.open_weight_menu(),
                     Some(EffectsHit::TitleNumber { field, slider }) => {

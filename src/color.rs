@@ -5,8 +5,6 @@
 //! 0 to 1 — so a colour read off the screen, typed as hex or picked from the
 //! square means the same thing a title stores.
 
-use std::path::PathBuf;
-
 /// How many recent colours are kept.
 pub const RECENT_MAX: usize = 8;
 
@@ -81,34 +79,20 @@ pub fn remember(recent: &mut Vec<[f32; 4]>, color: [f32; 4]) {
 
 /// Where the recent colours are kept: in the user's own config, not the
 /// project, so an end card's colours are at hand in the next short too.
-fn recent_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("videoEditor").join("recent-colours"))
-}
+const RECENT_FILE: &str = "recent-colours";
 
 /// The recent colours saved last time, or none. A file that will not read is
 /// the same as no file: losing the list is not worth an error.
 pub fn load_recent() -> Vec<[f32; 4]> {
-    let Some(text) = recent_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+    let Some(text) = crate::config::read(RECENT_FILE) else {
         return Vec::new();
     };
     text.lines().filter_map(from_hex).take(RECENT_MAX).collect()
 }
 
 pub fn save_recent(recent: &[[f32; 4]]) {
-    let Some(path) = recent_path() else {
-        return;
-    };
     let text: String = recent.iter().map(|c| to_hex(*c) + "\n").collect();
-    let written = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|_| std::fs::write(&path, text));
-    if let Err(e) = written {
-        log::warn!("could not save recent colours to {}: {e}", path.display());
-    }
+    crate::config::write(RECENT_FILE, &text);
 }
 
 #[cfg(test)]

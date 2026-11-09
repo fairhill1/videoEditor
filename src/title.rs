@@ -74,6 +74,8 @@ pub struct Title {
     pub outline: Outline,
     #[serde(default)]
     pub shadow: Shadow,
+    #[serde(default)]
+    pub background: Background,
     /// The distance from one line to the next, as a multiple of the font's
     /// own: 1 is the face as designed, with a little air.
     #[serde(default = "normal_spacing")]
@@ -119,6 +121,29 @@ pub struct Shadow {
 impl Default for Shadow {
     fn default() -> Self {
         Self { enabled: false, distance: 0.006, softness: 0.006, opacity: 0.7 }
+    }
+}
+
+/// A box of colour behind each line, the way captions are set on a video
+/// whose picture is too busy to read words over. One per line rather than one
+/// around the block, so each box is as wide as its own line; where the boxes
+/// of neighbouring lines meet they join into one shape rather than overlap.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Background {
+    pub enabled: bool,
+    pub color: [f32; 4],
+    pub opacity: f32,
+    /// How far the box reaches past the line on every side, as a fraction of
+    /// the canvas height.
+    pub padding: f32,
+    /// How round its corners are: their radius, as a fraction of the canvas
+    /// height.
+    pub radius: f32,
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        Self { enabled: false, color: [0.0, 0.0, 0.0, 1.0], opacity: 0.8, padding: 0.012, radius: 0.008 }
     }
 }
 
@@ -216,6 +241,9 @@ pub enum TitleNumber {
     ShadowDistance,
     ShadowSoftness,
     ShadowOpacity,
+    BackgroundOpacity,
+    BackgroundPadding,
+    BackgroundRadius,
 }
 
 impl TitleNumber {
@@ -227,6 +255,9 @@ impl TitleNumber {
             Self::ShadowDistance => ("Distance", 0.0, 0.04, 0.006, Unit::CanvasHeight),
             Self::ShadowSoftness => ("Softness", 0.0, 0.03, 0.006, Unit::CanvasHeight),
             Self::ShadowOpacity => ("Opacity", 0.0, 1.0, 0.7, Unit::Percent),
+            Self::BackgroundOpacity => ("Opacity", 0.0, 1.0, 0.8, Unit::Percent),
+            Self::BackgroundPadding => ("Padding", 0.0, 0.05, 0.012, Unit::CanvasHeight),
+            Self::BackgroundRadius => ("Rounding", 0.0, 0.03, 0.008, Unit::CanvasHeight),
         };
         ParamSpec { name, min, max, default, unit }
     }
@@ -239,6 +270,9 @@ impl TitleNumber {
             Self::ShadowDistance => title.shadow.distance,
             Self::ShadowSoftness => title.shadow.softness,
             Self::ShadowOpacity => title.shadow.opacity,
+            Self::BackgroundOpacity => title.background.opacity,
+            Self::BackgroundPadding => title.background.padding,
+            Self::BackgroundRadius => title.background.radius,
         }
     }
 
@@ -252,6 +286,9 @@ impl TitleNumber {
             Self::ShadowDistance => title.shadow.distance = value,
             Self::ShadowSoftness => title.shadow.softness = value,
             Self::ShadowOpacity => title.shadow.opacity = value,
+            Self::BackgroundOpacity => title.background.opacity = value,
+            Self::BackgroundPadding => title.background.padding = value,
+            Self::BackgroundRadius => title.background.radius = value,
         }
     }
 }
@@ -261,6 +298,7 @@ impl TitleNumber {
 pub enum TitleColor {
     Fill,
     Outline,
+    Background,
 }
 
 impl TitleColor {
@@ -268,6 +306,7 @@ impl TitleColor {
         match self {
             Self::Fill => title.color,
             Self::Outline => title.outline.color,
+            Self::Background => title.background.color,
         }
     }
 
@@ -275,6 +314,7 @@ impl TitleColor {
         match self {
             Self::Fill => title.color = color,
             Self::Outline => title.outline.color = color,
+            Self::Background => title.background.color = color,
         }
     }
 }
@@ -284,6 +324,7 @@ impl TitleColor {
 pub enum TitlePart {
     Outline,
     Shadow,
+    Background,
 }
 
 impl TitlePart {
@@ -291,6 +332,7 @@ impl TitlePart {
         match self {
             Self::Outline => "Outline",
             Self::Shadow => "Drop shadow",
+            Self::Background => "Background",
         }
     }
 
@@ -298,6 +340,7 @@ impl TitlePart {
         match self {
             Self::Outline => title.outline.enabled,
             Self::Shadow => title.shadow.enabled,
+            Self::Background => title.background.enabled,
         }
     }
 
@@ -305,6 +348,7 @@ impl TitlePart {
         match self {
             Self::Outline => title.outline.enabled = on,
             Self::Shadow => title.shadow.enabled = on,
+            Self::Background => title.background.enabled = on,
         }
     }
 }
@@ -319,6 +363,7 @@ impl Default for Title {
             weight: fonts::REGULAR,
             outline: Outline::default(),
             shadow: Shadow::default(),
+            background: Background::default(),
             line_spacing: 1.0,
         }
     }
@@ -342,6 +387,10 @@ pub struct Mask {
     pub width: u32,
     pub height: u32,
     pub coverage: Vec<u8>,
+    /// Each line with something on it, as `[left, top, right, bottom]` in
+    /// pixels: across from its pen start to its end, down from the font's
+    /// ascent to its descent. Where a background box goes.
+    pub lines: Vec<[f32; 4]>,
 }
 
 /// Draw `title` into a `width x height` coverage mask.
@@ -355,6 +404,7 @@ pub fn rasterize(title: &Title, width: u32, height: u32) -> Mask {
         width,
         height,
         coverage: vec![0; (width as usize) * (height as usize)],
+        lines: Vec::new(),
     };
     if width == 0 || height == 0 {
         return mask;
@@ -388,6 +438,9 @@ pub fn rasterize(title: &Title, width: u32, height: u32) -> Mask {
     for line in lines {
         let line_w: f32 = line.chars().map(|ch| face_for(ch).metrics(ch, px).advance_width).sum();
         let mut pen = (width as f32 - line_w) * 0.5;
+        if !line.trim().is_empty() {
+            mask.lines.push([pen, baseline - metrics.ascent, pen + line_w, baseline - metrics.descent]);
+        }
         for ch in line.chars() {
             let (m, bitmap) = face_for(ch).rasterize(ch, px);
             if m.width > 0 && m.height > 0 {
@@ -417,7 +470,10 @@ pub fn render(title: &Title, width: u32, height: u32) -> Rgba {
     // export's chroma, one sample per 2x2 pixels, both average across them.
     // Giving them the colour of the outermost layer keeps that edge its own
     // colour rather than fringing it towards black.
-    let bleed = if title.shadow.enabled {
+    let bleed = if title.background.enabled {
+        let [r, g, b, _] = title.background.color;
+        [r, g, b]
+    } else if title.shadow.enabled {
         [0.0; 3]
     } else if title.outline.enabled {
         let [r, g, b, _] = title.outline.color;
@@ -444,10 +500,28 @@ pub fn render(title: &Title, width: u32, height: u32) -> Rgba {
     let reach = outline_px.ceil() as i32
         + shadow.map_or(0, |(d, soft, _)| d.abs() + (soft * 3.0).ceil() as i32)
         + 2;
-    let bx0 = (x0 as i32 - reach).max(0) as usize;
-    let by0 = (y0 as i32 - reach).max(0) as usize;
-    let bx1 = (x1 as i32 + reach).min(width as i32 - 1) as usize;
-    let by1 = (y1 as i32 + reach).min(height as i32 - 1) as usize;
+    // Each line's box, grown by the padding; the area worked on reaches to
+    // take them in.
+    let boxes: Vec<[f32; 4]> = if title.background.enabled {
+        let pad = title.background.padding * h;
+        mask.lines.iter().map(|l| [l[0] - pad, l[1] - pad, l[2] + pad, l[3] + pad]).collect()
+    } else {
+        Vec::new()
+    };
+    let mut area = [x0 as i32 - reach, y0 as i32 - reach, x1 as i32 + reach, y1 as i32 + reach];
+    for b in &boxes {
+        area = [
+            area[0].min(b[0].floor() as i32),
+            area[1].min(b[1].floor() as i32),
+            area[2].max(b[2].ceil() as i32),
+            area[3].max(b[3].ceil() as i32),
+        ];
+    }
+    let bx0 = area[0].max(0) as usize;
+    let by0 = area[1].max(0) as usize;
+    let bx1 = area[2].min(width as i32 - 1) as usize;
+    let by1 = area[3].min(height as i32 - 1) as usize;
+    let radius = title.background.radius * h;
     let (bw, bh) = (bx1 - bx0 + 1, by1 - by0 + 1);
 
     let mut fill = Plane::new(bw, bh);
@@ -470,10 +544,18 @@ pub fn render(title: &Title, width: u32, height: u32) -> Rgba {
     for y in 0..bh {
         for x in 0..bw {
             let i = y * bw + x;
-            // Bottom to top: shadow, outline, letters — each laid over what
-            // is below it.
+            // Bottom to top: background, shadow, outline, letters — each laid
+            // over what is below it.
             let mut px = [0.0f32; 4];
             let o = ((by0 + y) * width as usize + bx0 + x) * 4;
+            if !boxes.is_empty() {
+                let (cx, cy) = ((bx0 + x) as f32 + 0.5, (by0 + y) as f32 + 0.5);
+                // The most any box covers: joined where they meet, rather
+                // than doubled up into a darker seam.
+                let cover = boxes.iter().map(|b| rounded_cover(*b, radius, cx, cy)).fold(0.0, f32::max);
+                let [r, g, b, a] = title.background.color;
+                px = over(px, [r, g, b, a * title.background.opacity * cover]);
+            }
             if let Some((soft, d, opacity)) = &cast {
                 let a = sample(soft, bw, bh, x as i32 - d, y as i32 - d) * opacity;
                 px = over(px, [0.0, 0.0, 0.0, a]);
@@ -493,6 +575,18 @@ pub fn render(title: &Title, width: u32, height: u32) -> Rgba {
         }
     }
     out
+}
+
+/// How much of the pixel centred at `(x, y)` the box `[left, top, right,
+/// bottom]` with corners of radius `r` covers, antialiased over one pixel.
+fn rounded_cover(b: [f32; 4], r: f32, x: f32, y: f32) -> f32 {
+    let (hx, hy) = ((b[2] - b[0]) * 0.5, (b[3] - b[1]) * 0.5);
+    let r = r.min(hx).min(hy).max(0.0);
+    let qx = (x - (b[0] + b[2]) * 0.5).abs() - (hx - r);
+    let qy = (y - (b[1] + b[3]) * 0.5).abs() - (hy - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let distance = outside + qx.max(qy).min(0.0) - r;
+    (0.5 - distance).clamp(0.0, 1.0)
 }
 
 /// The smallest box holding every inked pixel, as inclusive `[x0, y0, x1, y1]`.
@@ -732,6 +826,47 @@ mod tests {
             .filter(|&x| (1..255).contains(&alpha(&img, x, 90)))
             .count();
         assert!(partial >= 4, "only {partial} soft pixels at the edge");
+    }
+
+    #[test]
+    fn a_background_boxes_each_line_to_its_own_width() {
+        let title = Title {
+            text: "I\nIIIIIIII".into(),
+            size: 0.1,
+            color: [1.0, 1.0, 1.0, 1.0],
+            background: Background { enabled: true, opacity: 1.0, padding: 0.02, radius: 0.0, ..Background::default() },
+            ..Title::default()
+        };
+        let mask = rasterize(&title, 640, 360);
+        let [short, long] = [mask.lines[0], mask.lines[1]];
+        assert!(long[2] - long[0] > (short[2] - short[0]) * 4.0);
+        let img = render(&title, 640, 360);
+        let mid = |l: [f32; 4]| ((l[1] + l[3]) * 0.5) as u32;
+        // Past the short line's box, on its row: clear. The same distance
+        // out on the long line's row is inside that line's box.
+        let x = (short[2] + 0.02 * 360.0 + 4.0) as u32;
+        assert_eq!(alpha(&img, x, mid(short) - 4), 0);
+        assert_eq!(alpha(&img, x, mid(long)), 255);
+        assert_eq!(rgb(&img, x, mid(long)), [0, 0, 0]);
+        // The letters stay on top, in their own colour.
+        let inked = (0..640).find(|&x| at(&mask, x, mid(long)) == 255).expect("ink on the long line");
+        assert_eq!(rgb(&img, inked, mid(long)), [255, 255, 255]);
+        assert_eq!(alpha(&img, 0, 0), 0, "nothing outside the boxes");
+    }
+
+    #[test]
+    fn a_background_rounds_its_corners() {
+        let b = [10.0, 10.0, 50.0, 30.0];
+        assert_eq!(rounded_cover(b, 0.0, 10.5, 10.5), 1.0);
+        assert_eq!(rounded_cover(b, 8.0, 10.5, 10.5), 0.0);
+        assert_eq!(rounded_cover(b, 8.0, 30.5, 20.5), 1.0);
+        assert_eq!(rounded_cover(b, 8.0, 55.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn a_blank_line_has_no_box() {
+        let mask = rasterize(&Title { text: "A\n\nB".into(), ..Title::default() }, 320, 180);
+        assert_eq!(mask.lines.len(), 2);
     }
 
     #[test]

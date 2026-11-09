@@ -266,6 +266,8 @@ pub(crate) const MENU_BORDER: [f32; 4] = [0.34, 0.34, 0.40, 1.0];
 pub(crate) const MENU_PAD: f32 = 10.0;
 pub(crate) const MENU_ROW_H: f32 = 22.0;
 pub(crate) const MENU_ROW_GAP: f32 = 1.0;
+/// From a menu row's left edge to its label.
+pub(crate) const MENU_ROW_PAD_X: f32 = 8.0;
 pub(crate) const MENU_SECTION_GAP: f32 = 12.0;
 pub(crate) const MENU_HEADER_SIZE: f32 = TYPE_SM;
 pub(crate) const MENU_HEADER_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
@@ -506,6 +508,8 @@ pub(crate) const TITLE_SWATCH_COLUMNS: usize = 8;
 /// picker.
 pub(crate) const TITLE_CHIP_W: f32 = 36.0;
 pub(crate) const TITLE_CHIP_H: f32 = 18.0;
+/// Between the style box and the button beside it that saves a new style.
+pub(crate) const TITLE_STYLE_SAVE_GAP: f32 = 4.0;
 
 // The colour picker.
 pub(crate) const PICKER_SV_H: f32 = 132.0;

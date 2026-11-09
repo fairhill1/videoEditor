@@ -215,6 +215,11 @@ pub(crate) struct State {
     pub(crate) color_picker: Option<crate::picker::ColorPicker>,
     /// The colours picked lately, most recent first. Kept between sessions.
     pub(crate) recent_colors: Vec<[f32; 4]>,
+    /// The saved title styles, in the order they were saved. Kept between
+    /// sessions, and across projects.
+    pub(crate) title_styles: Vec<crate::styles::Style>,
+    /// A style just saved whose name is being typed.
+    pub(crate) naming_style: Option<crate::styles::Naming>,
     /// A pixel the eyedropper asked for, in physical pixels: read off the
     /// next frame drawn.
     pub(crate) eyedropper_pick: Option<[u32; 2]>,
@@ -390,6 +395,8 @@ impl State {
             font_menu: None,
             color_picker: None,
             recent_colors: crate::color::load_recent(),
+            title_styles: crate::styles::load(),
+            naming_style: None,
             eyedropper_pick: None,
             picker_tex: None,
             surface_copy_src: cap.usages.contains(wgpu::TextureUsages::COPY_SRC),

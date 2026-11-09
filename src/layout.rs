@@ -535,6 +535,10 @@ pub(crate) struct StackRow {
 /// control when the clip it is showing is a title.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum TitleControl {
+    /// The saved style the title is in, in a box that opens the list of
+    /// them, with the button that saves the title's own as a new one beside
+    /// it.
+    Style,
     /// The words, in a box that starts typing when pressed.
     Text,
     /// The face, in a box that opens the list of installed fonts.
@@ -671,6 +675,8 @@ pub(crate) enum EffectsHit {
     Remove { index: usize },
     Param { index: usize, param: usize, slider: Rect },
     TitleText,
+    TitleStyle,
+    TitleSaveStyle,
     TitleFont,
     TitleWeight,
     TitleNumber { field: TitleNumber, slider: Rect },
@@ -886,8 +892,9 @@ pub(crate) fn effects_panel(
     if let Some(lines) = title_lines {
         use TitleControl as C;
         let text_h = text_box_h(lines);
-        let groups: [&[TitleControl]; 3] = [
+        let groups: [&[TitleControl]; 4] = [
             &[
+                C::Style,
                 C::Text,
                 C::Font,
                 C::Weight,
@@ -905,6 +912,13 @@ pub(crate) fn effects_panel(
                 C::Number(TitleNumber::ShadowDistance),
                 C::Number(TitleNumber::ShadowSoftness),
                 C::Number(TitleNumber::ShadowOpacity),
+            ],
+            &[
+                C::Toggle(TitlePart::Background),
+                C::Color(TitleColor::Background),
+                C::Number(TitleNumber::BackgroundOpacity),
+                C::Number(TitleNumber::BackgroundPadding),
+                C::Number(TitleNumber::BackgroundRadius),
             ],
         ];
         for group in groups {
@@ -926,6 +940,9 @@ pub(crate) fn effects_panel(
                 };
                 let field = match control {
                     C::Text | C::Font | C::Weight => boxed,
+                    // Short of the save button, which sits square at the
+                    // row's end.
+                    C::Style => Rect { w: (boxed.w - TITLE_FIELD_H - TITLE_STYLE_SAVE_GAP).max(1.0), ..boxed },
                     C::Number(_) => slider_in(row),
                     C::Color(_) => Rect { y: row.y, h: row.h, ..boxed },
                     C::Toggle(_) => toggle_in(row),
@@ -1043,6 +1060,10 @@ impl EffectsPanel {
         for r in &self.title {
             match r.control {
                 TitleControl::Text if r.field.contains(p) => return Some(EffectsHit::TitleText),
+                TitleControl::Style if r.field.contains(p) => return Some(EffectsHit::TitleStyle),
+                TitleControl::Style if style_save_rect(r.field).contains(p) => {
+                    return Some(EffectsHit::TitleSaveStyle);
+                }
                 TitleControl::Font if r.field.contains(p) => return Some(EffectsHit::TitleFont),
                 TitleControl::Weight if r.field.contains(p) => return Some(EffectsHit::TitleWeight),
                 // The whole row past the label, as for an effect's slider.
@@ -1102,6 +1123,7 @@ impl EffectsPanel {
     /// The box a title's list drops from: the font box or the weight box.
     pub(crate) fn menu_field(&self, menu: TitleMenu) -> Option<Rect> {
         let control = match menu {
+            TitleMenu::Style => TitleControl::Style,
             TitleMenu::Font => TitleControl::Font,
             TitleMenu::Weight => TitleControl::Weight,
         };
@@ -1112,8 +1134,27 @@ impl EffectsPanel {
 /// Which of a title's lists is open.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TitleMenu {
+    Style,
     Font,
     Weight,
+}
+
+/// The button beside the style box that saves the title's style as a new
+/// one: square, at the end of the row.
+pub(crate) fn style_save_rect(field: Rect) -> Rect {
+    Rect { x: field.x + field.w + TITLE_STYLE_SAVE_GAP, y: field.y, w: TITLE_FIELD_H, h: TITLE_FIELD_H }
+}
+
+/// The button at the end of a row in the list of saved styles that deletes
+/// that style.
+pub(crate) fn style_remove_rect(row: Rect) -> Rect {
+    let side = EFFECT_SMALL_BTN.min(row.h);
+    Rect {
+        x: row.x + row.w - side - (row.h - side) * 0.5,
+        y: (row.y + (row.h - side) * 0.5).round(),
+        w: side,
+        h: side,
+    }
 }
 
 /// The list of fonts dropped from the font box `anchor`: where it sits, and
@@ -1722,6 +1763,7 @@ impl State {
         }
         let anchor = self.effects_panel().menu_field(kind)?;
         let n = match kind {
+            TitleMenu::Style => self.title_styles.len(),
             TitleMenu::Font => fonts::choice_count(),
             TitleMenu::Weight => self.shown_weights().len(),
         };
@@ -2066,8 +2108,8 @@ mod tests {
         stack.push(EffectKind::GaussianBlur.instance());
         let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(1), Some(&stack), 0.0);
         let controls: Vec<TitleControl> = panel.title.iter().map(|r| r.control).collect();
-        assert_eq!(controls.len(), 13);
-        assert_eq!(controls[0], TitleControl::Text);
+        assert_eq!(controls.len(), 19);
+        assert_eq!(controls[0], TitleControl::Style);
         assert!(panel.title[0].row.y >= panel.clip_heading_y + EFFECTS_SECTION_H);
         let last = panel.title.last().unwrap().row;
         assert!(panel.stack[0].row.y >= last.y + last.h);
@@ -2078,6 +2120,11 @@ mod tests {
         let at = |c: TitleControl| panel.title.iter().find(|r| r.control == c).unwrap();
         let f = at(TitleControl::Text).field;
         assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleText));
+        let f = at(TitleControl::Style).field;
+        assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleStyle));
+        let save = style_save_rect(f);
+        assert!(save.x + save.w <= at(TitleControl::Font).field.x + at(TitleControl::Font).field.w + 0.5);
+        assert_eq!(panel.hit([save.x + 2.0, save.y + 2.0]), Some(EffectsHit::TitleSaveStyle));
         let f = at(TitleControl::Font).field;
         assert_eq!(panel.hit([f.x + 2.0, f.y + 2.0]), Some(EffectsHit::TitleFont));
         let f = at(TitleControl::Weight).field;

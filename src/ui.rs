@@ -1,7 +1,7 @@
 use crate::quad::{Quad, QuadRenderer};
 use crate::text::TextRenderer;
 use crate::theme::{
-    SCROLLBAR_THUMB_COLOR, SCROLLBAR_TRACK_COLOR, ZOOM_SLIDER_GROOVE_H, ZOOM_SLIDER_KNOB_H,
+    MENU_ROW_PAD_X, SCROLLBAR_THUMB_COLOR, SCROLLBAR_TRACK_COLOR, ZOOM_SLIDER_GROOVE_H, ZOOM_SLIDER_KNOB_H,
     ZOOM_SLIDER_KNOB_W,
 };
 
@@ -125,7 +125,6 @@ pub fn draw_button(
 const MENU_ROW_HOVER: [f32; 4] = BTN_BG_HOVER;
 const MENU_ROW_LABEL: [f32; 4] = [0.86, 0.86, 0.90, 1.0];
 const MENU_ROW_LABEL_SELECTED: [f32; 4] = BTN_LABEL;
-const MENU_ROW_PAD_X: f32 = 8.0;
 
 /// One row of a settings popup: a label, an optional hover fill, and the same
 /// orange indicator strip the toggle buttons use.

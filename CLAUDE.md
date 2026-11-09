@@ -10,7 +10,9 @@ mutations and undo), `session` (project files), `compound` (compound clips:
 combining, opening and closing them), `freeze` (freeze frames: the frame
 grab, its PNG beside the project, and the gap it fills), `picker` (the colour picker: its
 state, the eyedropper and its gradients; `color.rs` holds the colour maths
-and the recent colours), `canvas` (project format and
+and the recent colours), `styles` (saved title styles: a title's look under a
+name, applied from the style box on the effects tab),
+`canvas` (project format and
 its popup), and `render` / `toolbar` / `timeline_view` / `effects_view`
 (drawing).
 
@@ -20,8 +22,8 @@ preview, `export/blur.rs` on the CPU for the file. A change to how a blur is
 computed lands in all three, and `blur::tests` checks the shader against the
 CPU path.
 
-A title is drawn once into a straight-RGBA picture by `title::render` (fill,
-outline, shadow; faces from `fonts.rs`). The preview uploads that picture and
+A title is drawn once into a straight-RGBA picture by `title::render` (a box
+behind each line, then shadow, outline, fill; faces from `fonts.rs`). The preview uploads that picture and
 the export takes it as a still, so both show the same title. New behaviour
 joins the module that matches its concern rather than going back into
 `main.rs`.
@@ -52,6 +54,10 @@ future UI zoom folds in at that one place rather than at every call site.
 
 `theme.rs` holds every colour and metric. Drawing modules glob-import it, so a
 new value goes there rather than at its call site.
+
+What outlives a project — the recent colours, the saved title styles — is
+kept in the user's config directory through `config.rs`
+(`~/.config/videoEditor/`), not in the project file.
 
 ## Editing a project file from outside
 

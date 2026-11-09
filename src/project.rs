@@ -186,7 +186,7 @@ pub fn read(path: &Path) -> Result<Project, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::title::{Outline, Shadow};
+    use crate::title::{Background, Outline, Shadow};
     use crate::timeline::Transform;
 
     fn sample() -> Project {
@@ -226,6 +226,13 @@ mod tests {
                         weight: 700,
                         outline: Outline { enabled: true, width: 0.01, color: [0.0, 0.0, 1.0, 1.0] },
                         shadow: Shadow { enabled: true, distance: 0.02, softness: 0.0, opacity: 0.5 },
+                        background: Background {
+                            enabled: true,
+                            color: [0.1, 0.1, 0.1, 1.0],
+                            opacity: 0.6,
+                            padding: 0.02,
+                            radius: 0.01,
+                        },
                         line_spacing: 1.4,
                     }),
                     compound: None,

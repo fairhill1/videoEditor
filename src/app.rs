@@ -176,6 +176,33 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                // So does naming a style just saved. Enter and Escape both
+                // keep the name: the style is saved already, and a name is
+                // all there is left to take back.
+                if state.typing_style_name() {
+                    match code {
+                        KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter => {
+                            state.finish_style_name()
+                        }
+                        KeyCode::KeyA if ctrl => state.select_all_in_style_name(),
+                        KeyCode::KeyC if ctrl => state.copy_from_style_name(false),
+                        KeyCode::KeyX if ctrl => state.copy_from_style_name(true),
+                        KeyCode::KeyV if ctrl => state.paste_into_style_name(),
+                        KeyCode::Backspace => state.backspace_style_name(),
+                        KeyCode::Delete => state.delete_in_style_name(),
+                        KeyCode::ArrowLeft => state.move_style_name_caret(caret::left, shift),
+                        KeyCode::ArrowRight => state.move_style_name_caret(caret::right, shift),
+                        KeyCode::Home | KeyCode::ArrowUp => state.move_style_name_caret(caret::home, shift),
+                        KeyCode::End | KeyCode::ArrowDown => state.move_style_name_caret(caret::end, shift),
+                        _ if ctrl => {}
+                        _ => {
+                            if let Some(text) = text.as_deref() {
+                                state.type_style_name(text);
+                            }
+                        }
+                    }
+                    return;
+                }
                 // Typing into a title takes the whole keyboard. Every bare
                 // letter below is a verb that edits, and they cannot both have
                 // the key — so while a title has the caret, nothing else does.
