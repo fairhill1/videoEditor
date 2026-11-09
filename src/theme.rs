@@ -160,6 +160,8 @@ pub(crate) const SNAP_PX: f32 = 8.0;
 /// current zoom is still something you can see following the cursor.
 pub(crate) const GHOST_MIN_W: f32 = 40.0;
 pub(crate) const AUDIO_WAVE_COLOR: [f32; 4] = [0.75, 0.95, 0.80, 0.95];
+/// A waveform column the clip's gain lifts past full scale.
+pub(crate) const AUDIO_WAVE_OVER_COLOR: [f32; 4] = [0.98, 0.45, 0.38, 0.95];
 pub(crate) const CLIP_LABEL_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
 /// Plate laid under a label that sits over a clip's contents.
 ///

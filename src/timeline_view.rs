@@ -526,8 +526,12 @@ impl State {
 
             // Waveform bars for audio clips. One 1px-wide vertical rect per
             // pixel column, height proportional to the max peak in that
-            // column's source-time window. Label is drawn after so it sits
-            // on top of the waveform.
+            // column's source-time window after the clip's gain, so the
+            // drawing is what plays rather than what the file holds. A column
+            // the gain pushes past full scale is pinned to the lane and
+            // coloured, since a cap alone would hide the boost entirely on
+            // loud material. Label is drawn after so it sits on top of the
+            // waveform.
             if track.kind == TrackKind::Audio && cw > 1.0 {
                 if let Some(src) = self.media.get(clip.source) {
                     if let Some(wf) = src.waveform.as_ref() {
@@ -558,12 +562,18 @@ impl State {
                                         peak = p;
                                     }
                                 }
-                                let half_h = (peak * max_half_h).max(0.5);
+                                let level = peak * clip.gain;
+                                let (level, color) = if level > 1.0 {
+                                    (1.0, AUDIO_WAVE_OVER_COLOR)
+                                } else {
+                                    (level, AUDIO_WAVE_COLOR)
+                                };
+                                let half_h = (level * max_half_h).max(0.5);
                                 let px = x + col as f32;
                                 self.quads.push(Quad::colored(
                                     [px, mid_y - half_h],
                                     [1.0, half_h * 2.0],
-                                    AUDIO_WAVE_COLOR,
+                                    color,
                                 ));
                             }
                         }
