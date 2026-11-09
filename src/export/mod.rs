@@ -37,6 +37,28 @@ use take::{StillTake, VideoTake};
 /// platform's own encode then makes worse; crf 16 holds up, and `slow` buys
 /// back some of the size for export time nobody is waiting on.
 const X264_OPTS: [(&str, &str); 2] = [("preset", "slow"), ("crf", "16")];
+/// Frame rates a render snaps to when it is within [`RATE_SNAP`] of one. A
+/// source's average rate comes out as 59.94005994 or 59.98, and carried
+/// through as a rational over 1000 that became 2997/50: the MP4 muxer then
+/// picked a video timescale of 11988 and a movie timescale of 47,952,000
+/// (their least common multiple with the audio's 48000), where every camera and
+/// editor writes 60000/1001 and a timescale of 60000.
+const STANDARD_RATES: [(i32, i32); 11] = [
+    (24000, 1001),
+    (24, 1),
+    (25, 1),
+    (30000, 1001),
+    (30, 1),
+    (48, 1),
+    (50, 1),
+    (60000, 1001),
+    (60, 1),
+    (120000, 1001),
+    (120, 1),
+];
+/// Relative distance within which a rate is taken to be the standard one.
+/// 59.94 and 60 are 0.1% apart, so this picks the nearer of the two.
+const RATE_SNAP: f64 = 0.001;
 /// Above what a recording usually carries, so the re-encode adds little loss
 /// of its own.
 const AUDIO_BIT_RATE: usize = 256_000;
@@ -187,7 +209,12 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
     if duration <= 0.0 || (!has_video && !has_audio) {
         return Err("nothing on the timeline to export".into());
     }
-    let spec = req.video.filter(|_| has_video);
+    // Snapped once, here, so the frame clock below and the encoder's time
+    // base agree on exactly the same rate.
+    let spec = req.video.filter(|_| has_video).map(|s| VideoSpec {
+        fps: rate_to_f64(exact_rate(s.fps)),
+        ..s
+    });
 
     let fps = spec.map_or(0.0, |s| s.fps);
     let total_frames = spec.map_or(0, |_| (duration * fps).ceil() as u64);
@@ -277,7 +304,12 @@ fn run(req: &ExportRequest, shared: &Mutex<Shared>, cancel: &AtomicBool) -> Resu
         None
     };
 
-    octx.write_header()
+    // The index goes at the front. An upload page reads a file from the
+    // start, and with the index at the end it has to hold everything before it
+    // in memory just to learn what the streams are.
+    let mut mux_opts = Dictionary::new();
+    mux_opts.set("movflags", "+faststart");
+    octx.write_header_with(mux_opts)
         .map_err(|e| format!("could not write the file header: {e}"))?;
 
     // The muxer is free to rewrite stream time bases while writing the header,
@@ -388,11 +420,13 @@ fn open_video_encoder(
         .video()?;
     // Carrying the frame rate as a rational keeps 29.97 and friends exact;
     // going through a single f64 would drift over a long render.
-    let rate = Rational((spec.fps * 1000.0).round() as i32, 1000).reduce();
+    let rate = exact_rate(spec.fps);
     let time_base = rate.invert();
     enc.set_width(spec.width);
     enc.set_height(spec.height);
     enc.set_format(format::Pixel::YUV420P);
+    // Square pixels, said outright rather than left for a player to assume.
+    enc.set_aspect_ratio(Rational(1, 1));
     enc.set_color_range(ffmpeg::color::Range::MPEG);
     // Untagged, every player and upload pipeline guesses the colour space,
     // and the guesses differ — the usual cause of a file looking washed out on
@@ -403,14 +437,38 @@ fn open_video_encoder(
     enc.set_time_base(time_base);
     enc.set_frame_rate(Some(rate));
     enc.set_gop((spec.fps * GOP_SECONDS).round().max(1.0) as u32);
+    // Closed GOPs: nothing after a keyframe refers back past it. FFmpeg's
+    // x264 wrapper turns open GOPs on unless told otherwise, and an open GOP
+    // leaves keyframes that the MP4 marks as sync points yet that cannot be
+    // decoded from on their own. TikTok Studio, which starts decoding at those
+    // points, ran out of memory on every such export; the same picture encoded
+    // with closed GOPs went through.
+    let mut flags = codec::Flags::CLOSED_GOP;
     if global_header {
-        enc.set_flags(codec::Flags::GLOBAL_HEADER);
+        flags |= codec::Flags::GLOBAL_HEADER;
     }
+    enc.set_flags(flags);
     let mut opts = Dictionary::new();
     for (key, value) in X264_OPTS {
         opts.set(key, value);
     }
     Ok((enc.open_with(opts)?, time_base))
+}
+
+/// `fps` as a rational: the standard rate it is within [`RATE_SNAP`] of, or
+/// failing that the rate itself over 1000.
+fn exact_rate(fps: f64) -> Rational {
+    STANDARD_RATES
+        .iter()
+        .map(|&(n, d)| (Rational(n, d), (fps - n as f64 / d as f64).abs()))
+        .filter(|&(_, off)| off <= fps * RATE_SNAP)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(r, _)| r)
+        .unwrap_or_else(|| Rational((fps * 1000.0).round() as i32, 1000).reduce())
+}
+
+fn rate_to_f64(r: Rational) -> f64 {
+    r.numerator() as f64 / r.denominator() as f64
 }
 
 fn open_audio_encoder(global_header: bool) -> Result<encoder::Audio, ffmpeg::Error> {
@@ -543,6 +601,20 @@ mod tests {
     use ffmpeg::frame;
 
     use crate::timeline::{SourceId, Transform};
+
+    #[test]
+    fn rates_snap_to_the_standard_rational() {
+        // What a 59.94 source reports as its average, and what it used to
+        // become.
+        assert_eq!(exact_rate(60000.0 / 1001.0), Rational(60000, 1001));
+        assert_eq!(exact_rate(59.94), Rational(60000, 1001));
+        assert_eq!(exact_rate(59.98), Rational(60, 1));
+        assert_eq!(exact_rate(29.97), Rational(30000, 1001));
+        assert_eq!(exact_rate(25.0), Rational(25, 1));
+        // Nothing standard nearby: kept as it is.
+        assert_eq!(exact_rate(15.0), Rational(15, 1));
+        assert_eq!(exact_rate(12.5), Rational(25, 2));
+    }
 
     /// End-to-end render, which is the only way to catch a mistake in the
     /// muxing or timestamp handling — every placement in `raster` can be
