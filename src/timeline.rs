@@ -11,7 +11,7 @@ use crate::effects::EffectStack;
 const EDIT_POINT_EPS: f64 = 1e-6;
 
 /// A video clip's opacity range. The top is fully opaque; there is nothing
-/// above it, unlike audio's +6dB of headroom — a picture cannot be more than
+/// above it, unlike audio's +12dB of headroom — a picture cannot be more than
 /// itself.
 pub const MIN_OPACITY: f32 = 0.0;
 pub const MAX_OPACITY: f32 = 1.0;
@@ -30,10 +30,11 @@ pub const MAX_SCALE: f32 = 20.0;
 
 /// The level line's range, in decibels. The bottom is a floor rather than true
 /// silence: it keeps the dB mapping finite, and a clip you want actually silent
-/// is one you fade out or delete. The top is the usual +6 of headroom — enough
-/// to lift a quiet take, not enough to invite clipping the mix.
+/// is one you fade out or delete. The top is +12 of headroom, Final Cut's ceiling:
+/// enough to rescue a quiet take, and the waveform turns red where a boost
+/// takes it past full scale.
 pub const MIN_GAIN_DB: f32 = -40.0;
-pub const MAX_GAIN_DB: f32 = 6.0;
+pub const MAX_GAIN_DB: f32 = 12.0;
 
 pub fn db_to_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)

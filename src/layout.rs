@@ -252,7 +252,7 @@ fn level_band(lane_y: f32, lane_h: f32) -> (f32, f32) {
 ///
 /// Linear in decibels rather than in the stored linear gain, which is what puts
 /// unity near the top of the lane: the range runs from `MIN_GAIN_DB` to
-/// `MAX_GAIN_DB`, and only 6 of those 46 dB are above unity. That matches what
+/// `MAX_GAIN_DB`, and only 12 of those 52 dB are above unity. That matches what
 /// the control is for — attenuating is the common move, and it gets the room.
 pub(crate) fn gain_to_y(lane_y: f32, lane_h: f32, gain: f32) -> f32 {
     let (top, h) = level_band(lane_y, lane_h);
