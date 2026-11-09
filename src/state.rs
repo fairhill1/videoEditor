@@ -671,9 +671,17 @@ impl State {
             self.set_status("Nothing to export".into(), STATUS_ERR);
             return;
         }
+        // Named after the project, so exports of different projects don't
+        // land on top of one another; an unsaved one has no name to give.
+        let file_name = self
+            .project_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .map(|stem| format!("{}.mp4", stem.to_string_lossy()))
+            .unwrap_or_else(|| "export.mp4".into());
         let Some(output) = rfd::FileDialog::new()
             .add_filter("MP4 video", &["mp4"])
-            .set_file_name("export.mp4")
+            .set_file_name(file_name)
             .save_file()
         else {
             return;
