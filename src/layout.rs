@@ -68,16 +68,21 @@ const PAN_STEP_FRAC: f64 = 0.12;
 /// the page happened on is still visible next to what follows it.
 const VIEW_FOLLOW_LEAD: f64 = 0.1;
 
-/// How far past the end of the last clip a view reaches, as a fraction of the
-/// visible span: the empty stretch a fitted view leaves on its right, and as
-/// far as any view scrolls. It is the room the last clip's end is dragged
-/// into to make the clip longer, which an end sitting on the panel's edge
-/// does not have.
-pub(crate) const VIEW_TAIL_FRAC: f64 = 0.15;
+/// The empty stretch a fitted view leaves after the last clip, as a fraction
+/// of the visible span. Only enough to keep the clip's end, and the handle
+/// on it, clear of the panel's edge: the fit is for seeing the edit, and a
+/// wide margin read as the edit not filling the view.
+pub(crate) const VIEW_FIT_MARGIN_FRAC: f64 = 0.03;
 
-/// The span that shows all of `content`, with the tail after it.
+/// How far past the end of the last clip a view scrolls, as a fraction of the
+/// visible span. More than the fit leaves: it is the room the last clip's end
+/// is dragged into to make the clip longer, there to be scrolled to when it
+/// is wanted rather than on show all the time.
+pub(crate) const VIEW_TAIL_FRAC: f64 = 0.25;
+
+/// The span that shows all of `content`, with a sliver of margin after it.
 pub(crate) fn fit_span(content: f64) -> f64 {
-    content.max(MIN_CONTENT_SPAN) / (1.0 - VIEW_TAIL_FRAC)
+    content.max(MIN_CONTENT_SPAN) / (1.0 - VIEW_FIT_MARGIN_FRAC)
 }
 
 /// The latest a view `dur` long scrolls to: the end of `content` the tail's
@@ -1426,7 +1431,7 @@ impl State {
         self.zoom_at_playhead((dur / want).ln() / ZOOM_STEP.ln());
     }
 
-    /// Show the whole edit, with the tail after it. Done once, when asked:
+    /// Show the whole edit, with a sliver of margin after it. Done once, when asked:
     /// the zoom it leaves is a zoom like any other, and stays as it is while
     /// clips are added, trimmed and deleted, until it is asked for again.
     pub(crate) fn zoom_timeline_to_fit(&mut self) {
@@ -2065,13 +2070,16 @@ mod tests {
         assert_eq!(resolve_view(-5.0, 10.0, 60.0), (0.0, 10.0));
     }
 
-    /// A fitted view ends past the last clip, and that is as far as any view
-    /// scrolls: the end of the content the tail's width in from the edge.
+    /// A fitted view ends just past the last clip, and any view scrolls
+    /// further than that: until the end of the content is the tail's width
+    /// in from the edge.
     #[test]
-    fn the_fit_leaves_a_tail_and_a_scroll_stops_at_it() {
+    fn the_fit_leaves_a_margin_and_a_scroll_reaches_past_it() {
         let fit = fit_span(60.0);
-        assert!((60.0 / fit - (1.0 - VIEW_TAIL_FRAC)).abs() < 1e-12);
-        assert_eq!(max_view_start(fit, 60.0), 0.0);
+        assert!((60.0 / fit - (1.0 - VIEW_FIT_MARGIN_FRAC)).abs() < 1e-12);
+        // Room to scroll right even from the fit, which is where the last
+        // clip's end goes to be made longer.
+        assert!(max_view_start(fit, 60.0) > 0.0);
         let far = max_view_start(10.0, 60.0);
         assert!((far + 10.0 * (1.0 - VIEW_TAIL_FRAC) - 60.0).abs() < 1e-12);
     }
