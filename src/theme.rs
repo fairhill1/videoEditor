@@ -46,12 +46,15 @@ pub(crate) const ICON_COMBINE: char = '\u{E464}'; // group
 pub(crate) const ICON_EDIT: char = '\u{E1F9}'; // pencil
 pub(crate) const ICON_BACK: char = '\u{E048}'; // arrow-left
 pub(crate) const ICON_SELECT_ALL: char = '\u{E1CB}'; // square-dashed
+pub(crate) const ICON_DESELECT: char = '\u{E175}'; // square-x
 pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
 pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
 pub(crate) const ICON_FREEZE: char = '\u{E165}'; // snowflake
 pub(crate) const ICON_RESET: char = '\u{E148}'; // rotate-ccw
 pub(crate) const ICON_RIPPLE: char = '\u{E458}'; // arrow-right-from-line
 pub(crate) const ICON_CHEVRON_UP: char = '\u{E070}'; // chevron-up
+pub(crate) const ICON_LINK: char = '\u{E102}'; // link
+pub(crate) const ICON_UNLINK: char = '\u{E19C}'; // unlink
 
 // Starting layout split ratios. Both are draggable at runtime and live on
 // `State` from then on; these are only where a fresh session begins.
@@ -183,6 +186,12 @@ pub(crate) const LABEL_COLOR: [f32; 4] = [0.72, 0.72, 0.78, 1.0];
 // Was dim enough that V1/A1 were a squint to read; a track's identity should be
 // legible at a glance, not decorative.
 pub(crate) const TRACK_LABEL_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
+// A header under the pointer: it takes a click, which pins the track as where
+// pastes go.
+pub(crate) const TRACK_LABEL_HOVER_COLOR: [f32; 4] = [0.82, 0.82, 0.88, 1.0];
+// The pinned track: its label, and a bar down the header's outer edge.
+pub(crate) const TRACK_PIN_COLOR: [f32; 4] = CLIP_SELECTED_BORDER;
+pub(crate) const TRACK_PIN_MARK_W: f32 = 3.0;
 // The type scale. Every font size below is one of these steps, so a new piece
 // of chrome picks a step rather than inventing a value a half point off one
 // that already exists.
@@ -534,6 +543,13 @@ pub(crate) const TITLE_SWATCH_RING_PX: f32 = 2.0;
 pub(crate) const FONT_MENU_ROWS: usize = 14;
 pub(crate) const FONT_MENU_MIN_W: f32 = 220.0;
 
+// The box dragged out from bare lane to select the clips it touches. A press
+// has to travel this far before it is a drag rather than a click.
+pub(crate) const MARQUEE_START_PX: f32 = 4.0;
+pub(crate) const MARQUEE_FILL_COLOR: [f32; 4] = [1.0, 0.72, 0.30, 0.10];
+pub(crate) const MARQUEE_BORDER_COLOR: [f32; 4] = [1.0, 0.72, 0.30, 0.85];
+pub(crate) const MARQUEE_BORDER_PX: f32 = 1.0;
+
 // The fx badge on a clip that has effects: the way from a clip on the timeline
 // to the panel that edits them.
 pub(crate) const FX_BADGE_W: f32 = 20.0;
@@ -548,6 +564,18 @@ pub(crate) const FX_BADGE_BG: [f32; 4] = [0.95, 0.55, 0.15, 1.0];
 /// Every effect on the clip switched off: still there, doing nothing.
 pub(crate) const FX_BADGE_OFF_BG: [f32; 4] = [0.36, 0.36, 0.42, 1.0];
 pub(crate) const FX_BADGE_TEXT: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
+
+// The chain badge on a clip with another half, a picture and its sound: it
+// says whether the two are linked, and a click on it changes that. It shares
+// the fx badge's row, after it when a clip has both.
+pub(crate) const LINK_BADGE_W: f32 = 18.0;
+pub(crate) const LINK_BADGE_GAP: f32 = 3.0;
+pub(crate) const LINK_BADGE_ICON_SIZE: f32 = TYPE_SM;
+pub(crate) const LINK_BADGE_BG: [f32; 4] = [0.05, 0.05, 0.06, 0.55];
+pub(crate) const LINK_BADGE_HOVER_BG: [f32; 4] = [0.05, 0.05, 0.06, 0.85];
+pub(crate) const LINK_BADGE_ON_COLOR: [f32; 4] = [0.92, 0.92, 0.96, 1.0];
+/// Unlinked: a broken chain, and dim like the fx badge with everything off.
+pub(crate) const LINK_BADGE_OFF_COLOR: [f32; 4] = [0.62, 0.62, 0.68, 1.0];
 
 // The rows above the top video lane and below the bottom audio lane, where a
 // new track is made: by the + in the header, or by dropping a clip in the row.

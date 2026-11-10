@@ -123,10 +123,21 @@ impl TransformField {
 #[serde(transparent)]
 pub struct SourceId(pub u32);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrackKind {
     Video,
     Audio,
+}
+
+impl TrackKind {
+    /// What the track on lane `lane` of this kind is called: V1, A2.
+    pub fn label(self, lane: usize) -> String {
+        let letter = match self {
+            TrackKind::Video => 'V',
+            TrackKind::Audio => 'A',
+        };
+        format!("{letter}{}", lane + 1)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,6 +155,13 @@ pub struct Clip {
     /// auto-pairing a video drop with its audio sibling; propagated across
     /// splits so each pair of halves stays linked to the correct counterpart.
     pub link: Option<u32>,
+    /// The link switched off: the clip is moved, trimmed, split and deleted
+    /// on its own, while `link` goes on naming the clips it was paired with
+    /// so the pair can be put back together. Read through
+    /// [`Clip::live_link`]. Defaulted so a project saved before a link could
+    /// be switched off still opens.
+    #[serde(default)]
+    pub unlinked: bool,
     /// Linear level multiplier for this clip's audio; 1.0 is unity.
     ///
     /// Linear rather than decibels because that is what the mixer multiplies
@@ -186,6 +204,7 @@ impl Default for Clip {
             source_out: 0.0,
             timeline_start: 0.0,
             link: None,
+            unlinked: false,
             gain: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
@@ -197,6 +216,11 @@ impl Default for Clip {
 }
 
 impl Clip {
+    /// The link this clip follows: its link id, unless that is switched off.
+    pub fn live_link(&self) -> Option<u32> {
+        self.link.filter(|_| !self.unlinked)
+    }
+
     pub fn duration(&self) -> f64 {
         (self.source_out - self.source_in).max(0.0)
     }
@@ -371,7 +395,11 @@ fn flatten_audio_at<'a>(
 }
 
 /// Clips copied out of the timeline, to be pasted back in elsewhere: each with
-/// the track it came from, so a paste puts every clip back on its own lane.
+/// the lane it came from, so a paste puts every clip back on its own.
+///
+/// A lane is a track's place among the tracks of its kind — the number in its
+/// V2 label, counted from zero — rather than its index, which only means
+/// anything in the timeline the copy was made in.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Clipboard {
     pub clips: Vec<(usize, TrackKind, Clip)>,
@@ -380,6 +408,35 @@ pub struct Clipboard {
 impl Clipboard {
     pub fn is_empty(&self) -> bool {
         self.clips.is_empty()
+    }
+
+    /// The lowest lane of `kind` any of the clips came off, if any did.
+    pub fn lowest(&self, kind: TrackKind) -> Option<usize> {
+        self.clips.iter().filter(|(_, k, _)| *k == kind).map(|(lane, _, _)| *lane).min()
+    }
+}
+
+/// A lane of each kind, where one has been picked: the tracks a paste is
+/// aimed at. See [`Timeline::paste`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PasteLanes {
+    pub video: Option<usize>,
+    pub audio: Option<usize>,
+}
+
+impl PasteLanes {
+    pub fn of(&self, kind: TrackKind) -> Option<usize> {
+        match kind {
+            TrackKind::Video => self.video,
+            TrackKind::Audio => self.audio,
+        }
+    }
+
+    pub fn of_mut(&mut self, kind: TrackKind) -> &mut Option<usize> {
+        match kind {
+            TrackKind::Video => &mut self.video,
+            TrackKind::Audio => &mut self.audio,
+        }
     }
 }
 
@@ -520,6 +577,39 @@ impl Timeline {
     pub fn push_track(&mut self, kind: TrackKind) -> usize {
         self.tracks.push(Track::new(kind));
         self.tracks.len() - 1
+    }
+
+    /// Whether another clip carries `clip`'s link id, switched on or off: the
+    /// other half its chain badge stands for. A clip whose partner has been
+    /// deleted has nothing left to unlink from, or to link back to.
+    pub fn has_partner(&self, clip: &Clip) -> bool {
+        clip.link.is_some()
+            && self
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .any(|c| c.id != clip.id && c.link == clip.link)
+    }
+
+    /// Switch link `link` off (`unlinked`) or back on, on every clip that
+    /// carries it.
+    pub fn set_unlinked(&mut self, link: u32, unlinked: bool) {
+        for clip in self.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+            if clip.link == Some(link) {
+                clip.unlinked = unlinked;
+            }
+        }
+    }
+
+    /// The track on lane `lane` of `kind`: lane 0 of video is the one labelled
+    /// V1.
+    pub fn track_on_lane(&self, kind: TrackKind, lane: usize) -> Option<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == kind)
+            .map(|(i, _)| i)
+            .nth(lane)
     }
 
     /// Move track `idx` one place up the timeline as drawn (`up`), or down,
@@ -737,46 +827,58 @@ impl TimelineSnapshot {
 impl Timeline {
     /// The clips called `ids`, for pasting later.
     pub fn copy(&self, ids: &std::collections::HashSet<u32>) -> Clipboard {
-        let clips = self
-            .tracks
-            .iter()
-            .enumerate()
-            .flat_map(|(ti, track)| {
-                track
-                    .clips
-                    .iter()
-                    .filter(|c| ids.contains(&c.id))
-                    .map(move |c| (ti, track.kind, *c))
-            })
-            .collect();
+        let mut clips = Vec::new();
+        let (mut video, mut audio) = (0, 0);
+        for track in &self.tracks {
+            let next = match track.kind {
+                TrackKind::Video => &mut video,
+                TrackKind::Audio => &mut audio,
+            };
+            let lane = *next;
+            *next += 1;
+            clips.extend(
+                track.clips.iter().filter(|c| ids.contains(&c.id)).map(|c| (lane, track.kind, *c)),
+            );
+        }
         Clipboard { clips }
     }
 
     /// Put copies of `board`'s clips in, keeping their spacing and their
-    /// tracks, with the earliest of them at `at` — or, where that would land
+    /// lanes, with the earliest of them at `at` — or, where that would land
     /// on a clip already there, as soon after it as the whole group fits.
     /// Returns the new clips' ids.
     ///
+    /// A lane in `onto` moves the clips of its kind there: the lowest lane
+    /// they were copied from lands on it, and the others stay as far above
+    /// it as they were. The kind without one goes back on the lanes it came
+    /// from.
+    ///
     /// The copies are clips of their own: fresh ids, and links of their own
     /// that pair them with each other rather than with the clips they came
-    /// from. A track the clips came from that is gone, or is now the other
-    /// kind, gets a new one.
-    pub fn paste(&mut self, board: &Clipboard, at: f64) -> Vec<u32> {
+    /// from. A lane that is not there — its track gone since the copy, or
+    /// this timeline never that tall — gets a new track.
+    pub fn paste(&mut self, board: &Clipboard, at: f64, onto: PasteLanes) -> Vec<u32> {
         let Some(start) = board.clips.iter().map(|(_, _, c)| c.timeline_start).reduce(f64::min)
         else {
             return Vec::new();
         };
+        // The track each copied lane goes onto. Lanes come in rising order
+        // within a kind, as `copy` leaves them, so tracks made here stack in
+        // the order the clips did.
         let mut lanes = std::collections::HashMap::new();
-        for &(ti, kind, _) in &board.clips {
-            if lanes.contains_key(&ti) {
+        for &(lane, kind, _) in &board.clips {
+            if lanes.contains_key(&(lane, kind)) {
                 continue;
             }
-            let lane = if self.tracks.get(ti).is_some_and(|t| t.kind == kind) {
-                ti
-            } else {
-                self.push_track(kind)
+            let wanted = match (onto.of(kind), board.lowest(kind)) {
+                (Some(target), Some(low)) => target + (lane - low),
+                _ => lane,
             };
-            lanes.insert(ti, lane);
+            let track = match self.track_on_lane(kind, wanted) {
+                Some(track) => track,
+                None => self.push_track(kind),
+            };
+            lanes.insert((lane, kind), track);
         }
 
         // Pushed later until nothing is in the way. Each push clears the clip
@@ -785,10 +887,10 @@ impl Timeline {
         const EPS: f64 = 1e-9;
         let mut shift = at.max(0.0) - start;
         'fit: loop {
-            for (ti, _, clip) in &board.clips {
+            for (lane, kind, clip) in &board.clips {
                 let s = clip.timeline_start + shift;
                 let e = s + clip.duration();
-                let blocker = self.tracks[lanes[ti]]
+                let blocker = self.tracks[lanes[&(*lane, *kind)]]
                     .clips
                     .iter()
                     .filter(|o| o.timeline_start < e - EPS && o.timeline_end() > s + EPS)
@@ -804,14 +906,14 @@ impl Timeline {
 
         let mut links = std::collections::HashMap::new();
         let mut ids = Vec::with_capacity(board.clips.len());
-        for (ti, _, clip) in &board.clips {
+        for (lane, kind, clip) in &board.clips {
             let link = clip.link.map(|old| *links.entry(old).or_insert_with(|| {
                 let id = self.next_link;
                 self.next_link += 1;
                 id
             }));
             let id = self.new_clip_id();
-            self.tracks[lanes[ti]].clips.push(Clip {
+            self.tracks[lanes[&(*lane, *kind)]].clips.push(Clip {
                 id,
                 link,
                 timeline_start: clip.timeline_start + shift,
@@ -955,7 +1057,7 @@ mod tests {
     fn a_paste_lands_at_the_playhead_keeping_its_spacing() {
         let mut tl = timeline_with(vec![clip(0.0, 2.0), clip(3.0, 1.0)]);
         let board = board_of(&tl, &[0, 1]);
-        let ids = tl.paste(&board, 10.0);
+        let ids = tl.paste(&board, 10.0, PasteLanes::default());
         assert_eq!(ids.len(), 2);
         let starts: Vec<f64> = ids.iter().map(|id| {
             let (t, i) = tl.find(*id).unwrap();
@@ -969,11 +1071,11 @@ mod tests {
         let mut tl = timeline_with(vec![clip(0.0, 4.0), clip(6.0, 2.0)]);
         let board = board_of(&tl, &[1]);
         // Playhead in the middle of the first clip: after it, where 2s fits.
-        let ids = tl.paste(&board, 1.0);
+        let ids = tl.paste(&board, 1.0, PasteLanes::default());
         let (t, i) = tl.find(ids[0]).unwrap();
         assert_eq!(tl.tracks[t].clips[i].timeline_start, 4.0);
         // Again at the same spot: the gap is now full up to 8, so after that.
-        let ids = tl.paste(&board, 1.0);
+        let ids = tl.paste(&board, 1.0, PasteLanes::default());
         let (t, i) = tl.find(ids[0]).unwrap();
         assert_eq!(tl.tracks[t].clips[i].timeline_start, 8.0);
     }
@@ -988,7 +1090,7 @@ mod tests {
         tl.tracks[0].clips.push(Clip { id: v, link: Some(link), ..clip(0.0, 3.0) });
         tl.tracks[1].clips.push(Clip { id: a, link: Some(link), ..clip(0.0, 3.0) });
         let board = board_of(&tl, &[v, a]);
-        let ids = tl.paste(&board, 5.0);
+        let ids = tl.paste(&board, 5.0, PasteLanes::default());
         let (vt, vi) = tl.find(ids[0]).unwrap();
         let (at, ai) = tl.find(ids[1]).unwrap();
         assert_eq!((vt, at), (0, 1), "each back on its own track");
@@ -1007,10 +1109,83 @@ mod tests {
         tl.tracks[1].clips.push(Clip { id, ..clip(0.0, 1.0) });
         let board = board_of(&tl, &[id]);
         tl.tracks.truncate(1);
-        let ids = tl.paste(&board, 0.0);
+        let ids = tl.paste(&board, 0.0, PasteLanes::default());
         assert_eq!(tl.tracks.len(), 2);
         assert_eq!(tl.find(ids[0]).unwrap().0, 1);
         assert_eq!(tl.tracks[1].kind, TrackKind::Video);
+    }
+
+    /// A link switched off is still there to switch back on, on both halves,
+    /// and stops counting as a link in between.
+    #[test]
+    fn a_link_switched_off_keeps_its_partner() {
+        let mut tl = Timeline::new();
+        tl.tracks.push(Track::new(TrackKind::Video));
+        tl.tracks.push(Track::new(TrackKind::Audio));
+        let link = tl.new_link_id();
+        let (v, a, other) = (tl.new_clip_id(), tl.new_clip_id(), tl.new_clip_id());
+        tl.tracks[0].clips.push(Clip { id: v, link: Some(link), ..clip(0.0, 3.0) });
+        tl.tracks[1].clips.push(Clip { id: a, link: Some(link), ..clip(0.0, 3.0) });
+        tl.tracks[0].clips.push(Clip { id: other, ..clip(3.0, 1.0) });
+        tl.set_unlinked(link, true);
+        for track in 0..2 {
+            let half = tl.tracks[track].clips[0];
+            assert_eq!(half.live_link(), None);
+            assert!(tl.has_partner(&half));
+        }
+        assert!(!tl.has_partner(&tl.tracks[0].clips[1]));
+        // With the sound deleted there is no pair left to put back together.
+        tl.tracks[1].clips.clear();
+        assert!(!tl.has_partner(&tl.tracks[0].clips[0]));
+        tl.set_unlinked(link, false);
+        assert_eq!(tl.tracks[0].clips[0].live_link(), Some(link));
+    }
+
+    /// The point of a target lane: the copy lands on the track picked, not the
+    /// one it was made on, and linked audio with no target of its own stays
+    /// where it was.
+    #[test]
+    fn a_paste_goes_onto_the_lane_it_is_aimed_at() {
+        let mut tl = Timeline::new();
+        for kind in [TrackKind::Video, TrackKind::Audio, TrackKind::Video] {
+            tl.tracks.push(Track::new(kind));
+        }
+        let link = tl.new_link_id();
+        let (v, a) = (tl.new_clip_id(), tl.new_clip_id());
+        tl.tracks[0].clips.push(Clip { id: v, link: Some(link), ..clip(0.0, 3.0) });
+        tl.tracks[1].clips.push(Clip { id: a, link: Some(link), ..clip(0.0, 3.0) });
+        let board = board_of(&tl, &[v, a]);
+        // V2 is the third track: lanes count within a kind.
+        let onto = PasteLanes { video: Some(1), audio: None };
+        let ids = tl.paste(&board, 0.0, onto);
+        assert_eq!(tl.find(ids[0]).unwrap().0, 2);
+        assert_eq!(tl.find(ids[1]).unwrap().0, 1);
+        // The audio had its original in the way, and the pair moved as one.
+        for id in ids {
+            let (t, i) = tl.find(id).unwrap();
+            assert_eq!(tl.tracks[t].clips[i].timeline_start, 3.0);
+        }
+    }
+
+    /// Clips from several lanes keep their stacking: the lowest on the target,
+    /// the rest as far above it as they were, on new tracks where the
+    /// timeline runs out.
+    #[test]
+    fn a_stack_pasted_onto_a_lane_keeps_its_order() {
+        let mut tl = Timeline::new();
+        for _ in 0..3 {
+            tl.tracks.push(Track::new(TrackKind::Video));
+        }
+        let (low, high) = (tl.new_clip_id(), tl.new_clip_id());
+        tl.tracks[0].clips.push(Clip { id: low, ..clip(0.0, 1.0) });
+        tl.tracks[2].clips.push(Clip { id: high, ..clip(0.0, 1.0) });
+        let board = board_of(&tl, &[low, high]);
+        let onto = PasteLanes { video: Some(1), audio: None };
+        let ids = tl.paste(&board, 0.0, onto);
+        // V1 and V3 onto V2: V2, and a V4 that had to be made.
+        assert_eq!(tl.find(ids[0]).unwrap().0, 1);
+        assert_eq!(tl.find(ids[1]).unwrap().0, 3);
+        assert_eq!(tl.tracks.len(), 4);
     }
 
     /// Only the clips picked are cut: the rest of the stack under the playhead

@@ -18,8 +18,8 @@ use crate::layout::{PoolTab, TitleMenu};
 use crate::theme::{FONT_MENU_ROWS, SNAP_PX, STATUS_ERR, STATUS_INFO};
 use crate::title::Title;
 use crate::timeline::{
-    db_to_gain, gain_to_db, FadeSide, SourceId, TimelineSnapshot, TrackKind, Tracks, Transform,
-    TransformField,
+    db_to_gain, gain_to_db, FadeSide, PasteLanes, SourceId, TimelineSnapshot, TrackKind, Tracks,
+    Transform, TransformField,
     MAX_GAIN_DB, MAX_OPACITY, MAX_SCALE, MIN_GAIN_DB, MIN_OPACITY, MIN_SCALE,
 };
 
@@ -149,6 +149,7 @@ impl State {
         // Only reached when the edit actually changed something, which is
         // exactly when the saved file goes stale.
         self.dirty = true;
+        self.settle_view();
     }
 
     pub(crate) fn undo(&mut self) {
@@ -200,6 +201,7 @@ impl State {
         if self.audio.position() > duration {
             self.audio.set_position(duration);
         }
+        self.settle_view();
     }
 
     pub(crate) fn remove_source(&mut self, id: SourceId) {
@@ -251,6 +253,10 @@ impl State {
         self.selected = self.timeline.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id)).collect();
     }
 
+    pub(crate) fn deselect_all(&mut self) {
+        self.selected.clear();
+    }
+
     /// Make `(track, idx)` the whole selection.
     pub(crate) fn select_clip_at(&mut self, track: usize, idx: usize) {
         self.selected = vec![self.timeline.tracks[track].clips[idx].id];
@@ -289,21 +295,38 @@ impl State {
     }
 
     /// Indices of every clip linked to `(track, idx)`, including itself.
-    /// Unlinked clips return just their own position.
+    /// Unlinked clips return just their own position, a pair whose link is
+    /// switched off among them.
     pub(crate) fn linked_siblings(&self, track: usize, idx: usize) -> Vec<(usize, usize)> {
-        let link = self.timeline.tracks[track].clips[idx].link;
+        let link = self.timeline.tracks[track].clips[idx].live_link();
         let Some(link_id) = link else {
             return vec![(track, idx)];
         };
         let mut v = Vec::new();
         for (ti, tr) in self.timeline.tracks.iter().enumerate() {
             for (ci, c) in tr.clips.iter().enumerate() {
-                if c.link == Some(link_id) {
+                if c.live_link() == Some(link_id) {
                     v.push((ti, ci));
                 }
             }
         }
         v
+    }
+
+    /// The chain badge: pull clip `(track, idx)` and the clips linked to it
+    /// apart, or tie them back together. Apart, each is moved, trimmed, split
+    /// and deleted alone. Together again they travel as one from wherever
+    /// they now sit: nothing is moved back into step.
+    pub(crate) fn toggle_link(&mut self, track: usize, idx: usize) {
+        let clip = self.timeline.tracks[track].clips[idx];
+        let Some(link) = clip.link else {
+            return;
+        };
+        self.begin_edit();
+        self.timeline.set_unlinked(link, !clip.unlinked);
+        self.commit_edit();
+        let said = if clip.unlinked { "Linked again" } else { "Unlinked: each clip is on its own" };
+        self.set_status(said.into(), STATUS_INFO);
     }
 
     /// Times a dragged edge can latch onto: every other clip's edges, the
@@ -965,9 +988,33 @@ impl State {
         self.clipboard_epoch = self.pool_epoch;
     }
 
+    /// Pin track `idx` as where pastes of its kind go, or let it go if it is
+    /// the one pinned.
+    pub(crate) fn toggle_paste_pin(&mut self, idx: usize) {
+        let Some(track) = self.timeline.tracks.get(idx) else {
+            return;
+        };
+        let (kind, lane) = (track.kind, self.visual_index(idx));
+        let pin = self.paste_pins.of_mut(kind);
+        *pin = if *pin == Some(lane) { None } else { Some(lane) };
+    }
+
+    /// The lane pastes of `kind` are pinned to, while there is such a lane:
+    /// an undo can take the track out from under a pin, which then waits for
+    /// a redo to bring it back.
+    pub(crate) fn paste_pin(&self, kind: TrackKind) -> Option<usize> {
+        self.paste_pins.of(kind).filter(|&lane| lane < self.n_tracks_of(kind))
+    }
+
     /// Paste what was copied at the playhead, or just after the clip the
     /// playhead is on, and select it. The playhead moves to the end of what
     /// was pasted, so pressing paste again lays the next copy after it.
+    ///
+    /// The clips go onto the pinned track of their kind. With none pinned
+    /// they go onto the track under the pointer, which is how the key aims a
+    /// paste without a click; and with the pointer elsewhere, as it is for
+    /// the toolbar's button, back onto the tracks they were copied from. The
+    /// pin comes first because it is the one on show.
     ///
     /// A title comes back as a title of its own, a copy of the words: changing
     /// one afterwards leaves the other as it was, which is what copying text
@@ -983,10 +1030,10 @@ impl State {
         // paste's undo step.
         self.begin_edit();
         let foreign = self.clipboard_epoch != self.pool_epoch;
+        let mut missing = 0;
         if foreign {
             let carried = std::mem::take(&mut self.clipboard_sources);
             let mut done = std::collections::HashMap::new();
-            let mut missing = 0;
             let (device, queue, quads) = (&self.device, &self.queue, &self.quads);
             let mut open = |pool: &mut MediaPool, path: &str| match pool.add(path, device, queue, quads) {
                 Ok(id) => Some(id),
@@ -1037,7 +1084,26 @@ impl State {
                 }
             }
         }
-        let ids = self.timeline.paste(&board, self.audio.position());
+        let mut onto = PasteLanes {
+            video: self.paste_pin(TrackKind::Video),
+            audio: self.paste_pin(TrackKind::Audio),
+        };
+        let layout = self.timeline_layout();
+        let pointed = self.cursor_in_window.then(|| self.lane_at(self.cursor, &layout)).flatten();
+        if let Some(track) = pointed {
+            let (kind, lane) = (self.timeline.tracks[track].kind, self.visual_index(track));
+            // Nothing is on show to say where this one went, so the status
+            // line does — unless it is where the clips were going anyway, or
+            // there is a file missing to report.
+            let moves = board.lowest(kind).is_some_and(|low| low != lane);
+            if onto.of(kind).is_none() && moves {
+                *onto.of_mut(kind) = Some(lane);
+                if missing == 0 {
+                    self.set_status(format!("Pasted onto {}", kind.label(lane)), STATUS_INFO);
+                }
+            }
+        }
+        let ids = self.timeline.paste(&board, self.audio.position(), onto);
         self.commit_edit();
         let end = ids
             .iter()
@@ -1100,8 +1166,19 @@ impl State {
     /// track moved up draws over the one it passed.
     pub(crate) fn move_track(&mut self, idx: usize, up: bool) {
         self.begin_edit();
-        self.timeline.move_track(idx, up);
+        let moved = self.timeline.move_track(idx, up);
         self.commit_edit();
+        // The two tracks traded lanes, and a pin stays with its track.
+        if let Some(to) = moved {
+            let kind = self.timeline.tracks[to].kind;
+            let (from, to) = (self.visual_index(idx), self.visual_index(to));
+            let pin = self.paste_pins.of_mut(kind);
+            *pin = match *pin {
+                Some(lane) if lane == from => Some(to),
+                Some(lane) if lane == to => Some(from),
+                other => other,
+            };
+        }
     }
 
     pub(crate) fn remove_track(&mut self, idx: usize) {
@@ -1111,9 +1188,17 @@ impl State {
         if !track.clips.is_empty() || self.n_tracks_of(track.kind) <= 1 {
             return;
         }
+        let (kind, gone) = (track.kind, self.visual_index(idx));
         self.begin_edit();
         self.timeline.tracks.remove(idx);
         self.commit_edit();
+        // Its pin goes with it, and a pin further out follows its track in.
+        let pin = self.paste_pins.of_mut(kind);
+        *pin = match *pin {
+            Some(lane) if lane == gone => None,
+            Some(lane) if lane > gone => Some(lane - 1),
+            other => other,
+        };
     }
 
     /// Put a fresh `kind` on the end of each clip at `targets`, as one step.

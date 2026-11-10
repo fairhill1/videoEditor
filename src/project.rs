@@ -255,7 +255,7 @@ mod tests {
             layout: Some(Layout {
                 split_top_bottom: 0.7,
                 split_pool_preview: 0.2,
-                pool_view: PoolView::Grid,
+                pool_view: PoolView::List,
                 pool_tab: PoolTab::Effects,
                 playhead: 12.5,
                 view: Some((10.0, 30.0)),

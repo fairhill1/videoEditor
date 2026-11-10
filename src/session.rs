@@ -377,5 +377,7 @@ impl State {
         self.typing_before = None;
         self.color_picker = None;
         self.eyedropper_pick = None;
+        // A pin names a lane of the timeline that was on screen.
+        self.paste_pins = Default::default();
     }
 }

@@ -49,6 +49,9 @@ ICONS=(
     rotate-ccw                # effects: reset a clip's placement
     arrow-right-from-line     # timeline: ripple trims
     chevron-up                # timeline: move a track up the stack
+    link                      # timeline: a clip linked to its other half
+    unlink                    # timeline: a linked pair pulled apart
+    square-x                  # timeline: deselect every clip
 )
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

@@ -10,9 +10,10 @@
 use crate::fmt::{fmt_db, fmt_opacity, format_tick_label, nice_tick_interval, truncate_to_width};
 use crate::input::DragMode;
 use crate::layout::{
-    fade_handle_rect, fx_badge_rect, lane_y, level_line_y, track_header_button, TimelineLayout,
+    fade_handle_rect, fx_badge_rect, lane_y, level_line_y, link_badge_rect, track_header_button,
+    TimelineHit, TimelineLayout,
 };
-use crate::ui::{draw_button, draw_tooltip, BtnState, TooltipSide};
+use crate::ui::{draw_button, draw_tooltip, BtnState, Rect, TooltipSide};
 use crate::quad::{Quad, QuadRenderer};
 use crate::state::State;
 use crate::text::TextRenderer;
@@ -201,7 +202,23 @@ impl State {
             let lane_y = lane_y(center_y, lane_h, visual_i, TrackKind::Audio);
             self.draw_track_lane(layout, lane_y, track_idx, visual_i);
         }
+        // The box of a selection being dragged out, over the clips it is
+        // picking and under the chrome.
+        if let DragMode::Marquee { origin, moved: true, .. } = self.drag {
+            let r = self.marquee_rect(origin, self.cursor, &layout);
+            let b = MARQUEE_BORDER_PX;
+            self.quads.push(Quad::colored([r.x, r.y], [r.w, r.h], MARQUEE_FILL_COLOR));
+            for (pos, size) in [
+                ([r.x, r.y], [r.w, b]),
+                ([r.x, r.y + r.h - b], [r.w, b]),
+                ([r.x, r.y], [b, r.h]),
+                ([r.x + r.w - b, r.y], [b, r.h]),
+            ] {
+                self.quads.push(Quad::colored(pos, size, MARQUEE_BORDER_COLOR));
+            }
+        }
         self.draw_track_header_buttons(&layout, w);
+        self.draw_link_tooltip(&layout, w);
 
         // --- Playhead: drawn last so it's on top of clips ---
         // Starts at the ruler rather than the top of the panel: it marks a
@@ -325,6 +342,35 @@ impl State {
         }
     }
 
+    /// What the chain badge under the pointer will do if clicked.
+    fn draw_link_tooltip(&mut self, layout: &TimelineLayout, w: f32) {
+        if !matches!(self.drag, DragMode::None) {
+            return;
+        }
+        let TimelineHit::ClipLink { track, idx } = self.timeline_hit(self.cursor[0], self.cursor[1])
+        else {
+            return;
+        };
+        let Some(badge) = self.link_badge(track, idx, layout) else {
+            return;
+        };
+        let tip = if self.timeline.tracks[track].clips[idx].unlinked {
+            "Unlinked. Click to link the pair again"
+        } else {
+            "Linked. Click to unlink, so each can be edited alone"
+        };
+        draw_tooltip(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            badge,
+            tip,
+            TRANSPORT_TOOLTIP_SIZE,
+            TooltipSide::Below,
+            w,
+        );
+    }
+
     /// The add-track rows with their + buttons, and the remove button on
     /// each empty track. While a pool drag is on, the rows show that they take
     /// a drop, and the one that would take this drop lights up.
@@ -439,6 +485,23 @@ impl State {
                 tooltip = Some((btn, "Remove this empty track", TooltipSide::Below));
             }
         }
+        // The rest of a header, where no button has claimed the pointer.
+        if let (None, true, Some(idx)) = (tooltip, idle, self.track_header_at(self.cursor, layout)) {
+            let kind = self.timeline.tracks[idx].kind;
+            let lane = self.visual_index(idx);
+            let header = Rect {
+                x: 0.0,
+                y: self.lane_top(idx, layout),
+                w: layout.clips_x,
+                h: layout.lane_h,
+            };
+            let tip = if self.paste_pin(kind) == Some(lane) {
+                "Pastes go on this track. Click to unpin"
+            } else {
+                "Click to pin: pastes go on this track"
+            };
+            tooltip = Some((header, tip, TooltipSide::Below));
+        }
         if let Some((anchor, label, side)) = tooltip {
             draw_tooltip(
                 &mut self.quads,
@@ -463,9 +526,9 @@ impl State {
         let lane_h = layout.lane_h;
         let band = [layout.clips_x, layout.clips_right()];
         let track = &self.timeline.tracks[track_idx];
-        let (clip_color, label_prefix) = match track.kind {
-            TrackKind::Video => (VIDEO_CLIP_COLOR, "V"),
-            TrackKind::Audio => (AUDIO_CLIP_COLOR, "A"),
+        let clip_color = match track.kind {
+            TrackKind::Video => VIDEO_CLIP_COLOR,
+            TrackKind::Audio => AUDIO_CLIP_COLOR,
         };
         let unselected_border = darken(clip_color, CLIP_BORDER_DARKEN);
 
@@ -477,8 +540,15 @@ impl State {
             LANE_COLOR,
         ));
 
-        // Track header label (V1, V2, A1, ...).
-        let header = format!("{}{}", label_prefix, visual_i + 1);
+        // Track header label (V1, V2, A1, ...). The track pastes are pinned
+        // to says so here, where the click that pins it lands.
+        let pinned = self.paste_pin(track.kind) == Some(visual_i);
+        let hovered = matches!(self.drag, DragMode::None)
+            && self.track_header_at(self.cursor, &layout) == Some(track_idx);
+        if pinned {
+            self.quads.push(Quad::colored([0.0, lane_y], [TRACK_PIN_MARK_W, lane_h], TRACK_PIN_COLOR));
+        }
+        let header = track.kind.label(visual_i);
         let baseline = lane_y + (lane_h + self.text.ascent(CLIP_LABEL_SIZE)) * 0.5;
         self.text.draw(
             &self.queue,
@@ -486,7 +556,11 @@ impl State {
             [8.0, baseline],
             &header,
             CLIP_LABEL_SIZE,
-            TRACK_LABEL_COLOR,
+            match (pinned, hovered) {
+                (true, _) => TRACK_PIN_COLOR,
+                (false, true) => TRACK_LABEL_HOVER_COLOR,
+                (false, false) => TRACK_LABEL_COLOR,
+            },
         );
 
         // Clips.
@@ -699,6 +773,37 @@ impl State {
                         "fx",
                         FX_BADGE_LABEL_SIZE,
                         FX_BADGE_TEXT,
+                    );
+                    name_x = badge.x + badge.w + FX_BADGE_GAP;
+                }
+            }
+            // The chain comes next, on a clip with another half: whole while
+            // the two are linked, broken once they have been pulled apart.
+            if self.timeline.has_partner(clip) {
+                let after_fx = !clip.effects.is_empty();
+                if let Some(badge) = link_badge_rect(vis_x0, x + cw, lane_y, after_fx) {
+                    let hovered =
+                        matches!(self.drag, DragMode::None) && badge.contains(self.cursor);
+                    let bg = if hovered { LINK_BADGE_HOVER_BG } else { LINK_BADGE_BG };
+                    self.quads.push(Quad::colored([badge.x, badge.y], [badge.w, badge.h], bg));
+                    let (icon, color) = if clip.unlinked {
+                        (ICON_UNLINK, LINK_BADGE_OFF_COLOR)
+                    } else {
+                        (ICON_LINK, LINK_BADGE_ON_COLOR)
+                    };
+                    let glyph = icon.to_string();
+                    let gw = self.text.measure_width(&glyph, LINK_BADGE_ICON_SIZE);
+                    let (gh, gymin) = self.text.glyph_visual_bounds(icon, LINK_BADGE_ICON_SIZE);
+                    self.text.draw(
+                        &self.queue,
+                        &mut self.quads,
+                        [
+                            (badge.x + (badge.w - gw) * 0.5).round(),
+                            (badge.y + (badge.h + gh) * 0.5 + gymin).round(),
+                        ],
+                        &glyph,
+                        LINK_BADGE_ICON_SIZE,
+                        color,
                     );
                     name_x = badge.x + badge.w + FX_BADGE_GAP;
                 }

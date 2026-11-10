@@ -95,7 +95,11 @@ impl ApplicationHandler for App {
                 // rects that were drawn.
                 let position = position.to_logical::<f32>(state.scale as f64);
                 state.cursor = [position.x, position.y];
+                state.cursor_in_window = true;
                 state.update_drag();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                state.cursor_in_window = false;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -282,6 +286,7 @@ impl ApplicationHandler for App {
                     // Ctrl versions every other program uses kept as well.
                     KeyCode::KeyG => state.combine_selected(),
                     KeyCode::KeyA => state.select_all(),
+                    KeyCode::KeyD => state.deselect_all(),
                     // Shift+Z rather than a bare key: it is the counterpart to
                     // the zoom pair above, and every bare letter it could have
                     // had is a verb that edits.

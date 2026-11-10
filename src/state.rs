@@ -31,7 +31,7 @@ use crate::project;
 use crate::quad::QuadRenderer;
 use crate::text::TextRenderer;
 use crate::theme::*;
-use crate::timeline::{Clip, Clipboard, SourceId, Timeline, Track, TrackKind, Tracks};
+use crate::timeline::{Clip, Clipboard, PasteLanes, SourceId, Timeline, Track, TrackKind, Tracks};
 use crate::title::Title;
 use crate::ui::Rect;
 
@@ -86,6 +86,9 @@ pub(crate) struct State {
     pub(crate) audio: AudioEngine,
     /// In logical points, matching the rects it is tested against.
     pub(crate) cursor: [f32; 2],
+    /// Whether the pointer is over the window at all. `cursor` keeps the last
+    /// place it was seen once it has left, which is no place to aim a paste.
+    pub(crate) cursor_in_window: bool,
     /// Fraction of the window height that sits above the timeline, and fraction
     /// of the width given to the media pool. Read through [`State::timeline_top`]
     /// and [`State::media_pool_w`], which apply the panel minimums. Saved with
@@ -134,6 +137,7 @@ pub(crate) struct State {
     pub(crate) timeline_copy_btn: Rect,
     pub(crate) timeline_combine_btn: Rect,
     pub(crate) timeline_select_all_btn: Rect,
+    pub(crate) timeline_deselect_btn: Rect,
     pub(crate) timeline_open_compound_btn: Rect,
     /// Back out of the compound clip being edited; empty when none is.
     pub(crate) timeline_back_btn: Rect,
@@ -146,6 +150,9 @@ pub(crate) struct State {
     /// recently: the *primary* clip, which the actions that only make sense on
     /// one clip — the canvas handles, typing into a title — act on.
     pub(crate) selected: Vec<u32>,
+    /// What was selected when a box selection began with Shift down, which
+    /// the box adds to: see [`DragMode::Marquee`]. Empty otherwise.
+    pub(crate) marquee_base: Vec<u32>,
     /// What Ctrl+C took, for Ctrl+V to put back. Kept for the session only,
     /// and across opening another project: see [`State::clipboard_sources`].
     pub(crate) clipboard: Clipboard,
@@ -156,6 +163,11 @@ pub(crate) struct State {
     /// Which pool the clipboard's source ids belong to: [`State::pool_epoch`]
     /// as it was at the copy.
     pub(crate) clipboard_epoch: u64,
+    /// The lane of each kind pinned as where pastes go: set and cleared by
+    /// clicking a track's header, which shows it. Read through
+    /// [`State::paste_pin`]. Not saved: it is about the next paste, not the
+    /// project.
+    pub(crate) paste_pins: PasteLanes,
     /// Bumped whenever a project is opened or started, which replaces the
     /// pool and every source id with it.
     pub(crate) pool_epoch: u64,
@@ -192,10 +204,11 @@ pub(crate) struct State {
     /// The timeline's visible window: the time at the left edge of the clip
     /// area, and the span it covers.
     ///
-    /// Both are requests rather than results — they are resolved against the
-    /// content by [`crate::layout::resolve_view`] on every read, which is what
-    /// keeps a view that spans the whole timeline spanning it as clips are
-    /// added. `view_dur` starts at infinity, i.e. fit to whatever there is.
+    /// Read through [`State::view_window`]. The zoom is the user's, and stays
+    /// as it is while the timeline changes length under it; the fit is asked
+    /// for, by the toolbar's button, rather than kept up. `view_dur` is
+    /// infinity only while the timeline is empty, which has no zoom of its
+    /// own: see [`State::settle_view`].
     pub(crate) view_start: f64,
     pub(crate) view_dur: f64,
     pub(crate) pool_open_btn: Rect,
@@ -337,6 +350,7 @@ impl State {
             timeline,
             audio: AudioEngine::new(),
             cursor: [0.0, 0.0],
+            cursor_in_window: false,
             split_top_bottom: TOP_BOTTOM_SPLIT,
             split_pool_preview: MEDIA_PREVIEW_SPLIT,
             canvas_res: Setting::Auto,
@@ -364,13 +378,16 @@ impl State {
             timeline_copy_btn: Rect::default(),
             timeline_combine_btn: Rect::default(),
             timeline_select_all_btn: Rect::default(),
+            timeline_deselect_btn: Rect::default(),
             timeline_open_compound_btn: Rect::default(),
             timeline_back_btn: Rect::default(),
             timeline_paste_btn: Rect::default(),
             selected: Vec::new(),
+            marquee_base: Vec::new(),
             clipboard: Clipboard::default(),
             clipboard_sources: Default::default(),
             clipboard_epoch: 0,
+            paste_pins: PasteLanes::default(),
             pool_epoch: 0,
             compound_stack: Vec::new(),
             timeline_export_btn: Rect::default(),
@@ -494,6 +511,7 @@ impl State {
                 }
             }
             DragMode::Scrub
+            | DragMode::Marquee { .. }
             | DragMode::ClipMove { .. }
             | DragMode::PoolDrag { .. }
             | DragMode::EffectDrag { .. }

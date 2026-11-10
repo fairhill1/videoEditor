@@ -23,6 +23,13 @@ use crate::ui::Rect;
 pub(crate) enum DragMode {
     None,
     Scrub,
+    /// A press on bare lane, which a drag turns into a box that selects the
+    /// clips it touches. `origin` is where the press landed; `moved` turns
+    /// true once the pointer has gone far enough to mean a drag, and until
+    /// then the release is a click, which puts the playhead there. `add`
+    /// when Shift was down: the selection as it stood, kept in
+    /// [`State::marquee_base`], is added to rather than replaced.
+    Marquee { origin: [f32; 2], add: bool, moved: bool },
     PoolDrag { source: SourceId },
     /// Carrying an effect from the library to a clip on the timeline.
     EffectDrag { kind: EffectKind },
@@ -238,6 +245,10 @@ impl State {
         }
         if self.timeline_select_all_btn.contains([cx, cy]) {
             self.select_all();
+            return;
+        }
+        if self.timeline_deselect_btn.contains([cx, cy]) {
+            self.deselect_all();
             return;
         }
         if self.timeline_split_btn.contains([cx, cy]) {
@@ -505,6 +516,12 @@ impl State {
             }
             return;
         }
+        // What is left of a header once its buttons have had their say: a
+        // press there pins the track as where pastes go, or lets it go.
+        if let Some(idx) = self.track_header_at([cx, cy], &layout) {
+            self.toggle_paste_pin(idx);
+            return;
+        }
         // Clip drags mutate continuously; snapshot once here so the whole
         // gesture collapses to one undo step (closed in `end_drag`).
         //
@@ -577,6 +594,12 @@ impl State {
                 self.begin_edit();
                 self.drag = DragMode::ClipLevel { track, idx };
             }
+            // The chain is a switch. It picks the clip as well, so what comes
+            // next — a delete, most likely — is done to this half.
+            TimelineHit::ClipLink { track, idx } => {
+                self.select_clip_at(track, idx);
+                self.toggle_link(track, idx);
+            }
             // The badge is the way from a clip to its effects: pick the clip,
             // and turn the panel to the page that edits them.
             TimelineHit::ClipEffects { track, idx } => {
@@ -586,7 +609,15 @@ impl State {
                     self.dirty = true;
                 }
             }
-            TimelineHit::Lane | TimelineHit::Ruler => {
+            // Bare lane is where a box selection starts. Nothing happens
+            // until the pointer has moved or let go: a release that never
+            // dragged is the click that puts the playhead here, in
+            // `end_drag`.
+            TimelineHit::Lane => {
+                self.marquee_base = if shift { self.selected.clone() } else { Vec::new() };
+                self.drag = DragMode::Marquee { origin: [cx, cy], add: shift, moved: false };
+            }
+            TimelineHit::Ruler => {
                 // Shift keeps the selection, so the playhead can be moved to
                 // where a group of clips is about to be cut.
                 if !shift {
@@ -653,10 +684,26 @@ impl State {
                 self.set_selected_transform(field, value);
             }
             DragMode::Scrub => self.apply_scrub(),
+            DragMode::Marquee { origin, add, moved } => {
+                let far = (self.cursor[0] - origin[0]).abs().max((self.cursor[1] - origin[1]).abs());
+                if !moved && far < MARQUEE_START_PX {
+                    return;
+                }
+                self.drag = DragMode::Marquee { origin, add, moved: true };
+                // Worked out afresh from the box each time, so a clip the
+                // box has backed off is let go again.
+                let mut picked = self.marquee_base.clone();
+                for id in self.clips_in_box(origin, self.cursor) {
+                    if !picked.contains(&id) {
+                        picked.push(id);
+                    }
+                }
+                self.selected = picked;
+            }
             DragMode::Pan { grab_x, start } => {
                 let px_per_sec = self.timeline_layout().px_per_sec();
                 if px_per_sec > 0.0 {
-                    self.view_start = start - (self.cursor[0] - grab_x) as f64 / px_per_sec;
+                    self.scroll_view_to(start - (self.cursor[0] - grab_x) as f64 / px_per_sec);
                 }
             }
             DragMode::ZoomSlider => {
@@ -818,7 +865,7 @@ impl State {
             }
             DragMode::Scrollbar { grab_dx } => {
                 let layout = self.timeline_layout();
-                self.view_start = layout.scroll_x_to_view_start(self.cursor[0] - grab_dx);
+                self.scroll_view_to(layout.scroll_x_to_view_start(self.cursor[0] - grab_dx));
             }
             // One gesture, two quantities: the line under the cursor carries
             // the sound's level on an audio lane and the picture's opacity on a
@@ -843,6 +890,15 @@ impl State {
 
     pub(crate) fn end_drag(&mut self) {
         self.ripple_trim = None;
+        // A press on bare lane that never became a box is a click: it lets
+        // the selection go, unless Shift is holding it, and puts the
+        // playhead where it landed.
+        if let DragMode::Marquee { add, moved: false, .. } = self.drag {
+            if !add {
+                self.selected.clear();
+            }
+            self.apply_scrub();
+        }
         // A click on one of several selected clips that never became a drag
         // picks that clip alone, as a click on any other clip does.
         if let DragMode::ClipMove { track, idx, group: true, moved: false, .. } = self.drag {
@@ -970,7 +1026,8 @@ impl State {
             | TimelineHit::ClipTrimRight { track, idx }
             | TimelineHit::ClipFade { track, idx, .. }
             | TimelineHit::ClipLevel { track, idx }
-            | TimelineHit::ClipEffects { track, idx } => (track, idx),
+            | TimelineHit::ClipEffects { track, idx }
+            | TimelineHit::ClipLink { track, idx } => (track, idx),
             _ => return None,
         };
         self.effects_clip_for(track, idx)
@@ -1036,7 +1093,8 @@ impl State {
             return;
         }
         let layout = self.timeline_layout();
-        let t = layout.cursor_to_t(self.cursor[0]);
+        // The view runs on past the last clip; the playhead does not.
+        let t = layout.cursor_to_t(self.cursor[0]).min(duration);
         // Audio engine owns the playhead — setting position also flushes any
         // pre-mixed samples so the next tick refills from the new time,
         // keeping scrub snappy instead of dragging 150ms of stale audio.

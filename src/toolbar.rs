@@ -9,7 +9,7 @@
 use crate::canvas::Canvas;
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
-use crate::layout::{zoom_fraction, PoolTab, PoolView};
+use crate::layout::{fit_span, zoom_fraction, PoolTab, PoolView};
 use crate::quad::Quad;
 use crate::state::State;
 use crate::theme::*;
@@ -224,7 +224,8 @@ impl State {
             w: TRANSPORT_BTN_W,
             h: TRANSPORT_BTN_H,
         };
-        let btn_x = first_x + stride;
+        self.timeline_deselect_btn = Rect { x: first_x + stride, ..self.timeline_select_all_btn };
+        let btn_x = first_x + stride * 2.0;
         self.timeline_split_btn = Rect { x: btn_x, ..self.timeline_select_all_btn };
         // Freeze beside Split: both cut the clip under the playhead, and
         // this one holds its picture there before playing on.
@@ -334,8 +335,9 @@ impl State {
             self.timeline_zoom_fit_btn = Rect::default();
         }
         let (_, view_dur) = self.view_window();
-        let zoom = zoom_fraction(view_dur, self.content_duration());
-        let fitted = view_dur >= self.content_duration();
+        let zoom = zoom_fraction(view_dur, fit_span(self.content_duration()));
+        let fitted = self.view_is_fitted();
+        let has_clips = self.timeline.duration() > 0.0;
 
         let exporting = self.export.is_some();
         // The gear's tooltip is the only place the resolved canvas is spelled
@@ -396,6 +398,12 @@ impl State {
                 avail(self.timeline.tracks.iter().any(|t| !t.clips.is_empty())),
             ),
             (
+                self.timeline_deselect_btn,
+                ICON_DESELECT,
+                "Deselect every clip (D)",
+                avail(self.has_selection()),
+            ),
+            (
                 self.timeline_split_btn,
                 ICON_SPLIT,
                 "Split selected clips at playhead (S)",
@@ -422,7 +430,7 @@ impl State {
             (
                 self.timeline_paste_btn,
                 ICON_PASTE,
-                "Paste at the playhead (V)",
+                "Paste at the playhead (V pastes onto the track pointed at)",
                 avail(!self.clipboard.is_empty()),
             ),
             (
@@ -471,13 +479,13 @@ impl State {
                 self.timeline_zoom_out_btn,
                 ICON_ZOOM_OUT,
                 "Zoom out (-)",
-                avail(!fitted),
+                avail(zoom > 0.0),
             ),
             (
                 self.timeline_zoom_in_btn,
                 ICON_ZOOM_IN,
                 "Zoom in (=)",
-                avail(zoom < 1.0),
+                avail(has_clips && zoom < 1.0),
             ),
             (
                 self.timeline_zoom_fit_btn,
