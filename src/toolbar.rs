@@ -430,7 +430,7 @@ impl State {
             (
                 self.timeline_paste_btn,
                 ICON_PASTE,
-                "Paste at the playhead (V pastes onto the track pointed at)",
+                "Paste at the playhead (V). Click a track label to pick the track",
                 avail(!self.clipboard.is_empty()),
             ),
             (
