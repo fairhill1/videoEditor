@@ -6,7 +6,7 @@
 //! the splitter handle and the popup over everything.
 
 use crate::canvas::Canvas;
-use crate::compose::Layer;
+use crate::compose::{self, Layer};
 use crate::fmt::{fmt_fps, format_timecode, truncate_to_width};
 use crate::input::DragMode;
 use crate::layout::{
@@ -18,6 +18,7 @@ use crate::state::State;
 use crate::theme::*;
 use crate::timeline::SourceId;
 use crate::ui::Rect;
+use crate::video;
 
 /// Draw a whole source's waveform into a box, one column per pixel of width.
 ///
@@ -182,6 +183,7 @@ impl State {
         ));
 
         let canvas = self.draw_preview(media_w, preview_w, preview_h, t);
+        self.preroll_cuts(t, canvas);
         // Before the timeline is drawn, so a page forward lands in this frame
         // rather than leaving the playhead off the edge for one.
         self.follow_playhead(t);
@@ -433,6 +435,26 @@ impl State {
         self.draw_title_edit_hint(canvas_y + canvas_h, media_w, preview_w);
 
         canvas
+    }
+
+    /// While playing, send a decoder ahead to every cut coming up, so the
+    /// clip after it is decoded and waiting when the playhead gets there
+    /// rather than seeking on this thread at the cut. See
+    /// [`crate::video::VideoStream::preroll`].
+    fn preroll_cuts(&mut self, t: f64, canvas: Canvas) {
+        if !self.audio.playing() {
+            return;
+        }
+        let entries =
+            compose::upcoming_entries(t, video::PREROLL_AHEAD, video::PREROLL_SAMPLES, |at| {
+                self.frame_layers(at, canvas)
+            });
+        for entry in entries {
+            if let Some(stream) = self.media.get_mut(entry.source).and_then(|s| s.stream.as_mut())
+            {
+                stream.preroll(entry.source_time, entry.before);
+            }
+        }
     }
 
     /// What the keyboard does while a title has the caret.

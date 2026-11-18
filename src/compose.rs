@@ -183,6 +183,71 @@ fn collect_layers<'a>(
     }
 }
 
+/// A clip that comes on screen shortly: which source it shows, and from where.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct Entry {
+    pub(crate) source: SourceId,
+    /// Time inside the source of the clip's first frame on screen.
+    pub(crate) source_time: f64,
+    /// Where the same source is showing just before the entry, if anywhere —
+    /// the place its decoder will be when the cut arrives.
+    pub(crate) before: Option<f64>,
+}
+
+/// How many halvings pin an entry down inside one sample step. A step of a
+/// quarter second halved twelve times is well under a millisecond, which is
+/// far finer than a frame.
+const ENTRY_SEARCH_STEPS: usize = 12;
+
+/// Every clip that comes on screen in `(t, t + ahead]`, found by sampling
+/// `layers` at `samples` evenly spaced times and narrowing down when each new
+/// clip first appears. Only the earliest entry per source is kept: that is the
+/// one a decoder has to be ready for first.
+///
+/// A clip shorter than one sample step can slip between samples; at the
+/// spacing the preview uses that is a few frames, which nobody cuts to.
+pub(crate) fn upcoming_entries(
+    t: f64,
+    ahead: f64,
+    samples: usize,
+    layers: impl Fn(f64) -> Vec<Layer>,
+) -> Vec<Entry> {
+    let mut seen: Vec<u32> = layers(t).iter().map(|l| l.clip).collect();
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut prev = t;
+    for k in 1..=samples.max(1) {
+        let at = t + ahead * k as f64 / samples.max(1) as f64;
+        for layer in layers(at) {
+            if seen.contains(&layer.clip) {
+                continue;
+            }
+            seen.push(layer.clip);
+            if entries.iter().any(|e| e.source == layer.source) {
+                continue;
+            }
+            // Absent at `lo`, present at `hi`.
+            let (mut lo, mut hi, mut first) = (prev, at, layer);
+            for _ in 0..ENTRY_SEARCH_STEPS {
+                let mid = 0.5 * (lo + hi);
+                match layers(mid).into_iter().find(|l| l.clip == layer.clip) {
+                    Some(l) => {
+                        hi = mid;
+                        first = l;
+                    }
+                    None => lo = mid,
+                }
+            }
+            let before = layers(lo)
+                .iter()
+                .find(|l| l.source == layer.source)
+                .map(|l| l.source_time);
+            entries.push(Entry { source: layer.source, source_time: first.source_time, before });
+        }
+        prev = at;
+    }
+    entries
+}
+
 impl State {
     /// Pixel dimensions of a source's picture, or `None` for one that has no
     /// picture — an audio-only import, or a file whose video stream failed to
@@ -477,5 +542,63 @@ mod tests {
             ..plain_layer()
         };
         assert_eq!(layer.visible_rect(1920, 1080), None);
+    }
+
+    /// The layers of one video track, as the preview would ask for them.
+    fn track_layers(track: &[Clip]) -> impl Fn(f64) -> Vec<Layer> + '_ {
+        move |t| {
+            layers_at([(TrackKind::Video, track)].into_iter(), t, canvas(), |_| Some((1920, 1080)))
+        }
+    }
+
+    #[test]
+    fn a_cut_to_another_file_is_seen_coming_with_its_in_point() {
+        let mut b = Clip { id: 1, ..clip(1, 12.0, 100.0) };
+        b.source_in = 17.0;
+        b.source_out = 117.0;
+        let track = [clip(0, 0.0, 12.0), b];
+        let entries = upcoming_entries(11.0, 2.0, 8, track_layers(&track));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, SourceId(1));
+        assert!((entries[0].source_time - 17.0).abs() < 1e-3);
+        assert_eq!(entries[0].before, None);
+    }
+
+    /// A jump within one file: the decoder showing it will be at the outgoing
+    /// clip's end when the cut arrives, which decides whether it can get there
+    /// on its own.
+    #[test]
+    fn a_jump_within_a_file_says_where_the_file_was_before_it() {
+        let mut b = Clip { id: 1, ..clip(0, 5.0, 5.0) };
+        b.source_in = 30.0;
+        b.source_out = 35.0;
+        let track = [clip(0, 0.0, 5.0), b];
+        let entries = upcoming_entries(4.5, 2.0, 8, track_layers(&track));
+        assert_eq!(entries.len(), 1);
+        assert!((entries[0].source_time - 30.0).abs() < 1e-3);
+        let before = entries[0].before.unwrap();
+        assert!((before - 5.0).abs() < 1e-3, "{before}");
+    }
+
+    #[test]
+    fn nothing_is_upcoming_while_one_clip_plays_on() {
+        let track = [clip(0, 0.0, 20.0)];
+        assert!(upcoming_entries(3.0, 2.0, 8, track_layers(&track)).is_empty());
+    }
+
+    /// Two clips of one file inside the look-ahead: the first to arrive is
+    /// the one its decoder must be ready for.
+    #[test]
+    fn only_the_first_entry_of_a_source_counts() {
+        let mut b = Clip { id: 1, ..clip(1, 1.0, 0.5) };
+        b.source_in = 10.0;
+        b.source_out = 10.5;
+        let mut c = Clip { id: 2, ..clip(1, 1.5, 5.0) };
+        c.source_in = 50.0;
+        c.source_out = 55.0;
+        let track = [clip(0, 0.0, 1.0), b, c];
+        let entries = upcoming_entries(0.5, 2.0, 8, track_layers(&track));
+        assert_eq!(entries.len(), 1);
+        assert!((entries[0].source_time - 10.0).abs() < 1e-3);
     }
 }

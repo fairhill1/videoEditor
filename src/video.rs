@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
@@ -9,26 +11,51 @@ use crate::quad::{QuadRenderer, Texture};
 const AV_TIME_BASE: f64 = 1_000_000.0;
 
 pub struct VideoStream {
-    ictx: ffmpeg::format::context::Input,
-    decoder: ffmpeg::decoder::Video,
+    /// Kept so a standby decoder can open the file again on its own thread.
+    path: String,
+    decoder: Decoder,
+    /// A second decoder for the same file, sent ahead to where the next cut
+    /// lands. See [`VideoStream::preroll`].
+    standby: Option<Standby>,
     scaler: ffmpeg::software::scaling::Context,
-    stream_index: usize,
-    time_base_seconds: f64,
     duration_seconds: f64,
     width: u32,
     height: u32,
     frame_rate: f64,
     texture: Texture,
     thumbnail: Texture,
-    /// The frames decoded most recently, so a step back can be answered
-    /// without going back to a keyframe. See [`Recent`].
-    recent: Recent<ffmpeg::frame::Video>,
     rgba_buf: Vec<u8>,
     scaled: ffmpeg::frame::Video,
     displayed_pts: Option<f64>,
     /// When the preview last asked for a frame, which is every frame while
     /// this stream is on screen. One that has gone quiet hands its cache back.
     last_used: Instant,
+}
+
+/// One place in a file: the demuxer, the codec, and the frames it decoded
+/// most recently. Everything here is safe to build on another thread and hand
+/// over, which is what a standby is.
+struct Decoder {
+    ictx: ffmpeg::format::context::Input,
+    decoder: ffmpeg::decoder::Video,
+    stream_index: usize,
+    time_base_seconds: f64,
+    /// The frames decoded most recently, so a step back can be answered
+    /// without going back to a keyframe. See [`Recent`].
+    recent: Recent<ffmpeg::frame::Video>,
+}
+
+/// A decoder being readied for a cut, or ready for it.
+struct Standby {
+    /// What it was sent to: a frame before the cut's in-point, so the in-point
+    /// itself is answered whichever side of a frame boundary it falls.
+    target: f64,
+    /// When a look-ahead last wanted it. One nobody has asked for in a while
+    /// is for a cut playback never reached.
+    asked: Instant,
+    /// Where its thread hands it over once it has arrived, or `None` if the
+    /// file would not open there.
+    ready: Receiver<Option<Decoder>>,
 }
 
 /// Short side of the baked media-pool thumbnail. The pool slot is a fixed
@@ -49,6 +76,10 @@ const RECENT_BYTES: usize = 192 << 20;
 /// which is what playing forward needs.
 const RECENT_MIN: usize = 2;
 
+/// What a standby keeps while it waits: the frames either side of its target
+/// and little more, since all it has to do is take over at one instant.
+const STANDBY_FRAMES: usize = 4;
+
 /// How long a stream can go without being shown before it gives its cache
 /// back. Long enough to outlast a hitch in rendering, short enough that a pool
 /// of clips that have each been on screen once doesn't sit on hundreds of
@@ -61,6 +92,16 @@ const RECENT_IDLE: Duration = Duration::from_secs(1);
 /// without making scrubs decode through the whole file).
 const FORWARD_DECODE_BUDGET: f64 = 1.0;
 
+/// How far ahead of the playhead the preview looks for cuts, in timeline
+/// seconds. A standby has this long to seek and decode up to its in-point —
+/// a whole GOP of a recording, which at 1440p can take most of a second on a
+/// machine that is also playing the clip before it.
+pub const PREROLL_AHEAD: f64 = 2.0;
+
+/// How many times across [`PREROLL_AHEAD`] the look-ahead samples the
+/// timeline. A clip shorter than the spacing can go unseen.
+pub const PREROLL_SAMPLES: usize = 8;
+
 impl VideoStream {
     pub fn open(
         path: &str,
@@ -68,16 +109,284 @@ impl VideoStream {
         queue: &wgpu::Queue,
         quads: &QuadRenderer,
     ) -> Result<Self, ffmpeg::Error> {
-        ffmpeg::init()?;
+        let (mut decoder, frame_rate) = Decoder::open(path)?;
 
-        let ictx = ffmpeg::format::input(&path)?;
-
-        let duration_raw = ictx.duration();
+        let duration_raw = decoder.ictx.duration();
         let duration_seconds = if duration_raw > 0 {
             duration_raw as f64 / AV_TIME_BASE
         } else {
             0.0
         };
+
+        let width = decoder.decoder.width();
+        let height = decoder.decoder.height();
+        let format = decoder.decoder.format();
+        let matrix = colorspace::matrix_for(decoder.decoder.color_space(), height);
+
+        let mut scaler = ffmpeg::software::scaling::Context::get(
+            format,
+            width,
+            height,
+            ffmpeg::format::Pixel::RGBA,
+            width,
+            height,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )?;
+        // Both scalers are built once per stream and never rebuilt, so the
+        // matrix set here holds for every frame.
+        if !colorspace::use_matrix(&mut scaler, matrix) {
+            log::warn!("{path}: preview kept the default colour matrix");
+        }
+
+        let texture =
+            quads.create_empty_texture(device, width, height, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+        let thumb_h = THUMB_HEIGHT.min(height).max(1);
+        let thumb_w =
+            ((thumb_h as f64 * width as f64 / height as f64).round() as u32).max(1);
+        let mut thumb_scaler = ffmpeg::software::scaling::Context::get(
+            format,
+            width,
+            height,
+            ffmpeg::format::Pixel::RGBA,
+            thumb_w,
+            thumb_h,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )?;
+        colorspace::use_matrix(&mut thumb_scaler, matrix);
+        let thumbnail = quads.create_empty_texture(
+            device,
+            thumb_w,
+            thumb_h,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
+        // Prime with the first frame so nothing flashes black at startup.
+        // Bake the pool thumbnail from the same frame — it's already decoded
+        // and we only need it once, so reusing it avoids a second seek/decode.
+        let first = decoder.decode_next_raw();
+        if let Some((frame, pts)) = first {
+            bake_thumbnail(queue, &mut thumb_scaler, &frame, thumb_w, thumb_h, &thumbnail);
+            decoder.recent.cap = recent_cap(&frame);
+            decoder.recent.push(frame, pts);
+        }
+
+        let mut stream = Self {
+            path: path.to_string(),
+            decoder,
+            standby: None,
+            scaler,
+            duration_seconds,
+            width,
+            height,
+            frame_rate,
+            texture,
+            thumbnail,
+            rgba_buf: vec![0u8; (width * height * 4) as usize],
+            scaled: ffmpeg::frame::Video::empty(),
+            displayed_pts: None,
+            last_used: Instant::now(),
+        };
+        stream.show(queue, 0);
+
+        Ok(stream)
+    }
+
+    /// Display the frame at `t` using whichever strategy is cheapest.
+    /// - `t` falls among the frames decoded recently — a step back, or a
+    ///   repeat of the same time while paused: show it from there.
+    /// - `t` is close ahead: let the decoder walk forward (cheap).
+    /// - a standby was sent to `t` ahead of a cut: take it over.
+    /// - anything else: seek.
+    /// This is the only entry point callers should use during playback/scrub;
+    /// it keeps per-frame decoder work bounded even under rapid seek requests.
+    pub fn goto(&mut self, queue: &wgpu::Queue, t: f64) {
+        self.last_used = Instant::now();
+        if !self.decoder.reaches(t) {
+            self.take_standby(t);
+        }
+        if let Some(i) = self.decoder.recent.covering(t) {
+            self.show(queue, i);
+        } else if self.decoder.reaches(t) {
+            self.decode_through(queue, t);
+        } else {
+            self.seek(queue, t);
+        }
+    }
+
+    /// Get a decoder ready, off the render thread, for a clip of this file
+    /// that comes on screen at `entry` in the source. `before` is where this
+    /// file is showing just before that, if it is.
+    ///
+    /// Without this, a cut to a clip whose in-point is anywhere but just ahead
+    /// of the decoder is a seek on the render thread at the moment of the cut:
+    /// back to the keyframe and forward through a GOP, which for a 1440p
+    /// recording is a visible stall. The standby does that work in the
+    /// seconds before, and [`Self::goto`] swaps it in when the cut arrives.
+    ///
+    /// Called every frame while playing, for every cut in the look-ahead; a
+    /// standby already sent to the same place is left to carry on.
+    pub fn preroll(&mut self, entry: f64, before: Option<f64>) {
+        let reachable = match before {
+            // On screen up to the cut: it will be where the outgoing clip
+            // ends, and can walk on from there if the in-point is just ahead.
+            Some(at) => entry >= at && entry <= at + FORWARD_DECODE_BUDGET,
+            // Off screen until the cut, so it will still be where it is now —
+            // unless it was on screen a moment ago and is still moving on.
+            None => {
+                self.last_used.elapsed() >= RECENT_IDLE && self.decoder.reaches(entry)
+            }
+        };
+        if reachable {
+            return;
+        }
+        let target = (entry - 1.0 / self.frame_rate).max(0.0);
+        if let Some(standby) = self.standby.as_mut() {
+            if (standby.target - target).abs() < 1e-3 {
+                standby.asked = Instant::now();
+                return;
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let path = self.path.clone();
+        let spawned = thread::Builder::new().name("video-preroll".into()).spawn(move || {
+            let decoder = Decoder::open(&path).ok().map(|(mut d, _)| {
+                d.recent.cap = STANDBY_FRAMES;
+                d.seek_through(target);
+                d
+            });
+            let _ = tx.send(decoder);
+        });
+        if spawned.is_err() {
+            return;
+        }
+        if let Some(old) = self.standby.take() {
+            drop_elsewhere(old);
+        }
+        self.standby = Some(Standby {
+            target,
+            asked: Instant::now(),
+            ready: rx,
+        });
+    }
+
+    /// Give back the cached frames behind the one on screen if nothing has
+    /// shown this stream for a while. The frame on screen and the one after it
+    /// stay, so playing on from here still doesn't have to seek. A standby no
+    /// look-ahead has wanted for as long goes too.
+    pub fn release_idle(&mut self) {
+        if self.standby.as_ref().is_some_and(|s| s.asked.elapsed() >= RECENT_IDLE) {
+            if let Some(old) = self.standby.take() {
+                drop_elsewhere(old);
+            }
+        }
+        if self.last_used.elapsed() < RECENT_IDLE {
+            return;
+        }
+        if let Some(shown) = self.displayed_pts {
+            self.decoder.recent.drop_before(shown);
+        }
+    }
+
+    pub fn texture(&self) -> &Texture {
+        &self.texture
+    }
+
+    pub fn thumbnail(&self) -> &Texture {
+        &self.thumbnail
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.duration_seconds
+    }
+
+    pub fn frame_rate(&self) -> f64 {
+        self.frame_rate
+    }
+
+    /// Make the standby the decoder, if it was sent to `t`. One still seeking
+    /// is waited for: it is partway through the seek this would otherwise
+    /// start from scratch.
+    fn take_standby(&mut self, t: f64) {
+        let Some(standby) = self.standby.take() else {
+            return;
+        };
+        if t < standby.target || t > standby.target + FORWARD_DECODE_BUDGET {
+            self.standby = Some(standby);
+            return;
+        }
+        let Some(mut decoder) = standby.ready.recv().ok().flatten() else {
+            return;
+        };
+        if !decoder.reaches(t) {
+            drop_elsewhere(decoder);
+            return;
+        }
+        decoder.recent.cap = self.decoder.recent.cap;
+        let old = std::mem::replace(&mut self.decoder, decoder);
+        drop_elsewhere(old);
+    }
+
+    /// Decode forward until the frame after `t` is in hand, then show the one
+    /// at `t`. Every frame decoded on the way goes into the cache, so stepping
+    /// back over them later costs nothing; only the one shown is converted and
+    /// uploaded.
+    fn decode_through(&mut self, queue: &wgpu::Queue, t: f64) {
+        self.decoder.decode_through(t);
+        if let Some(i) = self.decoder.recent.at_or_before(t) {
+            self.show(queue, i);
+        }
+    }
+
+    /// Seek to `t` seconds and display the frame containing `t` (frame-accurate:
+    /// the last frame with pts <= t, decoded forward from the keyframe before
+    /// it).
+    pub fn seek(&mut self, queue: &wgpu::Queue, t: f64) {
+        self.decoder.seek_through(t);
+        if let Some(i) = self.decoder.recent.at_or_before(t) {
+            self.show(queue, i);
+        }
+    }
+
+    /// Convert and upload cached frame `i`, unless it is already on screen.
+    fn show(&mut self, queue: &wgpu::Queue, i: usize) {
+        let Self { decoder, scaler, scaled, rgba_buf, texture, width, height, displayed_pts, .. } =
+            self;
+        let Some((frame, pts)) = decoder.recent.get(i) else {
+            return;
+        };
+        if *displayed_pts == Some(pts) {
+            return;
+        }
+        if scaler.run(frame, scaled).is_err() {
+            return;
+        }
+        let stride = scaled.stride(0);
+        let row_bytes = (*width * 4) as usize;
+        let src = scaled.data(0);
+        for y in 0..*height as usize {
+            rgba_buf[y * row_bytes..(y + 1) * row_bytes]
+                .copy_from_slice(&src[y * stride..y * stride + row_bytes]);
+        }
+        texture.write_region(queue, 0, 0, *width, *height, rgba_buf);
+        *displayed_pts = Some(pts);
+    }
+}
+
+impl Decoder {
+    /// Open the best video stream in `path`, with its frame rate.
+    fn open(path: &str) -> Result<(Self, f64), ffmpeg::Error> {
+        ffmpeg::init()?;
+
+        let ictx = ffmpeg::format::input(&path)?;
 
         let (stream_index, time_base_seconds, parameters, frame_rate) = {
             let input = ictx
@@ -111,148 +420,30 @@ impl VideoStream {
         });
         let decoder = ctx.decoder().video()?;
 
-        let width = decoder.width();
-        let height = decoder.height();
-        let matrix = colorspace::matrix_for(decoder.color_space(), height);
-
-        let mut scaler = ffmpeg::software::scaling::Context::get(
-            decoder.format(),
-            width,
-            height,
-            ffmpeg::format::Pixel::RGBA,
-            width,
-            height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )?;
-        // Both scalers are built once per stream and never rebuilt, so the
-        // matrix set here holds for every frame.
-        if !colorspace::use_matrix(&mut scaler, matrix) {
-            log::warn!("{path}: preview kept the default colour matrix");
-        }
-
-        let texture =
-            quads.create_empty_texture(device, width, height, wgpu::TextureFormat::Rgba8UnormSrgb);
-
-        let thumb_h = THUMB_HEIGHT.min(height).max(1);
-        let thumb_w =
-            ((thumb_h as f64 * width as f64 / height as f64).round() as u32).max(1);
-        let mut thumb_scaler = ffmpeg::software::scaling::Context::get(
-            decoder.format(),
-            width,
-            height,
-            ffmpeg::format::Pixel::RGBA,
-            thumb_w,
-            thumb_h,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )?;
-        colorspace::use_matrix(&mut thumb_scaler, matrix);
-        let thumbnail = quads.create_empty_texture(
-            device,
-            thumb_w,
-            thumb_h,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        );
-
-        let mut stream = Self {
-            ictx,
-            decoder,
-            scaler,
-            stream_index,
-            time_base_seconds,
-            duration_seconds,
-            width,
-            height,
+        Ok((
+            Self {
+                ictx,
+                decoder,
+                stream_index,
+                time_base_seconds,
+                recent: Recent::new(RECENT_MIN),
+            },
             frame_rate,
-            texture,
-            thumbnail,
-            recent: Recent::new(RECENT_MIN),
-            rgba_buf: vec![0u8; (width * height * 4) as usize],
-            scaled: ffmpeg::frame::Video::empty(),
-            displayed_pts: None,
-            last_used: Instant::now(),
-        };
-
-        // Prime with the first frame so nothing flashes black at startup.
-        // Bake the pool thumbnail from the same frame — it's already decoded
-        // and we only need it once, so reusing it avoids a second seek/decode.
-        if let Some((frame, pts)) = stream.decode_next_raw() {
-            bake_thumbnail(
-                queue,
-                &mut thumb_scaler,
-                &frame,
-                thumb_w,
-                thumb_h,
-                &stream.thumbnail,
-            );
-            stream.recent.cap = recent_cap(&frame);
-            stream.recent.push(frame, pts);
-            stream.show(queue, 0);
-        }
-
-        Ok(stream)
+        ))
     }
 
-    /// Display the frame at `t` using whichever strategy is cheapest.
-    /// - `t` falls among the frames decoded recently — a step back, or a
-    ///   repeat of the same time while paused: show it from there.
-    /// - `t` is close ahead: let the decoder walk forward (cheap).
-    /// - anything else: seek.
-    /// This is the only entry point callers should use during playback/scrub;
-    /// it keeps per-frame decoder work bounded even under rapid seek requests.
-    pub fn goto(&mut self, queue: &wgpu::Queue, t: f64) {
-        self.last_used = Instant::now();
-        if let Some(i) = self.recent.covering(t) {
-            self.show(queue, i);
-            return;
-        }
-        match self.recent.newest_pts() {
-            Some(newest) if t >= newest && t <= newest + FORWARD_DECODE_BUDGET => {
-                self.decode_through(queue, t)
-            }
-            _ => self.seek(queue, t),
-        }
+    /// Whether `t` can be shown without a seek: it is among the recent frames,
+    /// or close enough ahead to decode forward to.
+    fn reaches(&self, t: f64) -> bool {
+        self.recent.covering(t).is_some()
+            || self
+                .recent
+                .newest_pts()
+                .is_some_and(|newest| t >= newest && t <= newest + FORWARD_DECODE_BUDGET)
     }
 
-    /// Give back the cached frames behind the one on screen if nothing has
-    /// shown this stream for a while. The frame on screen and the one after it
-    /// stay, so playing on from here still doesn't have to seek.
-    pub fn release_idle(&mut self) {
-        if self.last_used.elapsed() < RECENT_IDLE {
-            return;
-        }
-        if let Some(shown) = self.displayed_pts {
-            self.recent.drop_before(shown);
-        }
-    }
-    pub fn texture(&self) -> &Texture {
-        &self.texture
-    }
-
-    pub fn thumbnail(&self) -> &Texture {
-        &self.thumbnail
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    pub fn duration(&self) -> f64 {
-        self.duration_seconds
-    }
-
-    pub fn frame_rate(&self) -> f64 {
-        self.frame_rate
-    }
-
-    /// Decode forward until the frame after `t` is in hand, then show the one
-    /// at `t`. Every frame decoded on the way goes into the cache, so stepping
-    /// back over them later costs nothing; only the one shown is converted and
-    /// uploaded.
-    fn decode_through(&mut self, queue: &wgpu::Queue, t: f64) {
+    /// Decode forward until the frame after `t` is in hand.
+    fn decode_through(&mut self, t: f64) {
         while self.recent.newest_pts().is_none_or(|newest| newest <= t) {
             match self.decode_next_raw() {
                 Some((frame, pts)) => self.recent.push(frame, pts),
@@ -260,15 +451,10 @@ impl VideoStream {
                 None => break,
             }
         }
-        if let Some(i) = self.recent.at_or_before(t) {
-            self.show(queue, i);
-        }
     }
 
-    /// Seek to `t` seconds and display the frame containing `t` (frame-accurate:
-    /// the last frame with pts <= t, decoded forward from the keyframe before
-    /// it).
-    pub fn seek(&mut self, queue: &wgpu::Queue, t: f64) {
+    /// Seek to the keyframe at or before `t` and decode forward through it.
+    fn seek_through(&mut self, t: f64) {
         let ts = (t.max(0.0) * AV_TIME_BASE) as i64;
         // The keyframe at or before `t`; failing that, the nearest one.
         if self.ictx.seek(ts, ..ts).is_err() {
@@ -276,31 +462,7 @@ impl VideoStream {
         }
         self.decoder.flush();
         self.recent.clear();
-        self.decode_through(queue, t);
-    }
-
-    /// Convert and upload cached frame `i`, unless it is already on screen.
-    fn show(&mut self, queue: &wgpu::Queue, i: usize) {
-        let Self { recent, scaler, scaled, rgba_buf, texture, width, height, displayed_pts, .. } =
-            self;
-        let Some((frame, pts)) = recent.get(i) else {
-            return;
-        };
-        if *displayed_pts == Some(pts) {
-            return;
-        }
-        if scaler.run(frame, scaled).is_err() {
-            return;
-        }
-        let stride = scaled.stride(0);
-        let row_bytes = (*width * 4) as usize;
-        let src = scaled.data(0);
-        for y in 0..*height as usize {
-            rgba_buf[y * row_bytes..(y + 1) * row_bytes]
-                .copy_from_slice(&src[y * stride..y * stride + row_bytes]);
-        }
-        texture.write_region(queue, 0, 0, *width, *height, rgba_buf);
-        *displayed_pts = Some(pts);
+        self.decode_through(t);
     }
 
     fn decode_next_raw(&mut self) -> Option<(ffmpeg::frame::Video, f64)> {
@@ -331,6 +493,13 @@ impl VideoStream {
             }
         }
     }
+}
+
+/// Drop a decoder, or anything holding one, on a thread of its own. Closing
+/// a frame-threaded codec joins its worker threads, which is not a wait the
+/// render thread should take in the middle of a cut.
+fn drop_elsewhere<T: Send + 'static>(value: T) {
+    let _ = thread::Builder::new().name("video-drop".into()).spawn(move || drop(value));
 }
 
 fn bake_thumbnail(
@@ -479,6 +648,41 @@ mod tests {
         let r = run(100);
         assert_eq!(r.at_or_before(-1.0), Some(0));
         assert_eq!(r.at_or_before(5.0), Some(9));
+    }
+
+    /// A standby readied on another thread, the way a look-ahead sends one,
+    /// arrives able to show the in-point without a seek, and shows the frame
+    /// a seek straight to it would have.
+    #[test]
+    fn a_standby_arrives_at_its_in_point() {
+        let Ok(list) = std::env::var("RUVE_TEST_MEDIA") else {
+            eprintln!("RUVE_TEST_MEDIA unset; skipping");
+            return;
+        };
+        let path = list.split(',').next().unwrap().to_string();
+        let (mut direct, fps) = Decoder::open(&path).unwrap();
+        let entry = (direct.ictx.duration() as f64 / AV_TIME_BASE * 0.5).max(0.0);
+        let started = Instant::now();
+        direct.seek_through(entry);
+        eprintln!("seeking to {entry:.3}s on the spot took {:?}", started.elapsed());
+        let want = direct.recent.get(direct.recent.at_or_before(entry).unwrap()).unwrap().1;
+
+        let target = (entry - 1.0 / fps).max(0.0);
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        thread::spawn(move || {
+            let (mut d, _) = Decoder::open(&p).unwrap();
+            d.recent.cap = STANDBY_FRAMES;
+            d.seek_through(target);
+            tx.send(d).unwrap();
+        });
+        let mut standby = rx.recv().unwrap();
+        assert!(standby.reaches(entry));
+        let started = Instant::now();
+        standby.decode_through(entry);
+        let got = standby.recent.get(standby.recent.at_or_before(entry).unwrap()).unwrap().1;
+        eprintln!("taking over at {entry:.3}s decoded in {:?}", started.elapsed());
+        assert_eq!(got, want);
     }
 
     #[test]
