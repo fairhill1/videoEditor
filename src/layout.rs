@@ -1753,6 +1753,16 @@ impl State {
         let cursor_t = layout.cursor_to_t(cursor_x);
         let track = &self.timeline.tracks[track_idx];
         let lane_y = self.lane_top(track_idx, &layout);
+        let spans = || {
+            track
+                .clips
+                .iter()
+                .map(|c| (layout.t_to_x(c.timeline_start), layout.t_to_x(c.timeline_end())))
+        };
+        // Near any clip's edge is a trim, even over another clip's body: a
+        // clip dragged to overlap the one before it has its start inside that
+        // clip, and the press that would pull it back out has to reach it.
+        let edge = trim_edge_at(cursor_x, spans());
         for (i, clip) in track.clips.iter().enumerate() {
             let x0 = layout.t_to_x(clip.timeline_start);
             let x1 = layout.t_to_x(clip.timeline_end());
@@ -1789,7 +1799,7 @@ impl State {
                 }
             }
             // Near an edge is a trim, settled once every clip has been seen.
-            if (cursor_x - x0).abs().min((cursor_x - x1).abs()) <= CLIP_EDGE_GRAB_PX {
+            if edge.is_some() {
                 continue;
             }
             if cursor_x >= x0 && cursor_x <= x1 {
@@ -1811,11 +1821,7 @@ impl State {
                 };
             }
         }
-        let spans = track
-            .clips
-            .iter()
-            .map(|c| (layout.t_to_x(c.timeline_start), layout.t_to_x(c.timeline_end())));
-        match trim_edge_at(cursor_x, spans) {
+        match edge {
             Some((idx, FadeSide::In)) => TimelineHit::ClipTrimLeft { track: track_idx, idx },
             Some((idx, FadeSide::Out)) => TimelineHit::ClipTrimRight { track: track_idx, idx },
             None => TimelineHit::Lane,
@@ -2292,6 +2298,18 @@ mod tests {
         // A lone edge still reaches a little outside its clip.
         assert_eq!(trim_edge_at(204.0, spans), Some((1, FadeSide::Out)));
         assert_eq!(trim_edge_at(150.0, spans), None);
+    }
+
+    #[test]
+    fn a_clip_overlapping_the_one_before_can_be_trimmed_by_its_start() {
+        // Dragged back so its start lies inside the earlier clip's body,
+        // nowhere near that clip's own edges: either side of the start trims
+        // the later clip.
+        let spans = [(0.0, 200.0), (150.0, 300.0)];
+        assert_eq!(trim_edge_at(153.0, spans), Some((1, FadeSide::In)));
+        assert_eq!(trim_edge_at(147.0, spans), Some((1, FadeSide::In)));
+        // The earlier clip's end, inside the later one, trims the earlier.
+        assert_eq!(trim_edge_at(198.0, spans), Some((0, FadeSide::Out)));
     }
 
     #[test]
