@@ -35,6 +35,10 @@ pub(super) struct VideoTake {
     pub(super) decoder: codec::decoder::Video,
     pub(super) stream_index: usize,
     pub(super) time_base_seconds: f64,
+    /// Told the decoder the file has run out, so it gives up the frames it
+    /// holds back: without that a render freezes on the last few of a clip
+    /// that runs to the end of its file.
+    pub(super) drained: bool,
     pub(super) width: u32,
     pub(super) height: u32,
     /// Whatever the last picture was scaled into place with. Rebuilt through
@@ -108,6 +112,7 @@ impl VideoTake {
             decoder,
             stream_index,
             time_base_seconds,
+            drained: false,
             scaler: None,
             native_scaler: None,
             pending: None,
@@ -260,6 +265,7 @@ impl VideoTake {
         let ts = (t.max(0.0) * 1_000_000.0) as i64;
         let _ = self.ictx.seek(ts, ..);
         self.decoder.flush();
+        self.drained = false;
         self.pending = None;
         self.due = None;
         self.staged_for = None;
@@ -302,11 +308,15 @@ impl VideoTake {
                     let pts = frame.pts().unwrap_or(0) as f64 * self.time_base_seconds;
                     return Some((frame, pts));
                 }
+                Err(_) if self.drained => return None,
                 Err(_) => match self.next_packet() {
                     Some(packet) => {
                         let _ = self.decoder.send_packet(&packet);
                     }
-                    None => return None,
+                    None => {
+                        let _ = self.decoder.send_eof();
+                        self.drained = true;
+                    }
                 },
             }
         }

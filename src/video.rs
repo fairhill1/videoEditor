@@ -40,6 +40,11 @@ struct Decoder {
     decoder: ffmpeg::decoder::Video,
     stream_index: usize,
     time_base_seconds: f64,
+    /// Told the decoder the file has run out. It holds frames back to put
+    /// them in order, and one a thread when decoding on several, and gives
+    /// them up only once it has been told: without that the last of the
+    /// file never comes out and the picture freezes short of the end.
+    drained: bool,
     /// The frames decoded most recently, so a step back can be answered
     /// without going back to a keyframe. See [`Recent`].
     recent: Recent<ffmpeg::frame::Video>,
@@ -426,6 +431,7 @@ impl Decoder {
                 decoder,
                 stream_index,
                 time_base_seconds,
+                drained: false,
                 recent: Recent::new(RECENT_MIN),
             },
             frame_rate,
@@ -461,6 +467,7 @@ impl Decoder {
             let _ = self.ictx.seek(ts, ..);
         }
         self.decoder.flush();
+        self.drained = false;
         self.recent.clear();
         self.decode_through(t);
     }
@@ -474,11 +481,15 @@ impl Decoder {
                     let pts_sec = pts as f64 * self.time_base_seconds;
                     return Some((frame, pts_sec));
                 }
+                Err(_) if self.drained => return None,
                 Err(_) => match self.next_video_packet() {
                     Some(packet) => {
                         let _ = self.decoder.send_packet(&packet);
                     }
-                    None => return None,
+                    None => {
+                        let _ = self.decoder.send_eof();
+                        self.drained = true;
+                    }
                 },
             }
         }
@@ -648,6 +659,39 @@ mod tests {
         let r = run(100);
         assert_eq!(r.at_or_before(-1.0), Some(0));
         assert_eq!(r.at_or_before(5.0), Some(9));
+    }
+
+    /// Decoding to the end of a file gives up every frame in it, the ones
+    /// the decoder holds back included: the last frame out is the file's
+    /// last, not one a few frames short of it that the picture freezes on.
+    #[test]
+    fn decoding_to_the_end_reaches_the_last_frame() {
+        let Ok(list) = std::env::var("RUVE_TEST_MEDIA") else {
+            eprintln!("RUVE_TEST_MEDIA unset; skipping");
+            return;
+        };
+        for path in list.split(',') {
+            let (mut d, _) = Decoder::open(path).unwrap();
+            // The last frame in the file, by its packets: those marked to be
+            // decoded and thrown away, as a recording can end on, show nothing.
+            let mut ictx = ffmpeg::format::input(&path).unwrap();
+            let last = ictx
+                .packets()
+                .filter(|(s, _)| s.index() == d.stream_index)
+                .filter(|(_, p)| {
+                    use ffmpeg::packet::Ref;
+                    // SAFETY: reads a field of a packet held for the call.
+                    unsafe { (*p.as_ptr()).flags & ffmpeg::ffi::AV_PKT_FLAG_DISCARD == 0 }
+                })
+                .filter_map(|(_, p)| p.pts())
+                .max()
+                .unwrap() as f64
+                * d.time_base_seconds;
+            d.seek_through((last - 1.0).max(0.0));
+            d.decode_through(last + 10.0);
+            let newest = d.recent.newest_pts().unwrap();
+            assert!((newest - last).abs() < 1e-6, "{path}: ended at {newest:.4}s, the file at {last:.4}s");
+        }
     }
 
     /// A standby readied on another thread, the way a look-ahead sends one,
