@@ -90,9 +90,17 @@ impl VideoTake {
                 stream.parameters(),
             )
         };
-        let decoder = codec::context::Context::from_parameters(parameters)?
-            .decoder()
-            .video()?;
+        let mut ctx = codec::context::Context::from_parameters(parameters)?;
+        // The render loop is serial, so every millisecond spent decoding is
+        // one x264 is left waiting for its next frame. On one core a 1440p60
+        // HEVC frame takes ~18ms, which made a 10s export 20% slower than the
+        // encoder alone; frame threading on every core brings it to ~3ms. See
+        // `VideoStream::open`, which does the same for the preview.
+        ctx.set_threading(codec::threading::Config {
+            kind: codec::threading::Type::Frame,
+            count: 0,
+        });
+        let decoder = ctx.decoder().video()?;
         Ok(Self {
             width: decoder.width(),
             height: decoder.height(),
