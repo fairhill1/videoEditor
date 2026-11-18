@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_next as ffmpeg;
@@ -434,10 +435,22 @@ struct Shared {
     /// Interleaved stereo f32 at `SAMPLE_RATE`.
     buffer: VecDeque<f32>,
     /// Timeline time of the next sample the cpal callback will consume.
-    /// Advances in real time when `playing`, and is the master clock everyone
-    /// else (video render, scrub) reads.
+    /// Advances in real time when `playing`. Not what is being heard: the
+    /// device still has its own queue to play before it gets there. See
+    /// [`heard`].
     consume_t: f64,
     playing: bool,
+    /// The last block handed to the device while playing: the timeline time
+    /// of its first sample, and when the device says that sample reaches the
+    /// speaker. `None` until the first block after a start or a jump.
+    anchor: Option<(f64, Instant)>,
+    /// Where playback started, or was last moved to while playing. Nothing
+    /// before it is heard, so the clock does not run back to before it while
+    /// the device's queue is still playing out.
+    play_from: f64,
+    /// The device's queue as of its last block, in seconds: how far the
+    /// picture is held back to meet the sound. Kept to be logged.
+    delay: f64,
     /// While stopped: the buffer holds a scrub grain for the callback to
     /// play out, without moving the clock.
     grain: bool,
@@ -453,6 +466,8 @@ pub struct AudioEngine {
     _stream: Option<cpal::Stream>,
     shared: Arc<Mutex<Shared>>,
     voices: Mutex<Voices>,
+    /// The device delay last logged, in whole milliseconds.
+    logged_delay: Mutex<i64>,
 }
 
 impl AudioEngine {
@@ -461,6 +476,9 @@ impl AudioEngine {
             buffer: VecDeque::with_capacity(SAMPLE_RATE as usize * CHANNELS),
             consume_t: 0.0,
             playing: false,
+            anchor: None,
+            play_from: 0.0,
+            delay: 0.0,
             grain: false,
             grain_at: f64::NAN,
         }));
@@ -477,6 +495,7 @@ impl AudioEngine {
             _stream: stream,
             shared,
             voices: Mutex::new(Voices::default()),
+            logged_delay: Mutex::new(0),
         }
     }
 
@@ -546,12 +565,20 @@ impl AudioEngine {
         let stream = device
             .build_output_stream(
                 config,
-                move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let mut shared = shared_cb.lock().unwrap();
                     let grain = !shared.playing && shared.grain;
                     if !shared.playing && !grain {
                         out.fill(0.0);
                         return;
+                    }
+                    if !grain {
+                        // This block is heard once the device has played what
+                        // it already holds; the picture waits for it.
+                        let stamp = info.timestamp();
+                        let delay = stamp.playback.duration_since(stamp.callback);
+                        shared.anchor = Some((shared.consume_t, Instant::now() + delay));
+                        shared.delay = delay.as_secs_f64();
                     }
                     for frame_slot in out.chunks_mut(device_channels) {
                         if !primed {
@@ -601,8 +628,10 @@ impl AudioEngine {
         Ok(stream)
     }
 
+    /// The playhead: while playing, the timeline time being heard right now,
+    /// which is what the picture has to show to stay in sync with it.
     pub fn position(&self) -> f64 {
-        self.shared.lock().unwrap().consume_t
+        heard(&self.shared.lock().unwrap(), Instant::now())
     }
 
     /// Jump the playhead. Drops any pre-mixed samples so the next `tick` refills
@@ -615,6 +644,8 @@ impl AudioEngine {
     pub fn set_position(&self, t: f64) {
         let mut shared = self.shared.lock().unwrap();
         shared.consume_t = t.max(0.0);
+        shared.play_from = shared.consume_t;
+        shared.anchor = None;
         if !shared.grain {
             shared.buffer.clear();
         }
@@ -638,7 +669,18 @@ impl AudioEngine {
     /// Stopping drops what was mixed ahead. So does starting over the end of
     /// a scrub grain: the rest of the grain is from wherever the drag was,
     /// not from where playback begins.
+    ///
+    /// Stopping parks the clock on what was last heard, not on what was last
+    /// handed to the device, or the playhead would jump on by the device's
+    /// queue as playback stops.
     fn start_or_stop(shared: &mut Shared, playing: bool) {
+        if shared.playing && !playing {
+            shared.consume_t = heard(shared, Instant::now());
+        }
+        if playing && !shared.playing {
+            shared.play_from = shared.consume_t;
+        }
+        shared.anchor = None;
         if !playing || shared.grain {
             shared.buffer.clear();
         }
@@ -687,6 +729,13 @@ impl AudioEngine {
             // The buffer is a grain's until it has played out.
             if shared.grain {
                 return;
+            }
+            // From here rather than the audio thread, which must not block.
+            let ms = (shared.delay * 1000.0).round() as i64;
+            let mut logged = self.logged_delay.lock().unwrap();
+            if (ms - *logged).abs() >= 10 {
+                log::info!("audio output delay {ms} ms; the picture is held back to match");
+                *logged = ms;
             }
             let target = (TARGET_BUFFER_SEC * SAMPLE_RATE as f64) as usize * CHANNELS;
             let have = shared.buffer.len();
@@ -756,6 +805,25 @@ impl AudioEngine {
             fill_t += (chunk / CHANNELS) as f64 / SAMPLE_RATE as f64;
         }
     }
+}
+
+/// The timeline time being heard at `now`. Stopped, that is the playhead
+/// itself. Playing, it runs on from the last block the device took, at the
+/// moment the device said that block would sound: never back before where
+/// playback began, nor past what the device has been given.
+fn heard(shared: &Shared, now: Instant) -> f64 {
+    if !shared.playing {
+        return shared.consume_t;
+    }
+    let Some((t0, at)) = shared.anchor else {
+        return shared.play_from;
+    };
+    let since = if now >= at {
+        now.duration_since(at).as_secs_f64()
+    } else {
+        -at.duration_since(now).as_secs_f64()
+    };
+    (t0 + since).max(shared.play_from).min(shared.consume_t)
 }
 
 /// Fade a grain in and out over [`GRAIN_FADE_SEC`] at each end, so cutting it
@@ -888,6 +956,50 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playing_from(t: f64) -> Shared {
+        Shared {
+            buffer: VecDeque::new(),
+            consume_t: t,
+            playing: true,
+            anchor: None,
+            play_from: t,
+            delay: 0.0,
+            grain: false,
+            grain_at: f64::NAN,
+        }
+    }
+
+    /// The picture shows what is being heard, not what was last handed to
+    /// the device: a block given over now at 10s, which the device will play
+    /// in 150ms, is not heard yet.
+    #[test]
+    fn the_clock_runs_behind_the_device_queue() {
+        let now = Instant::now();
+        let mut shared = playing_from(10.0);
+        assert_eq!(heard(&shared, now), 10.0, "nothing handed over yet");
+        // A 20ms block from 10s, sounding in 150ms.
+        shared.anchor = Some((10.0, now + std::time::Duration::from_millis(150)));
+        shared.consume_t = 10.02;
+        assert_eq!(heard(&shared, now), 10.0, "held at the start until it sounds");
+        let later = now + std::time::Duration::from_millis(160);
+        assert!((heard(&shared, later) - 10.01).abs() < 1e-6);
+        // Never past what the device was given.
+        let much_later = now + std::time::Duration::from_secs(1);
+        assert_eq!(heard(&shared, much_later), 10.02);
+    }
+
+    /// Stopping parks the playhead on what was heard, so it does not jump on
+    /// by the device's queue.
+    #[test]
+    fn stopping_parks_on_what_was_heard() {
+        let mut shared = playing_from(5.0);
+        shared.consume_t = 5.5;
+        shared.anchor = Some((5.48, Instant::now() + std::time::Duration::from_secs(10)));
+        AudioEngine::start_or_stop(&mut shared, false);
+        assert!(!shared.playing);
+        assert_eq!(shared.consume_t, 5.0);
+    }
 
     /// A grain starts and ends silent, so it does not click, and is untouched
     /// between its fades.
