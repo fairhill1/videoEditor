@@ -28,6 +28,13 @@ const RESEEK_THRESHOLD_SEC: f64 = 0.030;
 // How far before its target a seek starts decoding. Comfortably more than the
 // one or two frames a decoder needs to warm up after a jump.
 const SEEK_PREROLL_SEC: f64 = 0.2;
+// How long a scrub grain lasts: the sound a drag of the playhead plays at
+// each place it passes. Long enough to tell a word or a beat from a hiss,
+// short enough that a quick drag still sounds like it is moving.
+const GRAIN_SEC: f64 = 0.08;
+// The fade at each end of a grain. A grain is cut out of the middle of the
+// sound, and starting or stopping it on a hard edge clicks.
+const GRAIN_FADE_SEC: f64 = 0.004;
 
 // Peaks per second baked into the waveform summary. 50 Hz ≈ one peak every
 // 20ms, fine-grained enough that transients are visible at any practical zoom
@@ -431,6 +438,12 @@ struct Shared {
     /// else (video render, scrub) reads.
     consume_t: f64,
     playing: bool,
+    /// While stopped: the buffer holds a scrub grain for the callback to
+    /// play out, without moving the clock.
+    grain: bool,
+    /// Where the last grain was taken, so a playhead held still under the
+    /// pointer goes quiet rather than repeating itself.
+    grain_at: f64,
 }
 
 /// Owns the cpal output stream and the mixer. The cpal callback on the audio
@@ -448,6 +461,8 @@ impl AudioEngine {
             buffer: VecDeque::with_capacity(SAMPLE_RATE as usize * CHANNELS),
             consume_t: 0.0,
             playing: false,
+            grain: false,
+            grain_at: f64::NAN,
         }));
 
         let stream = match Self::build_stream(&shared) {
@@ -533,7 +548,8 @@ impl AudioEngine {
                 config,
                 move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     let mut shared = shared_cb.lock().unwrap();
-                    if !shared.playing {
+                    let grain = !shared.playing && shared.grain;
+                    if !shared.playing && !grain {
                         out.fill(0.0);
                         return;
                     }
@@ -562,6 +578,13 @@ impl AudioEngine {
                             *extra = 0.0;
                         }
                     }
+                    // A grain plays where the playhead stands; it does not move it.
+                    if grain {
+                        if shared.buffer.is_empty() {
+                            shared.grain = false;
+                        }
+                        return;
+                    }
                     // Advance by the whole block duration — if we underran and
                     // wrote silence, time still marched on. Counted in device
                     // seconds, which is what the listener hears however many
@@ -585,10 +608,16 @@ impl AudioEngine {
     /// Jump the playhead. Drops any pre-mixed samples so the next `tick` refills
     /// from the new time — scrub/seek should feel immediate, not drift through
     /// 150ms of stale buffer.
+    ///
+    /// A scrub grain still sounding is left to finish: a drag moves the
+    /// playhead every frame, and cutting each grain off there would leave
+    /// nothing but clicks.
     pub fn set_position(&self, t: f64) {
         let mut shared = self.shared.lock().unwrap();
         shared.consume_t = t.max(0.0);
-        shared.buffer.clear();
+        if !shared.grain {
+            shared.buffer.clear();
+        }
     }
 
     pub fn playing(&self) -> bool {
@@ -597,18 +626,53 @@ impl AudioEngine {
 
     pub fn set_playing(&self, playing: bool) {
         let mut shared = self.shared.lock().unwrap();
-        shared.playing = playing;
-        if !playing {
-            shared.buffer.clear();
-        }
+        Self::start_or_stop(&mut shared, playing);
     }
 
     pub fn toggle(&self) {
         let mut shared = self.shared.lock().unwrap();
-        shared.playing = !shared.playing;
-        if !shared.playing {
+        let playing = !shared.playing;
+        Self::start_or_stop(&mut shared, playing);
+    }
+
+    /// Stopping drops what was mixed ahead. So does starting over the end of
+    /// a scrub grain: the rest of the grain is from wherever the drag was,
+    /// not from where playback begins.
+    fn start_or_stop(shared: &mut Shared, playing: bool) {
+        if !playing || shared.grain {
             shared.buffer.clear();
         }
+        shared.grain = false;
+        shared.playing = playing;
+    }
+
+    /// Sound a drag of the playhead: a short grain from where it now stands,
+    /// once the last grain has finished and the playhead has moved since. One
+    /// at a time and back to back, so a steady drag plays the timeline in
+    /// pieces as the hand goes, and a held one goes quiet.
+    pub fn scrub(&self, tracks: &[Vec<Clip>], media: &mut MediaPool) {
+        let t = {
+            let shared = self.shared.lock().unwrap();
+            if shared.playing || shared.grain || shared.consume_t == shared.grain_at {
+                return;
+            }
+            shared.consume_t
+        };
+        let frames = (GRAIN_SEC * SAMPLE_RATE as f64) as usize;
+        let mut grain = vec![0.0f32; frames * CHANNELS];
+        self.mix_at(t, tracks, media, &mut grain);
+        shape_grain(&mut grain);
+        let mut shared = self.shared.lock().unwrap();
+        // Started playing, or moved again, while the grain was being mixed:
+        // it is a grain from somewhere else now, and the next frame takes
+        // another.
+        if shared.playing || shared.consume_t != t {
+            return;
+        }
+        shared.buffer.clear();
+        shared.buffer.extend(grain);
+        shared.grain = true;
+        shared.grain_at = t;
     }
 
     /// Refill the output buffer up to `TARGET_BUFFER_SEC` ahead of the current
@@ -618,8 +682,12 @@ impl AudioEngine {
     /// inside its compound clips, already on the timeline's clock — see
     /// [`crate::timeline::flatten_audio`].
     pub fn tick(&self, tracks: &[Vec<Clip>], media: &mut MediaPool) {
-        let (mut fill_t, to_produce) = {
+        let (fill_t, to_produce) = {
             let shared = self.shared.lock().unwrap();
+            // The buffer is a grain's until it has played out.
+            if shared.grain {
+                return;
+            }
             let target = (TARGET_BUFFER_SEC * SAMPLE_RATE as f64) as usize * CHANNELS;
             let have = shared.buffer.len();
             let need = target.saturating_sub(have);
@@ -633,6 +701,19 @@ impl AudioEngine {
         }
 
         let mut mix = vec![0.0f32; to_produce];
+        self.mix_at(fill_t, tracks, media, &mut mix);
+
+        let mut shared = self.shared.lock().unwrap();
+        // A grain taken while this was mixing owns the buffer now.
+        if !shared.grain {
+            shared.buffer.extend(mix.iter().copied());
+        }
+    }
+
+    /// Mix every audio clip live from timeline time `fill_t` into `mix`,
+    /// interleaved stereo, as long as `mix` is.
+    fn mix_at(&self, mut fill_t: f64, tracks: &[Vec<Clip>], media: &mut MediaPool, mix: &mut [f32]) {
+        let to_produce = mix.len();
         let mut scratch = vec![0.0f32; MIX_CHUNK_FRAMES * CHANNELS];
         let mut voices = self.voices.lock().unwrap();
         voices.begin_round();
@@ -674,9 +755,20 @@ impl AudioEngine {
             cursor += chunk;
             fill_t += (chunk / CHANNELS) as f64 / SAMPLE_RATE as f64;
         }
+    }
+}
 
-        let mut shared = self.shared.lock().unwrap();
-        shared.buffer.extend(mix.iter().copied());
+/// Fade a grain in and out over [`GRAIN_FADE_SEC`] at each end, so cutting it
+/// out of the middle of a sound does not click.
+fn shape_grain(grain: &mut [f32]) {
+    let frames = grain.len() / CHANNELS;
+    let fade = ((GRAIN_FADE_SEC * SAMPLE_RATE as f64) as usize).min(frames / 2).max(1);
+    for (i, frame) in grain.chunks_mut(CHANNELS).enumerate() {
+        let edge = i.min(frames - 1 - i);
+        if edge < fade {
+            let gain = edge as f32 / fade as f32;
+            frame.iter_mut().for_each(|s| *s *= gain);
+        }
     }
 }
 
@@ -796,6 +888,21 @@ pub fn build_waveform(path: &str) -> Result<Option<Waveform>, ffmpeg::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grain starts and ends silent, so it does not click, and is untouched
+    /// between its fades.
+    #[test]
+    fn a_scrub_grain_fades_in_and_out() {
+        let frames = (GRAIN_SEC * SAMPLE_RATE as f64) as usize;
+        let mut grain = vec![1.0f32; frames * CHANNELS];
+        shape_grain(&mut grain);
+        assert_eq!(&grain[..CHANNELS], &[0.0; CHANNELS]);
+        assert_eq!(&grain[grain.len() - CHANNELS..], &[0.0; CHANNELS]);
+        let mid = frames / 2 * CHANNELS;
+        assert_eq!(grain[mid], 1.0);
+        let fade = (GRAIN_FADE_SEC * SAMPLE_RATE as f64) as usize;
+        assert!(grain[(fade / 2) * CHANNELS] > 0.3 && grain[(fade / 2) * CHANNELS] < 0.7);
+    }
 
     /// Decoding a real file is the only way to catch a source the pool accepts
     /// but cannot actually play. Needs media, so it takes a path from

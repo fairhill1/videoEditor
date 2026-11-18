@@ -150,8 +150,13 @@ impl State {
         // if render is slow the audio thread still has samples queued.
         {
             let audio_tracks = self.audio_tracks();
+            let scrubbing = matches!(self.drag, DragMode::Scrub);
             let Self { audio, media, .. } = self;
             audio.tick(&audio_tracks, media);
+            // Dragging the playhead plays what it passes over.
+            if scrubbing {
+                audio.scrub(&audio_tracks, media);
+            }
         }
 
         let preview_h = (top_h - TRANSPORT_BAR_H).max(0.0);
