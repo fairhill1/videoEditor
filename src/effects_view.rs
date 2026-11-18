@@ -387,7 +387,8 @@ impl State {
                 ) => title.shadow.enabled,
                 TitleControl::Number(
                     TitleNumber::BackgroundOpacity
-                    | TitleNumber::BackgroundPadding
+                    | TitleNumber::BackgroundPaddingX
+                    | TitleNumber::BackgroundPaddingY
                     | TitleNumber::BackgroundRadius,
                 )
                 | TitleControl::Color(TitleColor::Background) => title.background.enabled,

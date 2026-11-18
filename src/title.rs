@@ -129,13 +129,16 @@ impl Default for Shadow {
 /// around the block, so each box is as wide as its own line; where the boxes
 /// of neighbouring lines meet they join into one shape rather than overlap.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "BackgroundFile")]
 pub struct Background {
     pub enabled: bool,
     pub color: [f32; 4],
     pub opacity: f32,
-    /// How far the box reaches past the line on every side, as a fraction of
-    /// the canvas height.
-    pub padding: f32,
+    /// How far the box reaches past the line to its left and right, as a
+    /// fraction of the canvas height.
+    pub padding_x: f32,
+    /// How far it reaches above and below the line, the same way.
+    pub padding_y: f32,
     /// How round its corners are: their radius, as a fraction of the canvas
     /// height.
     pub radius: f32,
@@ -143,7 +146,52 @@ pub struct Background {
 
 impl Default for Background {
     fn default() -> Self {
-        Self { enabled: false, color: [0.0, 0.0, 0.0, 1.0], opacity: 0.8, padding: 0.012, radius: 0.008 }
+        Self {
+            enabled: false,
+            color: [0.0, 0.0, 0.0, 1.0],
+            opacity: 0.8,
+            padding_x: 0.012,
+            padding_y: 0.012,
+            radius: 0.008,
+        }
+    }
+}
+
+/// A background as written to a file. Files from before the padding was
+/// split hold one `padding` for every side, which becomes both.
+#[derive(Deserialize)]
+struct BackgroundFile {
+    enabled: bool,
+    color: [f32; 4],
+    opacity: f32,
+    #[serde(default = "unset")]
+    padding: f32,
+    #[serde(default = "unset")]
+    padding_x: f32,
+    #[serde(default = "unset")]
+    padding_y: f32,
+    radius: f32,
+}
+
+/// A padding the file left out; NaN, since no padding is ever that.
+fn unset() -> f32 {
+    f32::NAN
+}
+
+impl From<BackgroundFile> for Background {
+    fn from(f: BackgroundFile) -> Self {
+        let or = |v: f32, fallback: f32| if v.is_nan() { fallback } else { v };
+        let default = Background::default();
+        let x = or(f.padding, default.padding_x);
+        let y = or(f.padding, default.padding_y);
+        Self {
+            enabled: f.enabled,
+            color: f.color,
+            opacity: f.opacity,
+            padding_x: or(f.padding_x, x),
+            padding_y: or(f.padding_y, y),
+            radius: f.radius,
+        }
     }
 }
 
@@ -242,7 +290,8 @@ pub enum TitleNumber {
     ShadowSoftness,
     ShadowOpacity,
     BackgroundOpacity,
-    BackgroundPadding,
+    BackgroundPaddingX,
+    BackgroundPaddingY,
     BackgroundRadius,
 }
 
@@ -256,7 +305,8 @@ impl TitleNumber {
             Self::ShadowSoftness => ("Softness", 0.0, 0.03, 0.006, Unit::CanvasHeight),
             Self::ShadowOpacity => ("Opacity", 0.0, 1.0, 0.7, Unit::Percent),
             Self::BackgroundOpacity => ("Opacity", 0.0, 1.0, 0.8, Unit::Percent),
-            Self::BackgroundPadding => ("Padding", 0.0, 0.05, 0.012, Unit::CanvasHeight),
+            Self::BackgroundPaddingX => ("Width padding", 0.0, 0.05, 0.012, Unit::CanvasHeight),
+            Self::BackgroundPaddingY => ("Height padding", 0.0, 0.05, 0.012, Unit::CanvasHeight),
             Self::BackgroundRadius => ("Rounding", 0.0, 0.03, 0.008, Unit::CanvasHeight),
         };
         ParamSpec { name, min, max, default, unit }
@@ -271,7 +321,8 @@ impl TitleNumber {
             Self::ShadowSoftness => title.shadow.softness,
             Self::ShadowOpacity => title.shadow.opacity,
             Self::BackgroundOpacity => title.background.opacity,
-            Self::BackgroundPadding => title.background.padding,
+            Self::BackgroundPaddingX => title.background.padding_x,
+            Self::BackgroundPaddingY => title.background.padding_y,
             Self::BackgroundRadius => title.background.radius,
         }
     }
@@ -287,7 +338,8 @@ impl TitleNumber {
             Self::ShadowSoftness => title.shadow.softness = value,
             Self::ShadowOpacity => title.shadow.opacity = value,
             Self::BackgroundOpacity => title.background.opacity = value,
-            Self::BackgroundPadding => title.background.padding = value,
+            Self::BackgroundPaddingX => title.background.padding_x = value,
+            Self::BackgroundPaddingY => title.background.padding_y = value,
             Self::BackgroundRadius => title.background.radius = value,
         }
     }
@@ -500,11 +552,12 @@ pub fn render(title: &Title, width: u32, height: u32) -> Rgba {
     let reach = outline_px.ceil() as i32
         + shadow.map_or(0, |(d, soft, _)| d.abs() + (soft * 3.0).ceil() as i32)
         + 2;
-    // Each line's box, grown by the padding; the area worked on reaches to
-    // take them in.
+    // Each line's box, grown by the padding, across and up and down on their
+    // own; the area worked on reaches to take them in.
     let boxes: Vec<[f32; 4]> = if title.background.enabled {
-        let pad = title.background.padding * h;
-        mask.lines.iter().map(|l| [l[0] - pad, l[1] - pad, l[2] + pad, l[3] + pad]).collect()
+        let px = title.background.padding_x * h;
+        let py = title.background.padding_y * h;
+        mask.lines.iter().map(|l| [l[0] - px, l[1] - py, l[2] + px, l[3] + py]).collect()
     } else {
         Vec::new()
     };
@@ -834,7 +887,14 @@ mod tests {
             text: "I\nIIIIIIII".into(),
             size: 0.1,
             color: [1.0, 1.0, 1.0, 1.0],
-            background: Background { enabled: true, opacity: 1.0, padding: 0.02, radius: 0.0, ..Background::default() },
+            background: Background {
+                enabled: true,
+                opacity: 1.0,
+                padding_x: 0.02,
+                padding_y: 0.02,
+                radius: 0.0,
+                ..Background::default()
+            },
             ..Title::default()
         };
         let mask = rasterize(&title, 640, 360);
@@ -852,6 +912,41 @@ mod tests {
         let inked = (0..640).find(|&x| at(&mask, x, mid(long)) == 255).expect("ink on the long line");
         assert_eq!(rgb(&img, inked, mid(long)), [255, 255, 255]);
         assert_eq!(alpha(&img, 0, 0), 0, "nothing outside the boxes");
+    }
+
+    #[test]
+    fn a_background_pads_across_and_down_on_their_own() {
+        let title = Title {
+            text: "II".into(),
+            size: 0.1,
+            background: Background {
+                enabled: true,
+                opacity: 1.0,
+                padding_x: 0.05,
+                padding_y: 0.0,
+                radius: 0.0,
+                ..Background::default()
+            },
+            ..Title::default()
+        };
+        let line = rasterize(&title, 640, 360).lines[0];
+        let img = render(&title, 640, 360);
+        let mid_y = ((line[1] + line[3]) * 0.5) as u32;
+        let mid_x = ((line[0] + line[2]) * 0.5) as u32;
+        // Well out to the side of the line: inside the box.
+        assert_eq!(alpha(&img, (line[2] + 0.04 * 360.0) as u32, mid_y), 255);
+        // Just above it: outside.
+        assert_eq!(alpha(&img, mid_x, (line[1] - 3.0) as u32), 0);
+    }
+
+    /// Files from before the padding was split hold one for every side.
+    #[test]
+    fn an_old_background_padding_reads_as_both() {
+        let old = "(enabled: true, color: (0.0, 0.0, 0.0, 1.0), opacity: 0.8, padding: 0.03, radius: 0.0)";
+        let b: Background = ron::from_str(old).unwrap();
+        assert_eq!((b.padding_x, b.padding_y), (0.03, 0.03));
+        let back: Background = ron::from_str(&ron::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back, b);
     }
 
     #[test]

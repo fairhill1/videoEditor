@@ -950,7 +950,8 @@ pub(crate) fn effects_panel(
                 C::Toggle(TitlePart::Background),
                 C::Color(TitleColor::Background),
                 C::Number(TitleNumber::BackgroundOpacity),
-                C::Number(TitleNumber::BackgroundPadding),
+                C::Number(TitleNumber::BackgroundPaddingX),
+                C::Number(TitleNumber::BackgroundPaddingY),
                 C::Number(TitleNumber::BackgroundRadius),
             ],
         ];
@@ -2292,7 +2293,7 @@ mod tests {
         stack.push(EffectKind::GaussianBlur.instance());
         let panel = effects_panel(400.0, 2000.0, &EffectKind::ALL, Some(1), Some(&stack), 0.0);
         let controls: Vec<TitleControl> = panel.title.iter().map(|r| r.control).collect();
-        assert_eq!(controls.len(), 19);
+        assert_eq!(controls.len(), 20);
         assert_eq!(controls[0], TitleControl::Style);
         assert!(panel.title[0].row.y >= panel.clip_heading_y + EFFECTS_SECTION_H);
         let last = panel.title.last().unwrap().row;
