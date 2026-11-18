@@ -19,6 +19,8 @@ pub(crate) const ICON_PLAY: char = '\u{E13C}'; // play
 pub(crate) const ICON_PAUSE: char = '\u{E12E}'; // pause
 pub(crate) const ICON_NEXT_FRAME: char = '\u{E06F}'; // chevron-right
 pub(crate) const ICON_NEXT_EDIT: char = '\u{E244}'; // chevron-last
+pub(crate) const ICON_START: char = '\u{E15F}'; // skip-back
+pub(crate) const ICON_END: char = '\u{E160}'; // skip-forward
 pub(crate) const ICON_SPLIT: char = '\u{E3B6}'; // square-split-horizontal
 pub(crate) const ICON_DELETE: char = '\u{E18D}'; // trash
 pub(crate) const ICON_UNDO: char = '\u{E19B}'; // undo
@@ -74,12 +76,13 @@ pub(crate) const SPLITTER_ACTIVE_COLOR: [f32; 4] = [0.45, 0.45, 0.53, 1.0];
 /// Floors for the four panels a splitter can squeeze, in points.
 ///
 /// The preview minimum is set by its transport bar rather than the picture:
-/// five buttons plus gaps plus the timecode readout is the point below which
-/// controls would start overlapping, and a preview can always letterbox.
+/// seven buttons plus gaps plus the timecode readout beside them is the point
+/// below which controls would start overlapping, and a preview can always
+/// letterbox.
 /// The pool's floor is its header: the label, the import and title buttons on
 /// the left and the view toggle on the right, without the two meeting.
 pub(crate) const POOL_MIN_W: f32 = 250.0;
-pub(crate) const PREVIEW_MIN_W: f32 = 340.0;
+pub(crate) const PREVIEW_MIN_W: f32 = 460.0;
 /// Enough for the transport bar plus a sliver of picture above it.
 pub(crate) const TOP_MIN_H: f32 = TRANSPORT_BAR_H + 60.0;
 /// Toolbar, ruler and one lane at its minimum height — below this the timeline

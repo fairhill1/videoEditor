@@ -226,24 +226,16 @@ impl State {
             self.drag = DragMode::Splitter(splitter);
             return;
         }
-        if self.transport[0].contains([cx, cy]) {
-            self.goto_edit_point(false);
-            return;
-        }
-        if self.transport[1].contains([cx, cy]) {
-            self.step_frame(-1.0);
-            return;
-        }
-        if self.transport[2].contains([cx, cy]) {
-            self.toggle_playback();
-            return;
-        }
-        if self.transport[3].contains([cx, cy]) {
-            self.step_frame(1.0);
-            return;
-        }
-        if self.transport[4].contains([cx, cy]) {
-            self.goto_edit_point(true);
+        if let Some(i) = self.transport.iter().position(|r| r.contains([cx, cy])) {
+            match i {
+                0 => self.goto_end(false),
+                1 => self.goto_edit_point(false),
+                2 => self.step_frame(-1.0),
+                3 => self.toggle_playback(),
+                4 => self.step_frame(1.0),
+                5 => self.goto_edit_point(true),
+                _ => self.goto_end(true),
+            }
             return;
         }
         if self.timeline_select_all_btn.contains([cx, cy]) {
@@ -1144,6 +1136,17 @@ impl State {
             new_t = new_t.min(duration);
         }
         self.audio.set_position(new_t);
+    }
+
+    /// Jump to the start of the timeline, or to its end. Pauses like the
+    /// other jumps in the transport row. Parking on the end is safe to play
+    /// from: Space there replays from the top.
+    pub(crate) fn goto_end(&mut self, forward: bool) {
+        if self.audio.playing() {
+            self.audio.set_playing(false);
+        }
+        let target = if forward { self.timeline.duration() } else { 0.0 };
+        self.audio.set_position(target);
     }
 
     /// Jump to the clip boundary before/after the playhead. Pauses like

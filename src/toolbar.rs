@@ -644,23 +644,40 @@ impl State {
         let bar_center_y = preview_h + TRANSPORT_BAR_H * 0.5;
         let playing = self.audio.playing();
         let icons = [
+            ICON_START,
             ICON_PREV_EDIT,
             ICON_PREV_FRAME,
             if playing { ICON_PAUSE } else { ICON_PLAY },
             ICON_NEXT_FRAME,
             ICON_NEXT_EDIT,
+            ICON_END,
         ];
         let tooltips = [
+            "Start (Home)",
             "Prev edit (Shift+Left)",
             "Prev frame (Left)",
             if playing { "Pause (Space)" } else { "Play (Space)" },
             "Next frame (Right)",
             "Next edit (Shift+Right)",
+            "End (End)",
         ];
         let n_transport = self.transport.len();
         let row_w =
             TRANSPORT_BTN_W * n_transport as f32 + TRANSPORT_GAP * (n_transport - 1) as f32;
-        let row_x = (media_w + (preview_w - row_w) * 0.5).round();
+        let timer_text = format!(
+            "{} / {}",
+            format_timecode(t),
+            format_timecode(self.timeline.duration())
+        );
+        let timer_w = self.text.measure_width(&timer_text, TIMER_SIZE);
+        // Centred under the picture while that leaves the timecode clear;
+        // otherwise slid left to stop a gap short of it, which is what a
+        // narrow preview needs now the row is seven buttons wide.
+        let timer_left = (w - LABEL_PAD - timer_w).round();
+        let row_x = (media_w + (preview_w - row_w) * 0.5)
+            .min(timer_left - TRANSPORT_GAP - row_w)
+            .max(media_w + LABEL_PAD)
+            .round();
         let row_y = (bar_center_y - TRANSPORT_BTN_H * 0.5).round();
         for i in 0..n_transport {
             self.transport[i] = Rect {
@@ -671,15 +688,8 @@ impl State {
             };
         }
 
-        let timer_text = format!(
-            "{} / {}",
-            format_timecode(t),
-            format_timecode(self.timeline.duration())
-        );
-        let timer_w = self.text.measure_width(&timer_text, TIMER_SIZE);
         let timer_ascent = self.text.ascent(TIMER_SIZE);
         let timer_baseline = (bar_center_y + timer_ascent * 0.5).round();
-        let timer_left = (w - LABEL_PAD - timer_w).round();
         self.text.draw(
             &self.queue,
             &mut self.quads,

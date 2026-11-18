@@ -250,6 +250,8 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowRight if shift => state.goto_edit_point(true),
                     KeyCode::ArrowLeft => state.step_frame(-1.0),
                     KeyCode::ArrowRight => state.step_frame(1.0),
+                    KeyCode::Home => state.goto_end(false),
+                    KeyCode::End => state.goto_end(true),
                     // Level nudges repeat for the same reason the arrows do:
                     // riding a clip down by 6dB, or a title's opacity down to
                     // a ghost, should be a held key rather than six presses.

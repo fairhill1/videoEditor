@@ -16,6 +16,8 @@ ICONS=(
     chevron-right             # transport: next frame
     chevron-first             # transport: previous clip edge
     chevron-last              # transport: next clip edge
+    skip-back                 # transport: start of the timeline
+    skip-forward              # transport: end of the timeline
     square-split-horizontal   # timeline: split at playhead
     trash                     # timeline: delete selected clip
     undo                      # timeline: undo
@@ -77,7 +79,20 @@ PY
 )
 echo "Subsetting ${#ICONS[@]} icons: $codepoints"
 
-python3 -m fontTools.subset "$work/package/font/lucide.ttf" \
+# The icons are reached by codepoint, never by the font's name ligatures, so
+# GSUB is dead weight. It goes before subsetting rather than through
+# --drop-tables because recent fontTools reads it on the way in and trips over
+# the ligature table in current Lucide releases.
+python3 - "$work/package/font/lucide.ttf" "$work/lucide-nogsub.ttf" <<'PY'
+import sys
+from fontTools.ttLib import TTFont
+font = TTFont(sys.argv[1])
+if "GSUB" in font:
+    del font["GSUB"]
+font.save(sys.argv[2])
+PY
+
+python3 -m fontTools.subset "$work/lucide-nogsub.ttf" \
     --unicodes="$codepoints" \
     --output-file="$out" \
     --no-hinting --desubroutinize --layout-features='' \

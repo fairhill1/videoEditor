@@ -118,9 +118,9 @@ pub(crate) struct State {
     pub(crate) cursor_icon: CursorIcon,
     pub(crate) drag: DragMode,
     pub(crate) last_playing_source: Option<SourceId>,
-    /// Prev-edit, prev-frame, play/pause, next-frame, next-edit — left to
-    /// right, so the outer buttons are the coarser jumps.
-    pub(crate) transport: [Rect; 5],
+    /// Start, prev-edit, prev-frame, play/pause, next-frame, next-edit, end —
+    /// left to right, so the outer buttons are the coarser jumps.
+    pub(crate) transport: [Rect; 7],
     pub(crate) timeline_split_btn: Rect,
     pub(crate) timeline_freeze_btn: Rect,
     pub(crate) timeline_undo_btn: Rect,
@@ -366,7 +366,7 @@ impl State {
             cursor_icon: CursorIcon::Default,
             drag: DragMode::None,
             last_playing_source: None,
-            transport: [Rect::default(); 5],
+            transport: [Rect::default(); 7],
             timeline_split_btn: Rect::default(),
             timeline_freeze_btn: Rect::default(),
             timeline_undo_btn: Rect::default(),
