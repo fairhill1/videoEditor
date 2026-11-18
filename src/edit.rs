@@ -829,6 +829,7 @@ impl State {
         self.begin_edit();
         let id = self.media.add_title(Title::default());
         self.commit_edit();
+        self.pool_offset = f32::MAX;
         self.begin_title_edit(id);
     }
 

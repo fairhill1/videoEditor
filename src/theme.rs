@@ -335,6 +335,11 @@ pub(crate) const SCROLLBAR_THUMB_INSET: f32 = 2.0;
 /// shrinking and its travel takes up the difference instead, which costs a
 /// little precision at extreme zoom and keeps the control usable.
 pub(crate) const SCROLLBAR_MIN_THUMB_W: f32 = 24.0;
+/// The media pool's scrollbar, down the panel's right margin: thin enough to
+/// sit between the tiles and the splitter's grab.
+pub(crate) const POOL_SCROLLBAR_W: f32 = 4.0;
+/// How far one wheel notch scrolls the media pool.
+pub(crate) const POOL_SCROLL_STEP: f32 = 60.0;
 
 // Media pool list layout.
 /// Below the MEDIA POOL label.

@@ -222,6 +222,9 @@ pub(crate) struct State {
     pub(crate) pool_tab: PoolTab,
     /// How far the effects tab is scrolled down, in points.
     pub(crate) effects_scroll: f32,
+    /// How far the media tab is scrolled down, in points. Held in range by
+    /// [`crate::layout::PoolScroll`] wherever it is read.
+    pub(crate) pool_offset: f32,
     /// The font list, while it is open: how many rows it is scrolled down.
     pub(crate) font_menu: Option<(crate::layout::TitleMenu, usize)>,
     /// The colour picker, while it is open.
@@ -409,6 +412,7 @@ impl State {
             pool_tab_btns: [Rect::default(); 2],
             pool_tab: PoolTab::default(),
             effects_scroll: 0.0,
+            pool_offset: 0.0,
             font_menu: None,
             color_picker: None,
             recent_colors: crate::color::load_recent(),
@@ -521,6 +525,7 @@ impl State {
             | DragMode::PickerSv
             | DragMode::PickerHue
             | DragMode::Scrollbar { .. }
+            | DragMode::PoolScrollbar { .. }
             | DragMode::ZoomSlider => CursorIcon::Default,
             DragMode::TextSelect { .. } | DragMode::HexSelect => CursorIcon::Text,
             DragMode::None => self.hover_cursor(),
@@ -644,6 +649,16 @@ impl State {
             self.import_file(path);
         }
         self.commit_edit();
+        self.show_pool_end();
+    }
+
+    /// Scroll the media tab to its end, where what was just added went, and
+    /// show that tab: an import that lands out of sight looks like one that
+    /// did nothing.
+    pub(crate) fn show_pool_end(&mut self) {
+        self.pool_tab = PoolTab::Media;
+        self.pool_offset = f32::MAX;
+        self.dirty = true;
     }
 
     pub(crate) fn can_export(&self) -> bool {

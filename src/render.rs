@@ -520,7 +520,12 @@ impl State {
         let grid = self.pool_view == PoolView::Grid;
         // Nothing scrubs while a drag is under way: a clip being carried to
         // the timeline is not being looked through.
-        let idle = matches!(self.drag, DragMode::None);
+        let scroll = self.pool_scroll();
+        let [top, bottom] = scroll.visible;
+        // A hover means something only where the entries show.
+        let idle = matches!(self.drag, DragMode::None) && (top..bottom).contains(&self.cursor[1]);
+        // Entries scrolled part way out are cut at the band's edges.
+        self.quads.set_clip_y(top, bottom);
         for (id, PoolCell { cell, thumb }) in self.pool_items() {
             let Some(src) = self.media.get(id) else {
                 continue;
@@ -670,9 +675,9 @@ impl State {
                 self.draw_pool_row_text(id, cell, thumb);
             }
 
-            if cell.contains(self.cursor) {
+            if (top..bottom).contains(&self.cursor[1]) && cell.contains(self.cursor) {
                 let close = pool_row_close_rect(cell.x, cell.y, cell.w);
-                let close_hover = close.contains(self.cursor);
+                let close_hover = idle && close.contains(self.cursor);
                 let bg = if close_hover {
                     POOL_CLOSE_BG_HOVER
                 } else {
@@ -694,6 +699,20 @@ impl State {
                     POOL_CLOSE_GLYPH_COLOR,
                 );
             }
+        }
+        self.quads.clear_clip_y();
+        if let Some((track, thumb)) = scroll.bar {
+            self.quads.push(Quad::colored([track.x, track.y], [track.w, track.h], SCROLLBAR_TRACK_COLOR));
+            let held = matches!(self.drag, DragMode::PoolScrollbar { .. });
+            let over = Rect { x: track.x - 2.0, w: track.w + 4.0, ..track }.contains(self.cursor);
+            let color = if held {
+                SCROLLBAR_THUMB_ACTIVE_COLOR
+            } else if over && matches!(self.drag, DragMode::None) {
+                SCROLLBAR_THUMB_HOVER_COLOR
+            } else {
+                SCROLLBAR_THUMB_COLOR
+            };
+            self.quads.push(Quad::colored([thumb.x, thumb.y], [thumb.w, thumb.h], color));
         }
     }
 

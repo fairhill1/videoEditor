@@ -466,22 +466,20 @@ pub(crate) struct PoolCell {
     pub(crate) thumb: Rect,
 }
 
-/// The cells for the first `n` pool entries in a pool `pool_w` wide, stopping
-/// at the first one that would run past `pool_h`.
+/// The cells for `n` pool entries in a pool `pool_w` wide, unscrolled: the
+/// first at `POOL_LIST_TOP`, and on down however far the entries go. The
+/// panel scrolls through them; see [`PoolScroll`].
 ///
 /// The one place pool geometry is worked out: drawing and every pool hit test
 /// read it from here, so a view switch cannot leave a row clickable where it
 /// used to be drawn.
-pub(crate) fn pool_cells(view: PoolView, pool_w: f32, pool_h: f32, n: usize) -> Vec<PoolCell> {
+pub(crate) fn pool_cells(view: PoolView, pool_w: f32, n: usize) -> Vec<PoolCell> {
     let avail = (pool_w - LABEL_PAD * 2.0).max(1.0);
     let mut cells = Vec::with_capacity(n);
     match view {
         PoolView::List => {
             for i in 0..n {
                 let y = POOL_LIST_TOP + i as f32 * (POOL_ROW_HEIGHT + POOL_ROW_GAP);
-                if y + POOL_ROW_HEIGHT > pool_h {
-                    break;
-                }
                 cells.push(PoolCell {
                     cell: Rect { x: LABEL_PAD, y, w: avail, h: POOL_ROW_HEIGHT },
                     thumb: Rect {
@@ -509,9 +507,6 @@ pub(crate) fn pool_cells(view: PoolView, pool_w: f32, pool_h: f32, n: usize) -> 
                 let (col, row) = ((i % cols) as f32, (i / cols) as f32);
                 let x = LABEL_PAD + col * (tile_w + POOL_TILE_GAP);
                 let y = POOL_LIST_TOP + row * (tile_h + POOL_TILE_GAP);
-                if y + tile_h > pool_h {
-                    break;
-                }
                 cells.push(PoolCell {
                     cell: Rect { x, y, w: tile_w, h: tile_h },
                     thumb: Rect {
@@ -525,6 +520,57 @@ pub(crate) fn pool_cells(view: PoolView, pool_w: f32, pool_h: f32, n: usize) -> 
         }
     }
     cells
+}
+
+/// How far the media pool scrolls, and the scrollbar beside it. The entries
+/// run on past the bottom of the panel once there are more than fit, and new
+/// ones go at the end, so without this an import past the fold was there and
+/// could not be seen.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct PoolScroll {
+    /// How far down it is scrolled, held to `0..=max`.
+    pub(crate) offset: f32,
+    pub(crate) max: f32,
+    /// The band entries show in: from under the tabs to the panel's foot.
+    pub(crate) visible: [f32; 2],
+    /// The scrollbar's track, down the panel's right margin, and its thumb.
+    /// `None` when everything fits and there is nothing to scroll.
+    pub(crate) bar: Option<(Rect, Rect)>,
+}
+
+impl PoolScroll {
+    /// For `cells` laid out unscrolled in a pool `pool_w` wide and `pool_h`
+    /// tall, scrolled `offset` down.
+    pub(crate) fn new(cells: &[PoolCell], pool_w: f32, pool_h: f32, offset: f32) -> Self {
+        let bottom = cells.iter().map(|c| c.cell.y + c.cell.h).fold(POOL_LIST_TOP, f32::max);
+        let max = (bottom + LABEL_PAD - pool_h).max(0.0);
+        let offset = offset.clamp(0.0, max);
+        let visible = [POOL_LIST_TOP, pool_h];
+        let bar = (max > 0.0).then(|| {
+            // In the margin right of the entries, clear of the splitter's
+            // grab on the panel's edge.
+            let track = Rect {
+                x: pool_w - SPLITTER_GRAB_PX - POOL_SCROLLBAR_W,
+                y: POOL_LIST_TOP,
+                w: POOL_SCROLLBAR_W,
+                h: (pool_h - POOL_LIST_TOP - SCROLLBAR_THUMB_INSET).max(0.0),
+            };
+            let shown = pool_h - POOL_LIST_TOP;
+            let thumb_h = (track.h * shown / (shown + max)).max(SCROLLBAR_MIN_THUMB_W).min(track.h);
+            let thumb = Rect { y: track.y + (track.h - thumb_h) * offset / max, h: thumb_h, ..track };
+            (track, thumb)
+        });
+        Self { offset, max, visible, bar }
+    }
+
+    /// The offset that puts the thumb's top at `thumb_y`.
+    pub(crate) fn offset_for_thumb(&self, thumb_y: f32) -> f32 {
+        let Some((track, thumb)) = self.bar else {
+            return 0.0;
+        };
+        let room = (track.h - thumb.h).max(1.0);
+        ((thumb_y - track.y) / room * self.max).clamp(0.0, self.max)
+    }
 }
 
 /// Which page the pool panel shows: the media in the project, or the effects
@@ -882,7 +928,7 @@ pub(crate) fn effects_panel(
     let x = LABEL_PAD;
     let w = (pool_w - LABEL_PAD * 2.0).max(1.0);
     // Laid out unscrolled, top at `POOL_LIST_TOP`, and moved up at the end.
-    let cells = pool_cells(PoolView::Grid, pool_w, f32::INFINITY, kinds.len());
+    let cells = pool_cells(PoolView::Grid, pool_w, kinds.len());
     let mut y = cells.iter().map(|c| c.cell.y + c.cell.h).fold(POOL_LIST_TOP, f32::max);
     let mut library: Vec<LibraryCard> = kinds
         .iter()
@@ -1844,14 +1890,38 @@ impl State {
         ])
     }
 
-    /// Every pool entry that fits in the panel, with where it sits.
+    /// How the media pool is scrolled, as it stands.
+    pub(crate) fn pool_scroll(&self) -> PoolScroll {
+        let cells = pool_cells(self.pool_view, self.media_pool_w(), self.media.ids().len());
+        PoolScroll::new(&cells, self.media_pool_w(), self.timeline_top(), self.pool_offset)
+    }
+
+    /// Every pool entry in view, wholly or in part, with where it sits now
+    /// the panel is scrolled.
     pub(crate) fn pool_items(&self) -> Vec<(SourceId, PoolCell)> {
         let ids = self.media.ids();
-        let cells = pool_cells(self.pool_view, self.media_pool_w(), self.timeline_top(), ids.len());
-        ids.iter().copied().zip(cells).collect()
+        let cells = pool_cells(self.pool_view, self.media_pool_w(), ids.len());
+        let scroll = PoolScroll::new(&cells, self.media_pool_w(), self.timeline_top(), self.pool_offset);
+        let [top, bottom] = scroll.visible;
+        let up = |r: Rect| Rect { y: r.y - scroll.offset, ..r };
+        ids.iter()
+            .copied()
+            .zip(cells)
+            .map(|(id, c)| (id, PoolCell { cell: up(c.cell), thumb: up(c.thumb) }))
+            .filter(|(_, c)| c.cell.y + c.cell.h > top && c.cell.y < bottom)
+            .collect()
+    }
+
+    /// Whether `y` is in the band pool entries show in: an entry scrolled
+    /// part way under the tabs takes no press where it is hidden.
+    fn in_pool_band(&self, y: f32) -> bool {
+        (POOL_LIST_TOP..self.timeline_top()).contains(&y)
     }
 
     pub(crate) fn pool_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
+        if !self.in_pool_band(cursor_y) {
+            return None;
+        }
         self.pool_items()
             .into_iter()
             .find(|(_, c)| c.cell.contains([cursor_x, cursor_y]))
@@ -1945,6 +2015,9 @@ impl State {
     }
 
     pub(crate) fn pool_close_hit(&self, cursor_x: f32, cursor_y: f32) -> Option<SourceId> {
+        if !self.in_pool_band(cursor_y) {
+            return None;
+        }
         self.pool_items()
             .into_iter()
             .find(|(_, c)| {
@@ -2192,7 +2265,7 @@ mod tests {
         // media grid tile exactly.
         let apply = panel.library[0].apply;
         assert!(card.thumb.contains([apply.x, apply.y]));
-        assert_eq!(card.cell, pool_cells(PoolView::Grid, 400.0, 2000.0, 1)[0].cell);
+        assert_eq!(card.cell, pool_cells(PoolView::Grid, 400.0, 1)[0].cell);
         assert!(panel.clip_heading_y > card.cell.y + card.cell.h);
         assert_eq!(panel.stack.len(), 2);
         let first_bottom = panel.stack[0].params.last().unwrap().row;
@@ -2425,7 +2498,7 @@ mod tests {
     #[test]
     fn a_grid_fills_the_pool_width_with_whole_tiles() {
         for pool_w in [POOL_MIN_W, 330.0, 500.0, 900.0] {
-            let cells = pool_cells(PoolView::Grid, pool_w, 10_000.0, 12);
+            let cells = pool_cells(PoolView::Grid, pool_w, 12);
             let right = cells.iter().map(|c| c.cell.x + c.cell.w).fold(0.0, f32::max);
             assert!(right <= pool_w - LABEL_PAD, "{pool_w}: runs to {right}");
             for c in &cells {
@@ -2434,7 +2507,7 @@ mod tests {
         }
         // Wide enough for three at the minimum, so three it is.
         let three = LABEL_PAD * 2.0 + POOL_TILE_MIN_W * 3.0 + POOL_TILE_GAP * 2.0;
-        let cells = pool_cells(PoolView::Grid, three, 10_000.0, 4);
+        let cells = pool_cells(PoolView::Grid, three, 4);
         assert_eq!(cells[2].cell.y, cells[0].cell.y);
         assert!(cells[3].cell.y > cells[0].cell.y);
     }
@@ -2442,7 +2515,7 @@ mod tests {
     #[test]
     fn no_two_pool_cells_overlap_in_either_view() {
         for view in [PoolView::List, PoolView::Grid] {
-            let cells = pool_cells(view, 480.0, 10_000.0, 9);
+            let cells = pool_cells(view, 480.0, 9);
             assert_eq!(cells.len(), 9);
             for (i, a) in cells.iter().enumerate() {
                 assert!(a.cell.contains([a.thumb.x, a.thumb.y]));
@@ -2458,13 +2531,33 @@ mod tests {
         }
     }
 
+    /// Every entry gets a cell, however many run past the panel's foot:
+    /// the panel scrolls to them rather than leaving them out.
     #[test]
-    fn a_pool_cell_that_would_run_off_the_panel_is_left_out() {
+    fn every_pool_entry_is_laid_out_and_scrolled_to() {
         for view in [PoolView::List, PoolView::Grid] {
-            let cells = pool_cells(view, 400.0, 300.0, 50);
-            assert!(!cells.is_empty() && cells.len() < 50);
-            assert!(cells.iter().all(|c| c.cell.y + c.cell.h <= 300.0));
+            let cells = pool_cells(view, 400.0, 50);
+            assert_eq!(cells.len(), 50);
+            let scroll = PoolScroll::new(&cells, 400.0, 300.0, f32::MAX);
+            let last = cells.last().unwrap().cell;
+            assert!(scroll.max > 0.0);
+            // Scrolled to the end, the last entry sits inside the panel.
+            assert!(last.y + last.h - scroll.offset <= 300.0, "{view:?}");
+            let (track, thumb) = scroll.bar.unwrap();
+            assert!((thumb.y + thumb.h - (track.y + track.h)).abs() < 1e-3, "thumb at the bottom");
+            assert_eq!(scroll.offset_for_thumb(thumb.y), scroll.max);
+            assert_eq!(scroll.offset_for_thumb(track.y), 0.0);
+            // The scrollbar stays clear of the entries and of the splitter.
+            assert!(track.x >= last.x + last.w && track.x + track.w <= 400.0 - SPLITTER_GRAB_PX);
         }
+    }
+
+    /// Few enough to fit: nothing scrolls and there is no bar.
+    #[test]
+    fn a_pool_that_fits_does_not_scroll() {
+        let cells = pool_cells(PoolView::Grid, 400.0, 2);
+        let scroll = PoolScroll::new(&cells, 400.0, 600.0, 50.0);
+        assert_eq!((scroll.offset, scroll.max, scroll.bar), (0.0, 0.0, None));
     }
 
     #[test]

@@ -87,6 +87,9 @@ pub(crate) enum DragMode {
     /// Outside the undo system, like [`DragMode::Splitter`]: where you are
     /// looking is not an edit.
     Scrollbar { grab_dx: f32 },
+    /// Dragging the media pool's scrollbar. `grab_dy` is how far below the
+    /// thumb's top the press landed, as for the timeline's.
+    PoolScrollbar { grab_dy: f32 },
     /// Dragging the timeline zoom slider's knob. Outside the undo system for
     /// the same reason as the scrollbar.
     ZoomSlider,
@@ -404,6 +407,18 @@ impl State {
                     };
                     self.dirty = true;
                     return;
+                }
+                // The scrollbar: the thumb is taken where it was pressed, and
+                // a press on the track beside it brings the thumb's middle
+                // there.
+                if let Some((track, thumb)) = self.pool_scroll().bar {
+                    let reach = Rect { x: track.x - 2.0, w: track.w + 4.0, ..track };
+                    if reach.contains([cx, cy]) {
+                        let grab_dy = if thumb.contains([thumb.x, cy]) { cy - thumb.y } else { thumb.h * 0.5 };
+                        self.drag = DragMode::PoolScrollbar { grab_dy };
+                        self.update_drag();
+                        return;
+                    }
                 }
                 if let Some(id) = self.pool_close_hit(cx, cy) {
                     self.remove_source(id);
@@ -863,6 +878,9 @@ impl State {
                 let placed = self.transform_scaled_about(size, anchor, corner, scale);
                 self.set_clip_transform(track, idx, placed);
             }
+            DragMode::PoolScrollbar { grab_dy } => {
+                self.pool_offset = self.pool_scroll().offset_for_thumb(self.cursor[1] - grab_dy);
+            }
             DragMode::Scrollbar { grab_dx } => {
                 let layout = self.timeline_layout();
                 self.scroll_view_to(layout.scroll_x_to_view_start(self.cursor[0] - grab_dx));
@@ -1038,9 +1056,9 @@ impl State {
     /// Zoom is the unmodified gesture because it is the one you reach for
     /// constantly and panning has an alternative — the horizontal axis a
     /// touchpad already reports, and Shift on a wheel that has no such axis.
-    /// Anywhere but the timeline it does nothing: no other panel scrolls yet,
-    /// and a wheel that silently zoomed the timeline from over the media pool
-    /// would read as a bug.
+    /// Over the pool panel it scrolls whichever tab is showing; anywhere else
+    /// off the timeline it does nothing, since a wheel that silently zoomed
+    /// the timeline from over the preview would read as a bug.
     pub(crate) fn wheel(&mut self, dx: f32, dy: f32) {
         // The font list first: it is drawn over the panels, so the wheel over
         // it means it.
@@ -1057,6 +1075,11 @@ impl State {
             // Down the page for a wheel turned towards you, as everywhere.
             let max = self.effects_panel().max_scroll;
             self.effects_scroll = (self.effects_scroll - dy * EFFECTS_SCROLL_STEP).clamp(0.0, max);
+            return;
+        }
+        if self.pool_tab == PoolTab::Media && cx < self.media_pool_w() && cy < self.timeline_top() {
+            let scroll = self.pool_scroll();
+            self.pool_offset = (scroll.offset - dy * POOL_SCROLL_STEP).clamp(0.0, scroll.max);
             return;
         }
         if self.cursor[1] < self.timeline_top() {
