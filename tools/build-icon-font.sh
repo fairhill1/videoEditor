@@ -49,6 +49,7 @@ ICONS=(
     refresh-cw                # timeline: reload the project from disk
     snowflake                 # timeline: freeze the frame at the playhead
     rotate-ccw                # effects: reset a clip's placement
+    maximize                  # effects: zoom a clip to fill the canvas
     arrow-right-from-line     # timeline: ripple trims
     chevron-up                # timeline: move a track up the stack
     link                      # timeline: a clip linked to its other half

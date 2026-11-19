@@ -123,7 +123,7 @@ impl State {
             // clips placed together; the heading says so, since the panel
             // shows only the first of them.
             let titles = self.styled_titles().len().saturating_sub(1);
-            let clips = self.selected_pictures().len().saturating_sub(1);
+            let clips = self.placement_group((track, idx)).len().saturating_sub(1);
             let label = match (titles, clips) {
                 (0, 0) => src.name.clone(),
                 (1, _) => format!("{} + 1 more title", src.name),
@@ -277,6 +277,20 @@ impl State {
         );
         if reset_hovered {
             *tooltip = Some((t.reset, "Reset: centred, at 100%"));
+        }
+        let fill_hovered = idle && t.fill.contains(self.cursor);
+        draw_button(
+            &mut self.quads,
+            &mut self.text,
+            &self.queue,
+            t.fill,
+            ICON_FILL,
+            TRANSPORT_ICON_SIZE,
+            fill_hovered,
+            BtnState::Normal,
+        );
+        if fill_hovered {
+            *tooltip = Some((t.fill, "Fill: centred, zoomed to cover the frame"));
         }
 
         let reach = self.transform_reach(clip);

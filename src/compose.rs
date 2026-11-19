@@ -502,6 +502,20 @@ mod tests {
         assert_eq!(c.place(1080.0, 1080.0, Transform::default()), [420.0, 0.0, 1080.0, 1080.0]);
     }
 
+    /// Landscape footage on a portrait canvas: the cover zoom fills the frame
+    /// top to bottom and overhangs at the sides, never leaving a bar.
+    #[test]
+    fn the_cover_scale_fills_the_frame_with_no_bars() {
+        let portrait = Canvas { width: 1080, height: 1920, fps: 25.0 };
+        let scale = portrait.cover_scale(1920.0, 1080.0);
+        assert!((scale - 1920.0 / 607.5).abs() < 1e-3, "{scale}");
+        let [x, y, w, h] = portrait.place(1920.0, 1080.0, Transform { x: 0.0, y: 0.0, scale });
+        assert!(y.abs() < 0.5 && (h - 1920.0).abs() < 0.5, "fills the height: {y} {h}");
+        assert!(x <= 0.0 && x + w >= 1080.0, "covers the width: {x} {w}");
+        // A source already the canvas's shape needs no zoom at all.
+        assert!((canvas().cover_scale(1280.0, 720.0) - 1.0).abs() < 1e-6);
+    }
+
     /// Quarter-size in the bottom-right corner — the picture-in-picture the
     /// whole transform exists for.
     #[test]

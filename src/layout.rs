@@ -639,13 +639,15 @@ pub(crate) struct TitleRow {
     pub(crate) field: Rect,
 }
 
-/// The selected clip's placement on the effects tab: a heading with a reset
-/// button, then a slider for each of its numbers.
+/// The selected clip's placement on the effects tab: a heading with fill and
+/// reset buttons, then a slider for each of its numbers.
 #[derive(Clone, Debug)]
 pub(crate) struct TransformRows {
     /// The whole block, heading and sliders.
     pub(crate) group: Rect,
     pub(crate) heading: Rect,
+    /// Zoom to cover the canvas, beside the reset.
+    pub(crate) fill: Rect,
     pub(crate) reset: Rect,
     pub(crate) rows: Vec<TransformRow>,
 }
@@ -764,6 +766,7 @@ pub(crate) enum EffectsHit {
     TitleColorChip(TitleColor),
     TitleToggle(TitlePart),
     Transform { field: TransformField, slider: Rect },
+    TransformFill,
     TransformReset,
 }
 
@@ -1041,6 +1044,7 @@ pub(crate) fn effects_panel(
         let top = y;
         let heading = Rect { x, y, w, h: EFFECT_ROW_H };
         let reset = Rect { x: x + w - POOL_ROW_PAD - EFFECT_SMALL_BTN, ..toggle_in(heading) };
+        let fill = Rect { x: reset.x - EFFECT_SMALL_BTN - EFFECT_BTN_GAP, ..reset };
         y += EFFECT_ROW_H;
         let rows = TransformField::ALL
             .iter()
@@ -1052,7 +1056,7 @@ pub(crate) fn effects_panel(
             .collect();
         let group = Rect { x, y: top, w, h: y - top };
         y += EFFECTS_SECTION_GAP;
-        TransformRows { group, heading, reset, rows }
+        TransformRows { group, heading, fill, reset, rows }
     });
     let hint_y = y;
 
@@ -1093,6 +1097,7 @@ pub(crate) fn effects_panel(
     if let Some(t) = &mut transform {
         t.group = up(t.group);
         t.heading = up(t.heading);
+        t.fill = up(t.fill);
         t.reset = up(t.reset);
         for r in &mut t.rows {
             r.row = up(r.row);
@@ -1171,6 +1176,9 @@ impl EffectsPanel {
         if let Some(t) = &self.transform {
             if t.reset.contains(p) {
                 return Some(EffectsHit::TransformReset);
+            }
+            if t.fill.contains(p) {
+                return Some(EffectsHit::TransformFill);
             }
             for r in &t.rows {
                 if r.row.contains(p) && p[0] >= r.slider.x - ZOOM_SLIDER_KNOB_W {
@@ -1833,15 +1841,19 @@ impl State {
     ///
     /// `None` unless there is a video clip selected *and* it is live at the
     /// playhead — a clip you cannot see is one there is nothing to place.
+    ///
+    /// With several selected, the primary one if it is on screen, and
+    /// otherwise the topmost selected picture that is: select-all makes the
+    /// last clip on the last track primary, which is seldom the one under the
+    /// playhead, and the handles should not vanish for that.
     pub(crate) fn preview_transform_target(&self) -> Option<(usize, usize, Rect)> {
-        let (track, idx) = self.primary_selected()?;
-        if self.timeline.tracks[track].kind != TrackKind::Video {
-            return None;
-        }
+        let now = self.audio.position();
+        let live = |&(t, i): &(usize, usize)| self.timeline.tracks[t].clips[i].contains(now);
+        let (track, idx) = self
+            .effects_target()
+            .filter(live)
+            .or_else(|| self.selected_pictures().into_iter().filter(live).max_by_key(|&(t, _)| t))?;
         let clip = self.timeline.tracks[track].clips[idx];
-        if !clip.contains(self.audio.position()) {
-            return None;
-        }
         let canvas = self.canvas();
         let (sw, sh) = self.source_size(clip.source, canvas)?;
         let [x, y, w, h] = canvas.place(sw as f32, sh as f32, clip.transform);
@@ -2321,6 +2333,8 @@ mod tests {
         assert_eq!(t.rows.len(), 3);
         assert!(panel.hint_y >= t.group.y + t.group.h, "the effects come after it");
         assert_eq!(panel.hit([t.reset.x + 2.0, t.reset.y + 2.0]), Some(EffectsHit::TransformReset));
+        assert_eq!(panel.hit([t.fill.x + 2.0, t.fill.y + 2.0]), Some(EffectsHit::TransformFill));
+        assert!(t.fill.x + t.fill.w <= t.reset.x, "fill sits left of reset, not under it");
         let zoom = t.rows[0];
         assert_eq!(
             panel.hit([zoom.slider.x + 10.0, zoom.row.y + 1.0]),

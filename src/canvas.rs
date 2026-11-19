@@ -66,6 +66,17 @@ impl Canvas {
         ]
     }
 
+    /// The zoom on the fit at which a `sw x sh` source covers the whole
+    /// canvas: 1.0 when its shape already matches, more the further apart the
+    /// two shapes are (16:9 footage on a 9:16 canvas needs about 3.16).
+    pub(crate) fn cover_scale(&self, sw: f32, sh: f32) -> f32 {
+        let (_, _, fw, fh) = self.fit(sw, sh);
+        if fw <= 0.0 || fh <= 0.0 {
+            return 1.0;
+        }
+        (self.width as f32 / fw).max(self.height as f32 / fh)
+    }
+
     /// Where a `sw x sh` source lands on the canvas with no transform applied:
     /// an aspect-preserving fit, centred.
     pub(crate) fn fit(&self, sw: f32, sh: f32) -> (f32, f32, f32, f32) {

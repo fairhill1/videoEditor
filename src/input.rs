@@ -470,6 +470,7 @@ impl State {
                         self.update_drag();
                     }
                     Some(EffectsHit::TransformReset) => self.reset_selected_transform(),
+                    Some(EffectsHit::TransformFill) => self.fill_selected_transform(),
                     Some(EffectsHit::TitleColorChip(field)) => self.open_color_picker(field),
                     Some(EffectsHit::TitleSwatch { field, swatch }) => {
                         self.change_shown_title(|t| field.set(t, SWATCHES[swatch]));
@@ -840,7 +841,7 @@ impl State {
                     Some(size) => self.snap_transform_offset(size, wanted),
                     None => wanted,
                 };
-                self.set_clip_transform(track, idx, placed);
+                self.place_on_canvas(track, idx, placed);
             }
             // Scale follows how much further from the pinned corner the cursor
             // has travelled, projected onto the direction it was grabbed in. A
@@ -868,7 +869,7 @@ impl State {
                 };
                 let scale = self.snap_scale_about(size, anchor, corner, start.scale * factor);
                 let placed = self.transform_scaled_about(size, anchor, corner, scale);
-                self.set_clip_transform(track, idx, placed);
+                self.place_on_canvas(track, idx, placed);
             }
             DragMode::PoolScrollbar { grab_dy } => {
                 self.pool_offset = self.pool_scroll().offset_for_thumb(self.cursor[1] - grab_dy);

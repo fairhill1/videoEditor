@@ -53,6 +53,7 @@ pub(crate) const ICON_PIPETTE: char = '\u{E13B}'; // pipette
 pub(crate) const ICON_RELOAD: char = '\u{E145}'; // refresh-cw
 pub(crate) const ICON_FREEZE: char = '\u{E165}'; // snowflake
 pub(crate) const ICON_RESET: char = '\u{E148}'; // rotate-ccw
+pub(crate) const ICON_FILL: char = '\u{E112}'; // maximize
 pub(crate) const ICON_RIPPLE: char = '\u{E458}'; // arrow-right-from-line
 pub(crate) const ICON_CHEVRON_UP: char = '\u{E070}'; // chevron-up
 pub(crate) const ICON_LINK: char = '\u{E102}'; // link
@@ -483,6 +484,9 @@ pub(crate) const EFFECT_META_COLOR: [f32; 4] = LABEL_COLOR;
 pub(crate) const EFFECT_OFF_COLOR: [f32; 4] = [0.50, 0.50, 0.56, 1.0];
 /// The square on-off and remove buttons of an applied effect.
 pub(crate) const EFFECT_SMALL_BTN: f32 = 22.0;
+/// Between two small buttons sharing a heading, such as the placement's
+/// fill and reset.
+pub(crate) const EFFECT_BTN_GAP: f32 = 4.0;
 pub(crate) const EFFECT_PARAM_LABEL_W: f32 = 82.0;
 pub(crate) const EFFECT_PARAM_VALUE_W: f32 = 52.0;
 /// The parameter rows sit under their effect's name, indented to say so.

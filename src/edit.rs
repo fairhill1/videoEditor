@@ -801,10 +801,46 @@ impl State {
         out
     }
 
+    /// The selected pictures a placement made on `anchor` carries over to:
+    /// those of its own kind, titles with titles and footage with footage.
+    ///
+    /// So that select-all, then reframing the footage for another aspect,
+    /// leaves the titles alone. A title is drawn at the canvas's own size and
+    /// already follows a change of format; zooming it with the footage would
+    /// throw it off the frame.
+    pub(crate) fn placement_group(&self, anchor: (usize, usize)) -> Vec<(usize, usize)> {
+        let is_title = |(t, i): (usize, usize)| {
+            self.media.title(self.timeline.tracks[t].clips[i].source).is_some()
+        };
+        let kind = is_title(anchor);
+        let mut out = vec![anchor];
+        for p in self.selected_pictures() {
+            if p != anchor && is_title(p) == kind {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Give the clip being dragged on the canvas `transform`, and every other
+    /// selected picture in its group the same: the handles act on the
+    /// selection as the sliders do, so a whole run of shots reframed for a
+    /// new aspect is one drag on whichever of them is on screen.
+    pub(crate) fn place_on_canvas(&mut self, track: usize, idx: usize, transform: Transform) {
+        for (t, i) in self.placement_group((track, idx)) {
+            self.set_clip_transform(t, i, transform);
+        }
+    }
+
+    /// The pictures the effects tab's placement controls act on.
+    fn placement_targets(&self) -> Vec<(usize, usize)> {
+        self.effects_target().map(|a| self.placement_group(a)).unwrap_or_default()
+    }
+
     /// Set `field` of the placement on every selected picture to `value`.
     /// Part of whatever edit is open; the slider opens one per drag.
     pub(crate) fn set_selected_transform(&mut self, field: TransformField, value: f32) {
-        for (t, i) in self.selected_pictures() {
+        for (t, i) in self.placement_targets() {
             let mut transform = self.timeline.tracks[t].clips[i].transform;
             field.set(&mut transform, value);
             self.set_clip_transform(t, i, transform);
@@ -814,8 +850,28 @@ impl State {
     /// Put every selected picture back centred and fitted.
     pub(crate) fn reset_selected_transform(&mut self) {
         self.begin_edit();
-        for (t, i) in self.selected_pictures() {
+        for (t, i) in self.placement_targets() {
             self.set_clip_transform(t, i, Transform::default());
+        }
+        self.commit_edit();
+    }
+
+    /// Centre every selected picture and zoom it until it covers the canvas,
+    /// cropping whatever overhangs: footage shot for one aspect, filling a
+    /// frame of another.
+    ///
+    /// Worked out per clip, from each one's own source, so footage of mixed
+    /// shapes all ends up covering rather than all taking one zoom.
+    pub(crate) fn fill_selected_transform(&mut self) {
+        let canvas = self.canvas();
+        self.begin_edit();
+        for (t, i) in self.placement_targets() {
+            let source = self.timeline.tracks[t].clips[i].source;
+            let Some((sw, sh)) = self.source_size(source, canvas) else {
+                continue;
+            };
+            let scale = canvas.cover_scale(sw as f32, sh as f32);
+            self.set_clip_transform(t, i, Transform { x: 0.0, y: 0.0, scale });
         }
         self.commit_edit();
     }
